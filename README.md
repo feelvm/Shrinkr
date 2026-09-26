@@ -53,7 +53,7 @@ Runs the same source through a matrix — x264 CRF 28 baseline plus HEVC NVENC C
 Requires a stable [Rust](https://rustup.rs) toolchain.
 
 ```sh
-git clone https://github.com/<owner>/shrinkr.git
+git clone https://github.com/feelvm/shrinkr.git
 cd shrinkr
 
 # GUI app
