@@ -5,10 +5,13 @@
 //! 2. Tag releases as `v0.x.y` (e.g. `v0.2.0`) — the tag MUST be valid
 //!    semver with a leading `v`; the updater compares it against the
 //!    running binary's `CARGO_PKG_VERSION`.
-//! 3. The release workflow (`.github/workflows/release.yml`) uploads a
-//!    zip named `shrinkr-<target>.zip` containing
-//!    `shrinkr.exe`. `self_update` picks the asset matching
-//!    the current target triple automatically.
+//! 3. Attach a bare `shrinkr.exe` (no target triple, no zip) as the
+//!    release asset. `asset_identifier` below is what makes the crate
+//!    pick it up: its default asset matching only looks for names
+//!    containing the target triple (`x86_64-pc-windows-msvc`), and the
+//!    bare exe would be reported as "no release found with an asset for
+//!    target". A `.exe` extension is detected as a plain file (not an
+//!    archive) and installed verbatim.
 //!
 //! GUI rules: never block the UI thread (callers run these on worker
 //! threads and report back via `JobMsg`), never prompt on stdin
@@ -21,7 +24,7 @@ use anyhow::{bail, Context, Result};
 pub const REPO_OWNER: &str = "feelvm";
 /// GitHub repo name.
 pub const REPO_NAME: &str = "Shrinkr";
-/// Binary name as shipped inside the release zip.
+/// Binary name of the release asset (`shrinkr.exe` on Windows).
 pub const BIN_NAME: &str = "shrinkr";
 
 /// True when the constants above were left as placeholders.
@@ -45,6 +48,16 @@ fn updater(current_version: &str) -> Result<self_update::backends::github::Updat
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
         .current_version(current_version)
+        // Releases carry a bare `shrinkr.exe`, whose name contains neither
+        // the target triple nor arch/os tokens, so the crate's default asset
+        // matching finds nothing. The identifier fallback matches by plain
+        // substring instead. Any target-named asset uploaded in the future
+        // still wins over it (target match is tried first).
+        .asset_identifier(BIN_NAME)
+        // The update check reports the newest release; without this the
+        // default "compatible" strategy could install an older same-major
+        // one instead of what the UI just showed the user.
+        .update_strategy(self_update::UpdateStrategy::Latest)
         // GUI: no stdout spam, no interactive yes/no prompt (1.x defaults
         // are interactive and would stall without a terminal).
         .show_output(false)
