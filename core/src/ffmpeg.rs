@@ -1003,30 +1003,36 @@ fn move_file_robust(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// Pick a destination that doesn't clobber an unrelated existing file:
-/// `<stem>.mkv`, then `<stem>.shrunk.mkv`, `<stem>.shrunk-1.mkv`, …
+/// `<stem>.<ext>`, then `<stem>.shrunk.<ext>`, `<stem>.shrunk-1.<ext>`, …
+/// The extension comes from `base` itself, so images and videos share
+/// the same collision ladder.
 fn unique_dest(base: &Path) -> PathBuf {
     if !base.exists() {
         return base.to_path_buf();
     }
     let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+    let ext = base
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out");
     let parent = base.parent();
     let candidate = |name: String| match parent {
         Some(p) if !p.as_os_str().is_empty() => p.join(name),
         _ => PathBuf::from(name),
     };
-    let first = candidate(format!("{stem}.shrunk.mkv"));
+    let first = candidate(format!("{stem}.shrunk.{ext}"));
     if !first.exists() {
         return first;
     }
     for i in 1..100u32 {
-        let p = candidate(format!("{stem}.shrunk-{i}.mkv"));
+        let p = candidate(format!("{stem}.shrunk-{i}.{ext}"));
         if !p.exists() {
             return p;
         }
     }
     // Degenerate (100 collisions): fall back to timestamped name.
     candidate(format!(
-        "{stem}.shrunk-{}.mkv",
+        "{stem}.shrunk-{}.{ext}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1036,18 +1042,26 @@ fn unique_dest(base: &Path) -> PathBuf {
 
 /// Move a verified temp output to its final home.
 /// * `replace=true`: delete-then-move next to the original (safe on full
-///   disks). Same-name (.mkv→.mkv) goes through a `.orig.bak` swap.
+///   disks). Same-name (ext→ext) goes through a `.orig.bak` swap.
 /// * `replace=false`: keep both; never overwrites — collides resolve to
-///   `<stem>.shrunk.mkv`, `<stem>.shrunk-1.mkv`, …
+///   `<stem>.shrunk.<ext>`, `<stem>.shrunk-1.<ext>`, …
+///
+/// `dest_ext` is the output extension without dot (`"mkv"` for video,
+/// `"jpg"` for images) — conversions (avi→mkv, png→jpg) land on the new
+/// extension next to the original.
 ///
 /// Cross-volume moves (TEMP vs media drive) fall back to copy+delete.
-/// Cross-volume moves (TEMP vs media drive) fall back to copy+delete.
 /// Returns `(bytes saved, final dest path)` — saved is 0 when keeping both.
-pub fn place_output(orig: &Path, tmp_out: &Path, replace: bool) -> Result<(i64, PathBuf), String> {
+pub fn place_output(
+    orig: &Path,
+    tmp_out: &Path,
+    replace: bool,
+    dest_ext: &str,
+) -> Result<(i64, PathBuf), String> {
     let orig_len = std::fs::metadata(orig).map(|m| m.len()).unwrap_or(0) as i64;
     let new_len = std::fs::metadata(tmp_out).map(|m| m.len()).unwrap_or(0) as i64;
     if replace {
-        let dest = orig.with_extension("mkv");
+        let dest = orig.with_extension(dest_ext);
         if dest == orig {
             let bak = orig.with_extension("orig.bak");
             let _ = std::fs::remove_file(&bak); // stale bak from a crashed run
@@ -1082,7 +1096,7 @@ pub fn place_output(orig: &Path, tmp_out: &Path, replace: bool) -> Result<(i64, 
             Ok(((orig_len - new_len).max(0), dest))
         }
     } else {
-        let dest = unique_dest(&orig.with_extension("mkv"));
+        let dest = unique_dest(&orig.with_extension(dest_ext));
         move_file_robust(tmp_out, &dest)
             .map_err(|e| format!("move {} into place: {e}", dest.display()))?;
         Ok((0, dest))
@@ -1191,7 +1205,7 @@ mod tests {
         fs::write(&orig, b"orig-mp4").unwrap();
         fs::write(&other, b"unrelated").unwrap();
         fs::write(&tmp, b"shrunk").unwrap();
-        let (saved, dest) = place_output(&orig, &tmp, false).unwrap();
+        let (saved, dest) = place_output(&orig, &tmp, false, "mkv").unwrap();
         assert_eq!(saved, 0);
         assert_eq!(dest, d.join("movie.shrunk.mkv"));
         assert_eq!(fs::read(&other).unwrap(), b"unrelated");
@@ -1206,7 +1220,7 @@ mod tests {
         let tmp = d.join("tmp-out.mkv");
         fs::write(&orig, b"old").unwrap();
         fs::write(&tmp, b"new").unwrap();
-        let (saved, dest) = place_output(&orig, &tmp, true).unwrap();
+        let (saved, dest) = place_output(&orig, &tmp, true, "mkv").unwrap();
         assert_eq!(saved, 0); // new (3B) is not smaller than old (3B)
         assert_eq!(dest, orig);
         assert_eq!(fs::read(&orig).unwrap(), b"new");
@@ -1223,7 +1237,7 @@ mod tests {
         let tmp = d.join("tmp-out.mkv");
         fs::write(&orig, b"old-avi").unwrap();
         fs::write(&tmp, b"new-mkv-content").unwrap();
-        let (saved, dest) = place_output(&orig, &tmp, true).unwrap();
+        let (saved, dest) = place_output(&orig, &tmp, true, "mkv").unwrap();
         assert_eq!(dest, d.join("movie.mkv"));
         assert!(!orig.exists(), "original must be deleted on success");
         assert!(!tmp.exists(), "tmp must be moved away");
@@ -1243,11 +1257,50 @@ mod tests {
         fs::write(&orig, b"old-avi").unwrap();
         fs::write(&other, b"unrelated").unwrap();
         fs::write(&tmp, b"new").unwrap();
-        let (_, dest) = place_output(&orig, &tmp, true).unwrap();
+        let (_, dest) = place_output(&orig, &tmp, true, "mkv").unwrap();
         assert_eq!(dest, d.join("movie.shrunk.mkv"));
         assert_eq!(fs::read(&other).unwrap(), b"unrelated");
         assert_eq!(fs::read(&dest).unwrap(), b"new");
         assert!(!orig.exists());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn image_places_land_on_the_image_extension() {
+        // png → jpeg flows through the same placer: keep-both writes
+        // photo.jpg next to photo.png; replace deletes the png only after
+        // the jpg is in place.
+        let d = tmp_dir("image-place");
+        let orig = d.join("photo.png");
+        let tmp = d.join("tmp-out.jpg");
+        fs::write(&orig, b"png-bytes").unwrap();
+        fs::write(&tmp, b"jpg-bytes").unwrap();
+        let (saved, dest) = place_output(&orig, &tmp, false, "jpg").unwrap();
+        assert_eq!(saved, 0);
+        assert_eq!(dest, d.join("photo.jpg"));
+        assert_eq!(fs::read(&dest).unwrap(), b"jpg-bytes");
+        assert_eq!(fs::read(&orig).unwrap(), b"png-bytes");
+        // Replace: png gone, jpg owns the (new) name.
+        fs::remove_file(&dest).unwrap();
+        fs::write(&tmp, b"jpg-bytes").unwrap();
+        let (_, dest2) = place_output(&orig, &tmp, true, "jpg").unwrap();
+        assert_eq!(dest2, d.join("photo.jpg"));
+        assert!(!orig.exists(), "png must be deleted on replace");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn image_replace_same_ext_swaps_in_place() {
+        // jpg → jpg replace keeps the same name via the bak swap.
+        let d = tmp_dir("image-replace");
+        let orig = d.join("photo.jpg");
+        let tmp = d.join("tmp-out.jpg");
+        fs::write(&orig, b"old").unwrap();
+        fs::write(&tmp, b"new").unwrap();
+        let (_, dest) = place_output(&orig, &tmp, true, "jpg").unwrap();
+        assert_eq!(dest, orig);
+        assert_eq!(fs::read(&orig).unwrap(), b"new");
+        assert!(!d.join("photo.orig.bak").exists());
         fs::remove_dir_all(&d).ok();
     }
 

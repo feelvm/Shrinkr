@@ -6,7 +6,7 @@ use shrinkr_core::convert::MediaKind;
 use shrinkr_core::log::{LevelFilter, LogEntry};
 use shrinkr_core::media::MediaFile;
 use shrinkr_core::pipeline::{
-    estimate_file, preflight, EstParams, NvencPreset, Preflight, ScalePolicy, VideoBackend,
+    estimate_file, preflight_auto, EstParams, NvencPreset, Preflight, ScalePolicy, VideoBackend,
 };
 use std::path::PathBuf;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -78,6 +78,12 @@ pub struct AppState {
     pub nvenc_preset: NvencPreset,
     pub cq: u32,
     pub scale: ScalePolicy,
+    /// Image-only quality/resolution, separate from the video knobs
+    /// above: an image batch never shows NVENC/audio controls, and
+    /// moving the video quality slider must not re-quality images.
+    pub image_cq: u32,
+    pub image_scale: ScalePolicy,
+    pub image_preserve_format: bool,
     pub keep_subs: bool,
     pub min_saving_pct: f64,
     pub skip_efficient: bool,
@@ -253,6 +259,9 @@ impl Default for AppState {
             nvenc_preset: NvencPreset::P5,
             cq: 28,
             scale: ScalePolicy::Preserve,
+            image_cq: 28,
+            image_scale: ScalePolicy::Preserve,
+            image_preserve_format: true,
             keep_subs: true,
             all_audio: false,
             opus_bps: Some(shrinkr_core::pipeline::DEFAULT_OPUS_BPS),
@@ -319,7 +328,25 @@ impl AppState {
             scale: self.scale,
             opus_bps: self.opus_bps,
             all_audio: self.all_audio,
+            image_cq: self.image_cq,
+            image_scale: self.image_scale,
+            image_preserve_format: self.image_preserve_format,
         }
+    }
+
+    /// Any still image in the library — drives which Pipeline settings
+    /// sections are shown (image knobs appear only when they matter).
+    pub fn has_images(&self) -> bool {
+        self.files
+            .iter()
+            .any(|f| shrinkr_core::images::is_shrinkable_image(&f.path))
+    }
+
+    /// Any non-image (video) file in the library.
+    pub fn has_videos(&self) -> bool {
+        self.files
+            .iter()
+            .any(|f| !shrinkr_core::images::is_shrinkable_image(&f.path))
     }
 
     pub fn eligible(&self) -> Vec<usize> {
@@ -328,23 +355,36 @@ impl AppState {
         self.files
             .iter()
             .enumerate()
-            .filter(|(_, f)| matches!(preflight(f, &p, t), Preflight::Shrink { .. }))
+            .filter(|(_, f)| matches!(preflight_auto(f, &p, t), Preflight::Shrink { .. }))
             .map(|(i, _)| i)
             .collect()
     }
 
     /// (eligible_input_bytes, new_bytes, saved_bytes, est_seconds).
     /// Skipped files count toward neither input nor output — the headline
-    /// describes exactly the bytes Shrink will touch.
+    /// describes exactly the bytes Shrink will touch. Images use their own
+    /// size model and a flat per-file time (they encode in well under a
+    /// second; the frames-per-second model doesn't apply to single frames).
     pub fn estimate(&self) -> (u64, u64, u64, f64) {
         let p = self.est_params();
         let idx = self.eligible();
         let mut new_b = 0u64;
         let mut total_frames = 0f64;
+        let mut image_count = 0usize;
         for &i in &idx {
             let f = &self.files[i];
-            new_b += estimate_file(f, &p).new_bytes;
-            total_frames += f.total_frames();
+            if shrinkr_core::images::is_shrinkable_image(&f.path) {
+                new_b += shrinkr_core::images::estimate_image_bytes(
+                    f,
+                    p.image_cq,
+                    p.image_scale,
+                    p.image_preserve_format,
+                );
+                image_count += 1;
+            } else {
+                new_b += estimate_file(f, &p).new_bytes;
+                total_frames += f.total_frames();
+            }
         }
         let total_b: u64 = idx.iter().map(|&i| self.files[i].bytes).sum();
         let saved = total_b.saturating_sub(new_b);
@@ -354,11 +394,13 @@ impl AppState {
             VideoBackend::CpuAv1 => 120.0, // SVT-AV1 preset 8, measured 145+ fps
             _ => 600.0,
         };
+        let video_secs = total_frames / fps / (self.parallel.max(1) as f64);
+        let image_secs = image_count as f64 * 0.35 / (self.parallel.max(1) as f64);
         (
             total_b,
             new_b,
             saved,
-            total_frames / fps / (self.parallel.max(1) as f64),
+            video_secs + image_secs,
         )
     }
 
@@ -375,7 +417,7 @@ impl AppState {
                     .and_then(|s| s.to_str())
                     .unwrap_or("?")
                     .to_string();
-                match preflight(f, &p, t) {
+                match preflight_auto(f, &p, t) {
                     Preflight::Shrink { reason } => (name, true, reason),
                     Preflight::Skip { reason } => (name, false, reason),
                 }

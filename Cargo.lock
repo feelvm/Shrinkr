@@ -4957,7 +4957,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shrinkr"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "dioxus",
  "futures-channel",
@@ -4973,14 +4973,14 @@ dependencies = [
 
 [[package]]
 name = "shrinkr-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "shrinkr-core",
 ]
 
 [[package]]
 name = "shrinkr-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "self_update",

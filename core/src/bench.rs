@@ -279,10 +279,18 @@ pub fn recommend(rows: &[BenchRow]) -> Option<String> {
     })
 }
 
-/// Collect candidate media files for CLI benchmark (file or recursive dir).
+/// Collect candidate media files for CLI benchmark (file or recursive
+/// dir). Video-only: still images have their own pipeline and the
+/// x264/NVENC matrix says nothing about them, so an explicitly passed
+/// image is dropped just like one found in a directory walk.
 pub fn collect_inputs(arg: &Path) -> Vec<PathBuf> {
     if arg.is_file() {
-        return vec![arg.to_path_buf()];
+        return match arg.extension().and_then(|s| s.to_str()) {
+            Some(e) if crate::media::MEDIA_EXTS.contains(&e.to_lowercase().as_str()) => {
+                vec![arg.to_path_buf()]
+            }
+            _ => vec![],
+        };
     }
     let mut hits = vec![];
     for e in walkdir::WalkDir::new(arg)
@@ -300,4 +308,38 @@ pub fn collect_inputs(arg: &Path) -> Vec<PathBuf> {
     }
     hits.sort();
     hits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_inputs_is_video_only() {
+        let d = std::env::temp_dir().join(format!(
+            "shrinkr-bench-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        for name in ["a.mkv", "b.jpg", "c.mp4", "d.png", "e.webp"] {
+            std::fs::write(d.join(name), b"x").unwrap();
+        }
+        // The dir walk picks videos only.
+        let hits = collect_inputs(&d);
+        let names: Vec<String> = hits
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.mkv", "c.mp4"]);
+        // An explicitly passed image is dropped, not benchmarked through
+        // the video ladder.
+        assert!(collect_inputs(&d.join("b.jpg")).is_empty());
+        assert!(collect_inputs(&d.join("d.png")).is_empty());
+        // An explicitly passed video still lands.
+        assert_eq!(collect_inputs(&d.join("a.mkv")).len(), 1);
+        std::fs::remove_dir_all(&d).ok();
+    }
 }

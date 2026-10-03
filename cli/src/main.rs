@@ -5,6 +5,7 @@
 //! `--probe`/`--caps`/`--dry-run` inspect without encoding.
 
 use shrinkr_core::ffmpeg::EncodeBackend;
+use shrinkr_core::images::build_image_args;
 use shrinkr_core::media::{human_bytes, probe_file};
 use shrinkr_core::pipeline::{NvencPreset, ScalePolicy, VideoBackend};
 use shrinkr_core::{bench, ffmpeg, hw, pipeline};
@@ -34,13 +35,22 @@ fn cli_help() -> String {
      --shrink <file|dir>       run the real shrink pipeline headlessly\n\
      --replace                 delete originals after verified encode\n\
      \u{20}                      (default: keep both, <stem>.mkv alongside)\n\
+     --images / --no-images   shrink still images too — jpg/webp re-encode,\n\
+     \u{20}                      png/bmp/tiff → jpeg (default: on)\n\
      --backend <auto|hevc|h264|x264|x265|av1|copy>  (default auto)\n\
      --min-saving <pct>        preflight skip threshold (default 10)\n\
      --target <400MB|2x|50%>  solve per-file quality for a size target\n\
      --benchmark <file|dir>   run A:x264 + B-E:NVENC P3-P6 matrix on each input\n\
      --bench-out <dir>        CSV + notes dir (default ./bench-out)\n\
      --cq <18-40>             quality: NVENC CQ / x264/x265 CRF / AV1 CRF (default 28)\n\
-     --scale <preserve|1080p|720p|480p>  (default preserve)\n\
+     --scale <preserve|1080p|720p|480p|WxH>  video resolution; WxH caps\n\
+     \u{20}                      the box, e.g. 1920x1080 (default preserve)\n\
+     --image-cq <18-40>       image quality (default: --cq value)\n\
+     --image-scale <policy>   image resolution, same values as --scale\n\
+     \u{20}                      (default: --scale value)\n\
+     --image-preserve-format  
+     \u{20}                      drop, near-lossless 256-color palettes), tiff→tiff\n\
+     \u{20}                      (deflate); conversions off (default: off)\n\
      --keep-subs / --no-subs  subtitle copy (default keep)\n\
      --all-audio              keep every audio track (default: primary only)\n\
      --audio <off|32|48|64|96|128|192|256>  Opus kbps, off keeps as-is (default 64)\n\
@@ -61,11 +71,15 @@ fn parse_cli() -> i32 {
     let mut bench: Option<String> = None;
     let mut shrink: Option<String> = None;
     let mut replace_cli = false;
+    let mut images_cli = true;
     let mut backend_cli = VideoBackend::Auto;
     let mut min_saving_cli = 10.0f64;
     let mut bench_out = String::from("bench-out");
     let mut cq: u32 = 28;
     let mut scale = ScalePolicy::Preserve;
+    let mut image_cq: Option<u32> = None;
+    let mut image_scale: Option<ScalePolicy> = None;
+    let mut image_preserve = false;
     let mut keep_subs = true;
     let mut all_audio = false;
     let mut opus_bps: Option<u32> = Some(pipeline::DEFAULT_OPUS_BPS);
@@ -90,6 +104,8 @@ fn parse_cli() -> i32 {
                 }
             }
             "--replace" => replace_cli = true,
+            "--images" => images_cli = true,
+            "--no-images" => images_cli = false,
             "--backend" => {
                 i += 1;
                 if i < args.len() {
@@ -125,14 +141,40 @@ fn parse_cli() -> i32 {
             "--scale" => {
                 i += 1;
                 if i < args.len() {
-                    scale = match args[i].as_str() {
-                        "1080p" => ScalePolicy::Force1080p,
-                        "720p" => ScalePolicy::Force720p,
-                        "480p" => ScalePolicy::Force480p,
-                        _ => ScalePolicy::Preserve,
-                    };
+                    match ScalePolicy::parse(&args[i]) {
+                        Some(p) => scale = p,
+                        None => {
+                            eprintln!(
+                                "--scale rejected: {:?} — use preserve, 1080p/720p/480p or WxH (e.g. 1920x1080)",
+                                args[i]
+                            );
+                            return 2;
+                        }
+                    }
                 }
             }
+            "--image-cq" => {
+                i += 1;
+                if i < args.len() {
+                    image_cq = Some(args[i].parse().unwrap_or(28).clamp(18, 40));
+                }
+            }
+            "--image-scale" => {
+                i += 1;
+                if i < args.len() {
+                    match ScalePolicy::parse(&args[i]) {
+                        Some(p) => image_scale = Some(p),
+                        None => {
+                            eprintln!(
+                                "--image-scale rejected: {:?} — use preserve, 1080p/720p/480p or WxH (e.g. 1920x1080)",
+                                args[i]
+                            );
+                            return 2;
+                        }
+                    }
+                }
+            }
+            "--image-preserve-format" => image_preserve = true,
             "--keep-subs" => keep_subs = true,
             "--no-subs" => keep_subs = false,
             "--all-audio" => all_audio = true,
@@ -228,15 +270,20 @@ fn parse_cli() -> i32 {
         return cli_shrink(
             Path::new(&s),
             replace_cli,
+            images_cli,
             backend_cli,
             cq,
             scale,
+            image_cq.unwrap_or(cq),
+            image_scale.unwrap_or(scale),
+            image_preserve,
             keep_subs,
             all_audio,
             min_saving_cli,
             extra_args,
             opus_bps,
             target,
+            dry_run,
         );
     }
     println!("{}", cli_help());
@@ -250,15 +297,20 @@ fn parse_cli() -> i32 {
 fn cli_shrink(
     input: &Path,
     replace: bool,
+    images: bool,
     backend: VideoBackend,
     cq: u32,
     scale: ScalePolicy,
+    image_cq: u32,
+    image_scale: ScalePolicy,
+    image_preserve: bool,
     keep_subs: bool,
     all_audio: bool,
     min_saving: f64,
     extra_args: Vec<String>,
     opus_bps: Option<u32>,
     target: Option<shrinkr_core::target::TargetSpec>,
+    dry_run: bool,
 ) -> i32 {
     println!("HW: {}", hw::caps().summary());
     println!(
@@ -270,20 +322,31 @@ fn cli_shrink(
         eprintln!("ffmpeg/ffprobe missing on PATH — install them first.");
         return 1;
     }
-    let inputs: Vec<PathBuf> = if input.is_file() {
-        vec![input.to_path_buf()]
-    } else {
-        bench::collect_inputs(input)
-    };
+    // Videos + still images; --no-images drops the image half.
+    let mut inputs: Vec<PathBuf> = shrinkr_core::images::collect_shrink_inputs(input);
+    let found = inputs.len();
+    if !images {
+        inputs.retain(|p| !shrinkr_core::images::is_shrinkable_image(p));
+    }
     if inputs.is_empty() {
-        eprintln!("no media files under {}", input.display());
+        eprintln!(
+            "no shrinkable files under {}{}",
+            input.display(),
+            if found > 0 && !images {
+                " (--no-images excluded them)"
+            } else {
+                ""
+            }
+        );
         return 1;
     }
     println!(
-        "shrink {} input(s): backend={:?} cq={} replace={} min-saving={:.0}%{}",
+        "shrink {} input(s): backend={:?} cq={} image-cq={} preserve={} replace={} min-saving={:.0}%{}",
         inputs.len(),
         backend,
         cq,
+        image_cq,
+        image_preserve,
         replace,
         min_saving,
         if extra_args.is_empty() {
@@ -305,6 +368,9 @@ fn cli_shrink(
         scale,
         opus_bps,
         all_audio,
+        image_cq,
+        image_scale,
+        image_preserve_format: image_preserve,
     };
     for (n, p) in inputs.iter().enumerate() {
         let m = match probe_file(p) {
@@ -315,7 +381,7 @@ fn cli_shrink(
                 continue;
             }
         };
-        match pipeline::preflight(&m, &wp, min_saving) {
+        match pipeline::preflight_auto(&m, &wp, min_saving) {
             pipeline::Preflight::Skip { reason } => {
                 println!("[{n}] SKIP {}: {}", p.display(), reason);
                 continue;
@@ -325,11 +391,74 @@ fn cli_shrink(
             }
         }
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+        // Still-image branch: same preflight/verify/place contract, but a
+        // dedicated encoder, temp extension and no target solve.
+        if shrinkr_core::images::is_shrinkable_image(p) {
+            let mut plan = match shrinkr_core::images::plan_image(&m, image_preserve) {
+                Ok(pl) => pl,
+                Err(reason) => {
+                    println!("[{n}] SKIP {}: {reason}", p.display());
+                    continue;
+                }
+            };
+            let tmp_out = tmp_root.join(format!("{stem}-cli-{n}.{}", plan.target_ext));
+            let _ = std::fs::remove_file(&tmp_out);
+            let args = build_image_args(&m, &plan, image_cq, image_scale, &tmp_out);
+            println!("  cmd: {}", ffmpeg::command_line(&args));
+            if dry_run {
+                continue;
+            }
+            match shrinkr_core::images::encode_image_with_fallback(
+                &m,
+                &mut plan,
+                image_cq,
+                image_scale,
+                &tmp_out,
+                &cancel,
+                image_preserve,
+            ) {
+                Ok((tmp_final, shrinkr_core::images::ImageOutcome::Done(res))) => {
+                    match ffmpeg::place_output(&m.path, &tmp_final, replace, plan.target_ext) {
+                        Ok((saved, dest)) => println!(
+                            "  DONE: {} → {} ({:.0}%) in {:.1}s [{} {} {}] saved={} orig={} | {}",
+                            human_bytes(m.bytes),
+                            human_bytes(res.output_bytes),
+                            res.ratio * 100.0,
+                            res.elapsed_s,
+                            res.encoder,
+                            res.quality,
+                            plan.note,
+                            human_bytes(saved.max(0) as u64),
+                            if replace { "replaced" } else { "kept" },
+                            dest.display()
+                        ),
+                        Err(e) => {
+                            println!("  ENCODED ok but placing output failed: {e}");
+                            failed += 1;
+                        }
+                    }
+                }
+                Ok((_, shrinkr_core::images::ImageOutcome::NoGain { output_bytes })) => {
+                    let _ = std::fs::remove_file(&tmp_out);
+                    println!(
+                        "  SKIP: no gain ({} → {}) — kept original",
+                        human_bytes(m.bytes),
+                        human_bytes(output_bytes)
+                    );
+                }
+                Err(e) => {
+                    println!("  FAIL: {e}");
+                    failed += 1;
+                }
+            }
+            continue;
+        }
         let tmp_out = tmp_root.join(format!("{stem}-cli-{n}.mkv"));
         let _ = std::fs::remove_file(&tmp_out);
         // Per-file target solve (after preflight, before the real encode).
+        // Skipped under --dry-run: the solver runs trial encodes.
         let mut file_cq = cq;
-        if let Some(spec) = target {
+        if let Some(spec) = target.filter(|_| !dry_run) {
             let work = tmp_root.join("target");
             match shrinkr_core::target::solve_crf_for_file(
                 &m,
@@ -384,6 +513,9 @@ fn cli_shrink(
                 println!("  cmd: {}", ffmpeg::command_line(&args));
             }
         }
+        if dry_run {
+            continue;
+        }
         // NOTE: benchmark matrix varies the preset; shrink uses P5.
         let r = be.encode(
             &m,
@@ -407,7 +539,7 @@ fn cli_shrink(
                 continue;
             }
         };
-        match ffmpeg::place_output(&m.path, &tmp_out, replace) {
+        match ffmpeg::place_output(&m.path, &tmp_out, replace, "mkv") {
             Ok((saved, dest)) => match probe_file(&dest) {
                 Ok(vf) => println!(
                     "  DONE: {} → {} ({:.0}%) in {:.0}s, {:.0} fps, {:.2}x [{} {} hwdec={} audio={}] saved={} orig={} | verify: {}/{} {}, VLC-playable container mkv",
@@ -461,7 +593,14 @@ fn cli_benchmark(
     println!("HW: {}", hw::caps().summary());
     let inputs = bench::collect_inputs(input);
     if inputs.is_empty() {
-        eprintln!("no media files under {}", input.display());
+        if shrinkr_core::images::is_shrinkable_image(input) {
+            eprintln!(
+                "benchmark is video-only — {} is a still image (images don't run the x264/NVENC matrix)",
+                input.display()
+            );
+        } else {
+            eprintln!("no media files under {}", input.display());
+        }
         return 1;
     }
     println!("{} input(s), cq={}, dry_run={}", inputs.len(), cq, dry_run);

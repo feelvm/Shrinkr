@@ -18,8 +18,8 @@ mod state;
 use components::ui::{
     Alert, AlertDescription, AlertTitle, AlertVariant, Badge, BadgeVariant, Button, ButtonVariant,
     Callout, CalloutVariant, Card, CardContent, CardDescription, CardHeader, CardTitle, Checkbox,
-    Empty, EmptyDescription, EmptyTitle, Label, Progress, Slider, Spinner, Tabs, TabsContent,
-    TabsList, TabsTrigger,
+    Collapsible, Empty, EmptyDescription, EmptyTitle, Label, Progress, Slider, Spinner, Tabs,
+    TabsContent, TabsList, TabsTrigger,
 };
 use dioxus::document;
 use dioxus::html::{DragEvent, HasFileData};
@@ -27,9 +27,10 @@ use dioxus::prelude::*;
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_util::StreamExt;
 use jobs::JobMsg;
+use shrinkr_core::images::{jpeg_q_for, webp_quality_for};
 use shrinkr_core::log::{Level, LogEntry};
 use shrinkr_core::media::human_bytes;
-use shrinkr_core::pipeline::{preflight, NvencPreset, Preflight, ScalePolicy, VideoBackend};
+use shrinkr_core::pipeline::{preflight_auto, NvencPreset, Preflight, ScalePolicy, VideoBackend};
 use state::AppState;
 use std::sync::{atomic::AtomicBool, Arc};
 
@@ -124,29 +125,26 @@ fn Header() -> Element {
     let s = state.read();
     let tools_ok = s.ffmpeg_ok && s.ffprobe_ok;
     let hw = s.hw_summary.clone();
-    let current = env!("CARGO_PKG_VERSION").to_string();
     let checking = s.update_checking;
     let installing = s.update_installing;
     let available = s.update_available.clone();
     let ready = s.update_ready.clone();
     let busy = s.executing || s.convert_executing;
     drop(s);
-    let version_label = format!("v{current}");
     rsx! {
-        header { class: "flex shrink-0 items-center justify-between border-b border-border bg-card px-5 py-3",
+        header { class: "relative flex shrink-0 items-center justify-between border-b border-border bg-card px-5 py-3",
             div {
                 h1 { class: "text-lg font-bold tracking-tight", "Shrinkr" }
-                p { class: "text-xs text-muted-foreground",
-                    "NVDEC → CUDA → HEVC NVENC → Opus 64k → MKV · {version_label}"
-                }
             }
-            div { class: "flex items-center gap-2",
-                Badge { variant: BadgeVariant::Secondary, "{hw}" }
+            div { class: "pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2",
                 if tools_ok {
                     Badge { variant: BadgeVariant::Success, "ffmpeg ready" }
                 } else {
                     Badge { variant: BadgeVariant::Destructive, "ffmpeg missing" }
                 }
+            }
+            div { class: "flex items-center gap-2",
+                Badge { variant: BadgeVariant::Secondary, "{hw}" }
                 if let Some(v) = ready {
                     Badge { variant: BadgeVariant::Success, "v{v} installed" }
                     Button {
@@ -234,6 +232,14 @@ fn Sidebar() -> Element {
     let probe_done = s.probe_done;
     let probe_total = s.probe_total;
     let files_summary = crate::sidebar_summary(&s);
+    // Run state — the Shrink button and its batch progress live at the
+    // bottom of this sidebar, next to the import controls.
+    let executing = s.executing;
+    let exec_done = s.exec_done();
+    let exec_total = s.exec_total;
+    let exec_overall = s.exec_overall();
+    let exec_items = s.exec_items.clone();
+    let n_eligible = s.eligible().len();
     drop(s);
     let probe_pct = if probe_total > 0 {
         probe_done as f64 / probe_total as f64 * 100.0
@@ -241,6 +247,11 @@ fn Sidebar() -> Element {
         0.0
     };
     let probe_label = format!("Probing {probe_done}/{probe_total} …");
+    let progress_label = format!(
+        "Working {exec_done}/{exec_total} — {:.0}%",
+        exec_overall * 100.0
+    );
+    let shrink_label = format!("Shrink {n_eligible} file(s)");
     // OS drag & drop onto the sidebar queues shrink sources.
     let drop_tx = pump_tx();
     let mut drag_over = use_signal(|| false);
@@ -298,6 +309,7 @@ fn Sidebar() -> Element {
                                     }
                                     if let Some(paths) = dlg
                                         .add_filter("media", shrinkr_core::media::MEDIA_EXTS)
+                                        .add_filter("images", shrinkr_core::images::IMAGE_SHRINK_EXTS)
                                         .pick_files()
                                     {
                                         let _ = tx.unbounded_send(JobMsg::TargetsAdded(paths));
@@ -403,6 +415,39 @@ fn Sidebar() -> Element {
                     }
                 }
             }
+            // Run control, pinned to the bottom of the sidebar: the
+            // Shrink button when idle, batch progress + cancel mid-run.
+            div { class: "mt-auto flex flex-col gap-2",
+                if !executing {
+                    Button {
+                        variant: ButtonVariant::Default,
+                        class: "w-full",
+                        onclick: move |_| crate::shrink_clicked(state, pump_tx()),
+                        "{shrink_label}"
+                    }
+                } else {
+                    Progress { value: exec_overall * 100.0 }
+                    p { class: "text-xs text-muted-foreground", "{progress_label}" }
+                    p { class: "text-xs font-semibold", "Per-file progress ({exec_done}/{exec_total})" }
+                    div { class: "flex max-h-40 flex-col gap-2 overflow-y-auto",
+                        for item in exec_items {
+                            div { class: "flex flex-col gap-1",
+                                div { class: "flex items-center gap-2",
+                                    span { class: "min-w-0 flex-1 truncate font-mono text-xs", "{item.name}" }
+                                    span { class: "shrink-0 text-xs text-muted-foreground", "{item.status_text()}" }
+                                }
+                                Progress { value: item.frac * 100.0 }
+                            }
+                        }
+                    }
+                    Button {
+                        variant: ButtonVariant::Destructive,
+                        class: "w-full",
+                        onclick: move |_| crate::jobs::cancel_exec(state),
+                        "Cancel"
+                    }
+                }
+            }
         }
     }
 }
@@ -429,6 +474,9 @@ fn Main() -> Element {
         let s = state.read();
         s.ffmpeg_ok && s.ffprobe_ok
     };
+    // The benchmark matrix is video-only, so the card follows the
+    // library like the video knobs: no video loaded, no card.
+    let has_video = state.read().has_videos();
     rsx! {
         main { class: "min-w-0 flex-1 overflow-y-auto p-5",
             div { class: "mx-auto flex max-w-4xl flex-col gap-4",
@@ -452,8 +500,9 @@ fn Main() -> Element {
                             } else {
                                 PipelineCard {}
                                 EstimateCard {}
-                                RunCard {}
-                                BenchCard {}
+                                if has_video {
+                                    BenchCard {}
+                                }
                             }
                         }
                     }
@@ -495,7 +544,7 @@ fn ShrinkEmpty() -> Element {
                     Empty {
                         EmptyTitle { "No files yet" }
                         EmptyDescription {
-                            "Add folders or files on the left, press Scan — or drag & drop them here."
+                            "Add folders or files (videos and images) on the left, press Scan — or drag & drop them here."
                         }
                     }
                 }
@@ -512,6 +561,9 @@ fn PipelineCard() -> Element {
     let preset = s.nvenc_preset;
     let scale = s.scale;
     let cq = s.cq;
+    let image_cq = s.image_cq;
+    let image_scale = s.image_scale;
+    let image_preserve_format = s.image_preserve_format;
     let keep_subs = s.keep_subs;
     let all_audio = s.all_audio;
     let skip_efficient = s.skip_efficient;
@@ -520,19 +572,33 @@ fn PipelineCard() -> Element {
     let parallel = s.parallel;
     let extra_args = s.extra_args.clone();
     let opus_bps = s.opus_bps;
+    // Sections follow the library: video knobs only when a video is
+    // loaded, image knobs only when an image is — no NVENC/audio rows
+    // for a folder of photos.
+    let has_video = s.has_videos();
+    let has_image = s.has_images();
     drop(s);
     let cq_label = format!("{cq}");
+    let image_cq_label = format!("{image_cq}");
+    let image_quality_note = format!(
+        "Maps to JPEG q{} / WebP q{} — lower = smaller files.",
+        jpeg_q_for(image_cq),
+        webp_quality_for(image_cq)
+    );
     let saving_label = format!("{min_saving:.0}");
     let parallel_label = format!("{parallel}");
     rsx! {
         Card {
             CardHeader {
                 CardTitle { "Pipeline" }
-                CardDescription { "Encoder, quality, resolution and I/O" }
+                CardDescription { "Quality, resolution and I/O — video and images have separate knobs" }
             }
             CardContent {
                 div { class: "flex flex-col gap-4",
-                    div { class: "flex flex-wrap gap-2",
+                    if has_video {
+                        div { class: "flex flex-col gap-3",
+                            p { class: "text-xs font-semibold text-muted-foreground", "Video" }
+                            div { class: "flex flex-wrap gap-2",
                         Button {
                             variant: ButtonVariant::Outline,
                             onclick: move |_| {
@@ -540,7 +606,6 @@ fn PipelineCard() -> Element {
                                 w.backend = VideoBackend::Auto;
                                 w.nvenc_preset = NvencPreset::P5;
                                 w.cq = 28;
-                                w.scale = ScalePolicy::Preserve;
                             },
                             "Fast GPU"
                         }
@@ -551,7 +616,6 @@ fn PipelineCard() -> Element {
                                 w.backend = VideoBackend::HevcNvenc;
                                 w.nvenc_preset = NvencPreset::P6;
                                 w.cq = 32;
-                                w.scale = ScalePolicy::Force1080p;
                             },
                             "Smaller GPU"
                         }
@@ -560,7 +624,6 @@ fn PipelineCard() -> Element {
                             onclick: move |_| {
                                 let mut w = state.write();
                                 w.backend = VideoBackend::CpuX265;
-                                w.scale = ScalePolicy::Force720p;
                                 w.parallel = 1;
                             },
                             "Max CPU shrink"
@@ -611,20 +674,9 @@ fn PipelineCard() -> Element {
                         }
                         div { class: "flex flex-col gap-1",
                             Label { "Resolution" }
-                            select {
-                                class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
-                                onchange: move |e: FormEvent| {
-                                    state.write().scale = match e.value().as_str() {
-                                        "1080p" => ScalePolicy::Force1080p,
-                                        "720p" => ScalePolicy::Force720p,
-                                        "480p" => ScalePolicy::Force480p,
-                                        _ => ScalePolicy::Preserve,
-                                    };
-                                },
-                                option { value: "preserve", selected: scale == ScalePolicy::Preserve, "Preserve" }
-                                option { value: "1080p", selected: scale == ScalePolicy::Force1080p, "Force 1080p" }
-                                option { value: "720p", selected: scale == ScalePolicy::Force720p, "Force 720p" }
-                                option { value: "480p", selected: scale == ScalePolicy::Force480p, "Force 480p" }
+                            ScalePicker {
+                                value: scale,
+                                on_change: move |v| state.write().scale = v,
                             }
                         }
                     }
@@ -701,62 +753,6 @@ fn PipelineCard() -> Element {
                             }
                             "Keep all audio tracks (dual-audio)"
                         }
-                        label { class: "flex items-center gap-2 text-sm",
-                            Checkbox {
-                                checked: skip_efficient,
-                                on_checked_change: move |v| state.write().skip_efficient = v,
-                            }
-                            "Skip already-efficient files"
-                        }
-                        label { class: "flex items-center gap-2 text-sm",
-                            Checkbox {
-                                checked: replace,
-                                on_checked_change: move |v| state.write().replace = v,
-                            }
-                            "Replace originals after verified encode"
-                        }
-                    }
-                    div { class: "flex items-center gap-3",
-                        div { class: "w-28 shrink-0",
-                            Label { "Min. saving %" }
-                        }
-                        div { class: "max-w-md flex-1",
-                            Slider {
-                                min: 0.0,
-                                max: 30.0,
-                                step: 1.0,
-                                value: min_saving,
-                                oninput: move |e: FormEvent| {
-                                    if let Ok(v) = e.value().parse::<f64>() {
-                                        state.write().min_saving_pct = v.clamp(0.0, 30.0);
-                                    }
-                                },
-                            }
-                        }
-                        div { class: "flex w-12 shrink-0 justify-end",
-                            Badge { "{saving_label}" }
-                        }
-                    }
-                    div { class: "flex items-center gap-3",
-                        div { class: "w-28 shrink-0",
-                            Label { "Parallel jobs" }
-                        }
-                        div { class: "max-w-md flex-1",
-                            Slider {
-                                min: 1.0,
-                                max: 4.0,
-                                step: 1.0,
-                                value: parallel as f64,
-                                oninput: move |e: FormEvent| {
-                                    if let Ok(v) = e.value().parse::<f64>() {
-                                        state.write().parallel = v.clamp(1.0, 4.0) as usize;
-                                    }
-                                },
-                            }
-                        }
-                        div { class: "flex w-12 shrink-0 justify-end",
-                            Badge { "{parallel_label}" }
-                        }
                     }
                     div { class: "flex flex-col gap-1",
                         Label { "Extra ffmpeg flags (advanced)" }
@@ -773,9 +769,220 @@ fn PipelineCard() -> Element {
                             "Appended as output options (can override quality flags). Estimates ignore them. Blocked: -i -map -ss -t -f -y -c:s and other structural flags."
                         }
                     }
-                    Callout { variant: CalloutVariant::Info, title: "How estimates work",
-                        "Size, time and plan update live: codec × CQ × preset × resolution × audio. NVENC CQ ≠ x264 CRF — verify in Benchmark."
+                        }
                     }
+                    if has_image {
+                        div { class: "flex flex-col gap-3",
+                            p { class: "text-xs font-semibold text-muted-foreground", "Images" }
+                            div { class: "flex items-center gap-3",
+                                div { class: "w-28 shrink-0",
+                                    Label { "Image quality" }
+                                }
+                                div { class: "max-w-md flex-1",
+                                    // Stored value is a CQ (higher = lower
+                                    // quality), so the slider renders it
+                                    // mirrored: left = low quality, right = high.
+                                    Slider {
+                                        min: 18.0,
+                                        max: 40.0,
+                                        step: 1.0,
+                                        value: 58.0 - image_cq as f64,
+                                        oninput: move |e: FormEvent| {
+                                            if let Ok(v) = e.value().parse::<f64>() {
+                                                state.write().image_cq = (58.0 - v).clamp(18.0, 40.0) as u32;
+                                            }
+                                        },
+                                    }
+                                }
+                                div { class: "flex w-12 shrink-0 justify-end",
+                                    Badge { "{image_cq_label}" }
+                                }
+                            }
+                            div { class: "flex items-center gap-3",
+                                div { class: "w-28 shrink-0",
+                                    Label { "Image resolution" }
+                                }
+                                div { class: "flex-1",
+                                    ScalePicker {
+                                        value: image_scale,
+                                        on_change: move |v| state.write().image_scale = v,
+                                    }
+                                }
+                            }
+                            label { class: "flex items-center gap-2 text-sm",
+                                Checkbox {
+                                    checked: image_preserve_format,
+                                    on_checked_change: move |v| {
+                                        state.write().image_preserve_format = v;
+                                    },
+                                }
+                                "Preserve image formats (png stays png, tiff stays tiff)"
+                            }
+                            Collapsible { title: "How image quality works",
+                                "{image_quality_note} PNG/BMP/TIFF convert to JPEG when smaller; transparency converts to WebP with the alpha channel kept; animations skip; dead-end JPEGs get one measured WebP fallback. With Preserve image formats checked, PNGs stay PNG (constant opaque alpha planes dropped, near-lossless 256-color palettes, lossless re-encode) and TIFFs stay TIFF via deflate — files that cannot win as their own format skip."
+                            }
+                        }
+                    }
+                    div { class: "flex flex-col gap-3",
+                        p { class: "text-xs font-semibold text-muted-foreground", "General" }
+                        div { class: "flex flex-col gap-2",
+                            label { class: "flex items-center gap-2 text-sm",
+                                Checkbox {
+                                    checked: skip_efficient,
+                                    on_checked_change: move |v| state.write().skip_efficient = v,
+                                }
+                                "Skip already-efficient files"
+                            }
+                            label { class: "flex items-center gap-2 text-sm",
+                                Checkbox {
+                                    checked: replace,
+                                    on_checked_change: move |v| state.write().replace = v,
+                                }
+                                "Replace originals after verified encode"
+                            }
+                        }
+                        div { class: "flex items-center gap-3",
+                            div { class: "w-28 shrink-0",
+                                Label { "Min. saving %" }
+                            }
+                            div { class: "max-w-md flex-1",
+                                Slider {
+                                    min: 0.0,
+                                    max: 30.0,
+                                    step: 1.0,
+                                    value: min_saving,
+                                    oninput: move |e: FormEvent| {
+                                        if let Ok(v) = e.value().parse::<f64>() {
+                                            state.write().min_saving_pct = v.clamp(0.0, 30.0);
+                                        }
+                                    },
+                                }
+                            }
+                            div { class: "flex w-12 shrink-0 justify-end",
+                                Badge { "{saving_label}" }
+                            }
+                        }
+                        div { class: "flex items-center gap-3",
+                            div { class: "w-28 shrink-0",
+                                Label { "Parallel jobs" }
+                            }
+                            div { class: "max-w-md flex-1",
+                                Slider {
+                                    min: 1.0,
+                                    max: 4.0,
+                                    step: 1.0,
+                                    value: parallel as f64,
+                                    oninput: move |e: FormEvent| {
+                                        if let Ok(v) = e.value().parse::<f64>() {
+                                            state.write().parallel = v.clamp(1.0, 4.0) as usize;
+                                        }
+                                    },
+                                }
+                            }
+                            div { class: "flex w-12 shrink-0 justify-end",
+                                Badge { "{parallel_label}" }
+                            }
+                        }
+                    }
+                    Collapsible { title: "How estimates work",
+                        "Size, time and plan update live as you change settings. Videos: codec × CQ × preset × resolution × audio. Images: their own quality and resolution knobs above (JPEG/WebP re-encode, PNG/BMP/TIFF → JPEG when smaller, transparency → WebP with alpha kept, measured WebP fallback for dead-end JPEGs; with format preservation on, png/tiff re-encode as themselves losslessly and conversions are off; animated files skip). NVENC CQ ≠ x264 CRF — verify in Benchmark. Extra ffmpeg flags apply to video only."
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resolution policy dropdown shared by the video and image sections.
+/// `Custom` reveals W/H inputs: the policy becomes `ScalePolicy::Custom`,
+/// a fit-inside box (downscale-only, aspect preserved, never upscaled).
+/// Width/height live in local text signals so half-typed numbers ("1" on
+/// the way to "1600") never clamp the field under the user's cursor —
+/// they commit to the policy only once they parse.
+#[component]
+fn ScalePicker(value: ScalePolicy, on_change: EventHandler<ScalePolicy>) -> Element {
+    let is_custom = matches!(value, ScalePolicy::Custom(_, _));
+    let mut wtext = use_signal(move || match value {
+        ScalePolicy::Custom(w, _) => w.to_string(),
+        _ => String::new(),
+    });
+    let mut htext = use_signal(move || match value {
+        ScalePolicy::Custom(_, h) => h.to_string(),
+        _ => String::new(),
+    });
+    // One side of the committed custom box: the parsed field text if it
+    // parses, else whatever the policy already holds, else the default.
+    let side = |text: String, fallback: u32| -> u32 {
+        text.parse::<u32>()
+            .map(|v| v.clamp(16, 8192))
+            .unwrap_or(fallback.clamp(16, 8192))
+    };
+    let box_now = move || match value {
+        ScalePolicy::Custom(w, h) => (side(wtext(), w), side(htext(), h)),
+        _ => (side(wtext(), 1920), side(htext(), 1080)),
+    };
+    rsx! {
+        div { class: "flex flex-col gap-1",
+            select {
+                class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
+                onchange: move |e: FormEvent| {
+                    match e.value().as_str() {
+                        "1080p" => on_change.call(ScalePolicy::Force1080p),
+                        "720p" => on_change.call(ScalePolicy::Force720p),
+                        "480p" => on_change.call(ScalePolicy::Force480p),
+                        "custom" => {
+                            // Field text survives dropdown toggles, so the
+                            // user's last size comes back instead of resetting.
+                            let (w, h) = box_now();
+                            wtext.set(w.to_string());
+                            htext.set(h.to_string());
+                            on_change.call(ScalePolicy::Custom(w, h));
+                        }
+                        _ => on_change.call(ScalePolicy::Preserve),
+                    }
+                },
+                option { value: "preserve", selected: value == ScalePolicy::Preserve, "Preserve" }
+                option { value: "1080p", selected: value == ScalePolicy::Force1080p, "Force 1080p" }
+                option { value: "720p", selected: value == ScalePolicy::Force720p, "Force 720p" }
+                option { value: "480p", selected: value == ScalePolicy::Force480p, "Force 480p" }
+                option { value: "custom", selected: is_custom, "Custom (max W × H)" }
+            }
+            if is_custom {
+                div { class: "flex items-center gap-2",
+                    input {
+                        class: "w-20 rounded-md border border-input bg-background px-2 py-1 text-sm",
+                        r#type: "number",
+                        min: "16",
+                        max: "8192",
+                        placeholder: "width",
+                        value: "{wtext}",
+                        oninput: move |e: FormEvent| {
+                            let v = e.value();
+                            wtext.set(v.clone());
+                            if let Ok(w) = v.parse::<u32>() {
+                                let (_, h) = box_now();
+                                on_change.call(ScalePolicy::Custom(w.clamp(16, 8192), h));
+                            }
+                        },
+                    }
+                    span { class: "text-xs text-muted-foreground", "×" }
+                    input {
+                        class: "w-20 rounded-md border border-input bg-background px-2 py-1 text-sm",
+                        r#type: "number",
+                        min: "16",
+                        max: "8192",
+                        placeholder: "height",
+                        value: "{htext}",
+                        oninput: move |e: FormEvent| {
+                            let v = e.value();
+                            htext.set(v.clone());
+                            if let Ok(h) = v.parse::<u32>() {
+                                let (w, _) = box_now();
+                                on_change.call(ScalePolicy::Custom(w, h.clamp(16, 8192)));
+                            }
+                        },
+                    }
+                    span { class: "text-xs text-muted-foreground", "px max box — aspect kept, never upscaled" }
                 }
             }
         }
@@ -842,6 +1049,10 @@ fn EstimateCard() -> Element {
         .collect();
     let target_text = s.target_text.clone();
     let target_solving = s.target_solving;
+    // Target solving is video-only (images don't take a CRF), so the
+    // solve row follows the library like the Benchmark card — the
+    // estimates and plan rows above stay for image-only batches.
+    let has_video = s.has_videos();
     drop(s);
     rsx! {
         Card {
@@ -857,78 +1068,26 @@ fn EstimateCard() -> Element {
                         p { class: "{cls}", "{mark} {text}" }
                     }
                 }
-                div { class: "mt-2 flex items-center gap-2",
-                    input {
-                        class: "w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs",
-                        r#type: "text",
-                        placeholder: "400MB or 2x",
-                        value: "{target_text}",
-                        oninput: move |e: FormEvent| {
-                            state.write().target_text = e.value();
-                        },
-                    }
-                    Button {
-                        variant: ButtonVariant::Outline,
-                        disabled: target_solving,
-                        onclick: move |_| crate::solve_clicked(state, pump_tx()),
-                        if target_solving { "Solving…" } else { "Solve CRF" }
-                    }
-                }
-                p { class: "text-xs text-muted-foreground",
-                    "Solves the quality value for the first eligible file and sets the slider. Batch runs reuse it."
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn RunCard() -> Element {
-    let state = use_context::<Signal<AppState>>();
-    let s = state.read();
-    let executing = s.executing;
-    let done = s.exec_done();
-    let total = s.exec_total;
-    let overall = s.exec_overall();
-    let items = s.exec_items.clone();
-    let n = s.eligible().len();
-    drop(s);
-    let progress_label = format!("Working {done}/{total} — {:.0}%", overall * 100.0);
-    let shrink_label = format!("Shrink {n} file(s)");
-    rsx! {
-        Card {
-            CardHeader {
-                CardTitle { "Run" }
-            }
-            CardContent {
-                if !executing {
-                    Button {
-                        variant: ButtonVariant::Default,
-                        class: "w-full",
-                        onclick: move |_| crate::shrink_clicked(state, pump_tx()),
-                        "{shrink_label}"
-                    }
-                } else {
-                    Progress { value: overall * 100.0 }
-                    p { class: "mt-1 text-xs text-muted-foreground", "{progress_label}" }
-                    p { class: "mt-2 text-xs font-semibold", "Per-file progress ({done}/{total})" }
-                    div { class: "mt-1 flex max-h-40 flex-col gap-2 overflow-y-auto",
-                        for item in items {
-                            div { class: "flex flex-col gap-1",
-                                div { class: "flex items-center gap-2",
-                                    span { class: "min-w-0 flex-1 truncate font-mono text-xs", "{item.name}" }
-                                    span { class: "shrink-0 text-xs text-muted-foreground", "{item.status_text()}" }
-                                }
-                                Progress { value: item.frac * 100.0 }
-                            }
+                if has_video {
+                    div { class: "mt-2 flex items-center gap-2",
+                        input {
+                            class: "w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs",
+                            r#type: "text",
+                            placeholder: "400MB or 2x",
+                            value: "{target_text}",
+                            oninput: move |e: FormEvent| {
+                                state.write().target_text = e.value();
+                            },
                         }
-                    }
-                    div { class: "mt-2",
                         Button {
-                            variant: ButtonVariant::Destructive,
-                            onclick: move |_| crate::jobs::cancel_exec(state),
-                            "Cancel"
+                            variant: ButtonVariant::Outline,
+                            disabled: target_solving,
+                            onclick: move |_| crate::solve_clicked(state, pump_tx()),
+                            if target_solving { "Solving…" } else { "Solve CRF" }
                         }
+                    }
+                    p { class: "text-xs text-muted-foreground",
+                        "Solves the quality value for the first eligible file and sets the slider. Batch runs reuse it."
                     }
                 }
             }
@@ -955,7 +1114,7 @@ fn shrink_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
             w.push_log("  (no probed files — Scan first)".into());
         }
         for f in files.iter().take(10) {
-            if let Preflight::Skip { reason } = preflight(f, &p, t) {
+            if let Preflight::Skip { reason } = preflight_auto(f, &p, t) {
                 let name = f.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
                 w.push_log(format!("  ✗ {}: {}", name, reason));
             }
@@ -994,10 +1153,23 @@ fn shrink_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
             return;
         }
     };
-    let first_cmd = {
-        if let Some(f0) = files.first() {
+    let first_cmd = files.first().and_then(|f0| {
+        if shrinkr_core::images::is_shrinkable_image(&f0.path) {
+            // Image jobs echo the image command; target ext comes from the plan.
+            shrinkr_core::images::plan_image(f0, params.image_preserve_format)
+                .ok()
+                .map(|plan| {
+                command_line(&shrinkr_core::images::build_image_args(
+                    f0,
+                    &plan,
+                    params.image_cq,
+                    params.image_scale,
+                    std::path::Path::new(&format!("<tmp>.{}", plan.target_ext)),
+                ))
+            })
+        } else {
             let levels = select_levels_for_media(params.backend, caps(), f0);
-            if let Some(l0) = levels.first() {
+            levels.first().map(|l0| {
                 let plan = plan_streams(f0, keep_subs, params.opus_bps, params.all_audio);
                 let args = build_args(
                     f0,
@@ -1010,14 +1182,10 @@ fn shrink_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
                     &plan,
                     &extra_args,
                 );
-                Some(command_line(&args))
-            } else {
-                None
-            }
-        } else {
-            None
+                command_line(&args)
+            })
         }
-    };
+    });
     drop(s);
     let cancel = Arc::new(AtomicBool::new(false));
     let cfg = crate::state::ExecCfg {
@@ -1080,14 +1248,21 @@ fn solve_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         }
     };
     let idx = s.eligible();
-    if idx.is_empty() {
+    // Target solving drives the video encoder ladder; still images have
+    // no CRF to solve (their quality is the same CQ slider).
+    let Some(vi) = idx
+        .iter()
+        .copied()
+        .find(|&i| !shrinkr_core::images::is_shrinkable_image(&s.files[i].path))
+    else {
         drop(s);
         state.write().push_log(
-            "Solve CRF needs an eligible file — Scan first (preflight decides eligibility).".into(),
+            "Solve CRF is video-only — no eligible video in the plan (images don't take a CRF)."
+                .into(),
         );
         return;
-    }
-    let f = s.files[idx[0]].clone();
+    };
+    let f = s.files[vi].clone();
     let fname = f
         .path
         .file_name()
@@ -1196,19 +1371,39 @@ fn BenchCard() -> Element {
                             onclick: move |_| {
                                 let tx = pump_tx();
                                 let s = state.read();
-                                let idx = s.eligible();
-                                if idx.is_empty() && s.files.is_empty() {
+                                if s.files.is_empty() {
                                     drop(s);
                                     state
                                         .write()
                                         .push_log("Benchmark: scan files first.".into());
                                     return;
                                 }
-                                let m = if let Some(&i) = idx.first() {
-                                    s.files[i].clone()
-                                } else {
-                                    s.files.first().cloned().unwrap()
+                                // The matrix is the video encoder ladder;
+                                // still images stay out of it (same
+                                // video-only rule as Solve CRF).
+                                let vi = s
+                                    .eligible()
+                                    .iter()
+                                    .copied()
+                                    .find(|&i| {
+                                        !shrinkr_core::images::is_shrinkable_image(
+                                            &s.files[i].path,
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        s.files.iter().position(|f| {
+                                            !shrinkr_core::images::is_shrinkable_image(&f.path)
+                                        })
+                                    });
+                                let Some(vi) = vi else {
+                                    drop(s);
+                                    state.write().push_log(
+                                        "Benchmark is video-only — no eligible video in the plan (images don't run the x264/NVENC matrix)."
+                                            .into(),
+                                    );
+                                    return;
                                 };
+                                let m = s.files[vi].clone();
                                 let (cq, scale, keep_subs) = (s.cq, s.scale, s.keep_subs);
                                 drop(s);
                                 {
@@ -1325,7 +1520,7 @@ fn ConvertCard() -> Element {
         Card {
             CardHeader {
                 CardTitle { "Convert — change file type" }
-                CardDescription { "Video→video, video→audio (extract soundtrack), audio→audio, image→image, subtitle→subtitle, Word→Word, spreadsheet→spreadsheet. Only outputs this machine can write are offered. {caps_summary}" }
+                CardDescription { "Change a file's type — video, audio, image, subtitle or document" }
             }
             CardContent {
                 div { class: "flex flex-col gap-3",
@@ -1556,7 +1751,10 @@ fn ConvertCard() -> Element {
                             "Word, Excel, PowerPoint and PDF conversion needs LibreOffice installed (soffice on PATH). Media and subtitle conversion works without it."
                         }
                     }
-                    Callout { variant: CalloutVariant::Info, title: "How convert works",
+                    Collapsible { title: "What convert supports",
+                        "Video→video, video→audio (extract soundtrack), audio→audio, image→image, subtitle→subtitle, Word→Word, spreadsheet→spreadsheet. Only outputs this machine can write are offered. {caps_summary}"
+                    }
+                    Collapsible { title: "How convert works",
                         "Remuxes (-c copy) when the codecs fit the new container, otherwise re-encodes once with high-quality defaults. Video→audio extracts the soundtrack only (MP3 192k, M4A 128k, Opus 96k, Vorbis q5, FLAC lossless, WAV PCM). Documents go through LibreOffice (one at a time). Size estimates are exact for remuxes, approximate (~) otherwise."
                     }
                 }

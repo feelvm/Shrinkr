@@ -11,7 +11,7 @@ use futures_channel::mpsc::UnboundedSender;
 use shrinkr_core::bench;
 use shrinkr_core::ffmpeg::{place_output, EncodeBackend, FfmpegBackend};
 use shrinkr_core::media::{human_bytes, probe_file, MediaFile};
-use shrinkr_core::pipeline::{preflight, EstParams, Preflight};
+use shrinkr_core::pipeline::{preflight_auto, EstParams, Preflight};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicBool, atomic::AtomicUsize, atomic::Ordering, Arc};
@@ -111,9 +111,10 @@ pub fn start_scan(tx: UnboundedSender<JobMsg>, targets: Vec<PathBuf>) {
                             continue;
                         }
                         if let Some(ext) = e.path().extension().and_then(|s| s.to_str()) {
-                            if shrinkr_core::media::MEDIA_EXTS
-                                .contains(&ext.to_lowercase().as_str())
-                            {
+                            let l = ext.to_lowercase();
+                            let hit = shrinkr_core::media::MEDIA_EXTS.contains(&l.as_str())
+                                || shrinkr_core::images::IMAGE_SHRINK_EXTS.contains(&l.as_str());
+                            if hit {
                                 if seen.insert(e.path().to_path_buf()) {
                                     hits.push(e.path().to_path_buf());
                                 }
@@ -193,8 +194,13 @@ fn run_one_job(
     extra_args: Vec<String>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(i64, String), String> {
-    if let Preflight::Skip { reason } = preflight(&f, &params, threshold) {
+    if let Preflight::Skip { reason } = preflight_auto(&f, &params, threshold) {
         return Err(format!("skip {}: {}", f.path.display(), reason));
+    }
+    // Still images take the image branch: dedicated encoder, temp
+    // extension and placement ext; the video pipeline never sees them.
+    if shrinkr_core::images::is_shrinkable_image(&f.path) {
+        return run_one_image_job(tx, f, params, tmp_root, job_idx, replace, cancel);
     }
     let stem = f.path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let tmp_out = tmp_root.join(format!("{}-{}.mkv", stem, job_idx));
@@ -235,7 +241,7 @@ fn run_one_job(
         Some((w, h)) => format!(" scale_cuda→{}x{}", w, h),
         None => String::new(),
     };
-    let (saved, dest) = place_output(&f.path, &tmp_out, replace)?;
+    let (saved, dest) = place_output(&f.path, &tmp_out, replace, "mkv")?;
     let dest_name = dest.file_name().and_then(|x| x.to_str()).unwrap_or("?");
     let detail = format!(
         "done {}: {} → {} ({:.0}%) in {:.0}s, {:.0} fps, {:.2}x realtime [{} {}{}, hwdec={}, audio={}, orig={}]",
@@ -251,6 +257,76 @@ fn run_one_job(
         scale_note,
         er.hw_decode,
         er.audio_mode,
+        if replace {
+            format!("replaced→{dest_name}")
+        } else {
+            format!("kept, wrote {dest_name}")
+        }
+    );
+    Ok((saved, detail))
+}
+
+/// One still image through the image pipeline: plan → temp encode →
+/// place next to the original with the target extension. The caller's
+/// preflight already said Shrink; a stale plan (impossible in-process)
+/// degrades to a loud skip. No progress stream: stills encode in well
+/// under a second.
+fn run_one_image_job(
+    _tx: &UnboundedSender<JobMsg>,
+    f: MediaFile,
+    params: EstParams,
+    tmp_root: &Path,
+    job_idx: usize,
+    replace: bool,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(i64, String), String> {
+    use shrinkr_core::images::{encode_image_with_fallback, plan_image, ImageOutcome};
+    let fname = f
+        .path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
+    let mut plan =
+        plan_image(&f, params.image_preserve_format)
+            .map_err(|reason| format!("skip {fname}: {reason}"))?;
+    let stem = f.path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+    let tmp_out = tmp_root.join(format!("{}-{}.{}", stem, job_idx, plan.target_ext));
+    let _ = std::fs::remove_file(&tmp_out);
+    // The fallback may switch the plan to WebP; the returned path is the
+    // temp file that actually holds the winning encode.
+    let (tmp_final, outcome) = encode_image_with_fallback(
+        &f,
+        &mut plan,
+        params.image_cq,
+        params.image_scale,
+        &tmp_out,
+        cancel,
+        params.image_preserve_format,
+    )?;
+    let res = match outcome {
+        ImageOutcome::Done(r) => r,
+        ImageOutcome::NoGain { output_bytes } => {
+            let _ = std::fs::remove_file(&tmp_out);
+            return Err(format!(
+                "skip {fname}: no gain ({} → {}) — kept original",
+                human_bytes(f.bytes),
+                human_bytes(output_bytes)
+            ));
+        }
+    };
+    let (saved, dest) = place_output(&f.path, &tmp_final, replace, plan.target_ext)?;
+    let dest_name = dest.file_name().and_then(|x| x.to_str()).unwrap_or("?");
+    let detail = format!(
+        "done {}: {} → {} ({:.0}%) in {:.1}s [{} {}, {} orig={}]",
+        fname,
+        human_bytes(f.bytes),
+        human_bytes(res.output_bytes),
+        res.ratio * 100.0,
+        res.elapsed_s,
+        res.encoder,
+        res.quality,
+        plan.note,
         if replace {
             format!("replaced→{dest_name}")
         } else {
@@ -798,7 +874,7 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                         let p = s.est_params();
                         let t = s.threshold();
                         if matches!(
-                            shrinkr_core::pipeline::preflight(&f, &p, t),
+                            shrinkr_core::pipeline::preflight_auto(&f, &p, t),
                             shrinkr_core::pipeline::Preflight::Shrink { .. }
                         ) {
                             s.pending.push(f);

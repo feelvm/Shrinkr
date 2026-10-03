@@ -100,15 +100,38 @@ pub enum ScalePolicy {
     Force720p,
     /// Downscale any larger source to 480p. Never upscales.
     Force480p,
+    /// Fit inside a user-set `WxH` box: downscale-only, aspect preserved,
+    /// never upscales. Each side is its own cap — landscape sources hit
+    /// the width limit, portrait ones the height limit.
+    Custom(u32, u32),
 }
 
 impl ScalePolicy {
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> String {
         match self {
-            ScalePolicy::Preserve => "Preserve (never resize)",
-            ScalePolicy::Force1080p => "Force max 1080p (downscale only)",
-            ScalePolicy::Force720p => "Force max 720p (downscale only)",
-            ScalePolicy::Force480p => "Force max 480p (downscale only)",
+            ScalePolicy::Preserve => "Preserve (never resize)".into(),
+            ScalePolicy::Force1080p => "Force max 1080p (downscale only)".into(),
+            ScalePolicy::Force720p => "Force max 720p (downscale only)".into(),
+            ScalePolicy::Force480p => "Force max 480p (downscale only)".into(),
+            ScalePolicy::Custom(w, h) => format!("Fit within {w}x{h} (downscale only)"),
+        }
+    }
+
+    /// Parse a policy value: `preserve|1080p|720p|480p` or a `WxH` box
+    /// (`1920x1080`) for [`ScalePolicy::Custom`]. CLI/GUI share this so
+    /// custom sizes parse identically everywhere.
+    pub fn parse(s: &str) -> Option<ScalePolicy> {
+        match s.to_lowercase().as_str() {
+            "preserve" | "keep" | "none" => Some(ScalePolicy::Preserve),
+            "1080p" => Some(ScalePolicy::Force1080p),
+            "720p" => Some(ScalePolicy::Force720p),
+            "480p" => Some(ScalePolicy::Force480p),
+            other => {
+                let (w, h) = other.split_once('x')?;
+                let w = w.trim().parse::<u32>().ok()?;
+                let h = h.trim().parse::<u32>().ok()?;
+                Some(ScalePolicy::Custom(w, h))
+            }
         }
     }
 }
@@ -313,6 +336,19 @@ pub struct EstParams {
     /// Keep every audio track (dual-audio releases). Default false:
     /// primary track only, the rest dropped.
     pub all_audio: bool,
+    /// Still-image quality on the same 18–40 CQ scale, kept separate from
+    /// the video slider: an image batch has no use for NVENC CQ, and a
+    /// video batch shouldn't drag image quality along.
+    pub image_cq: u32,
+    /// Still-image resolution policy, separate from the video one for the
+    /// same reason.
+    pub image_scale: ScalePolicy,
+    /// Preserve still-image formats: outputs keep their source extension
+    /// (png→png, tiff→tiff) using format-preserving techniques (alpha-plane
+    /// drop, near-lossless 256-color palettes, TIFF deflate, max re-encode) and
+    /// format conversions (png→jpeg, alpha→webp) are suppressed — a file
+    /// that can't win as its own format skips instead of converting.
+    pub image_preserve_format: bool,
 }
 
 /// Default Opus target: transparent-ish stereo, lean 5.1.
@@ -618,6 +654,25 @@ pub fn preflight(m: &MediaFile, p: &EstParams, min_saving_pct: f64) -> Preflight
     }
 }
 
+/// Preflight for any probed input: still images route to the image
+/// model with their own quality/resolution settings
+/// ([`crate::images::preflight_image`]), everything else to the video
+/// pipeline above. The GUI/CLI layers call this instead of [`preflight`]
+/// so mixed video+image batches plan correctly.
+pub fn preflight_auto(m: &MediaFile, p: &EstParams, min_saving_pct: f64) -> Preflight {
+    if crate::images::is_shrinkable_image(&m.path) {
+        crate::images::preflight_image(
+            m,
+            p.image_cq,
+            p.image_scale,
+            p.image_preserve_format,
+            min_saving_pct,
+        )
+    } else {
+        preflight(m, p, min_saving_pct)
+    }
+}
+
 fn est_ratio(vcodec: &str, backend: VideoBackend) -> f64 {
     match backend {
         VideoBackend::CpuX264 => x264_ratio_for(vcodec),
@@ -682,31 +737,44 @@ fn bitrate_suggests_headroom(m: &MediaFile) -> bool {
 /// Returns `(w,h)` to scale to (even numbers, aspect preserved), or `None`
 /// to keep the source resolution. Never upscales.
 ///
-/// The cap applies to the SHORT side so landscape `1920x1080` and portrait
-/// `1080x1920` are treated identically (both are "1080p-class"), matching
-/// the bitrate-headroom tiers. Keying off height alone would mangle
-/// portrait sources while leaving their landscape twins untouched.
+/// The preset caps apply to the SHORT side so landscape `1920x1080` and
+/// portrait `1080x1920` are treated identically (both are "1080p-class"),
+/// matching the bitrate-headroom tiers. Keying off height alone would
+/// mangle portrait sources while leaving their landscape twins untouched.
+/// `Custom(w, h)` instead fits inside the box: each side is its own cap,
+/// so landscape sources hit the width limit and portrait ones the height.
 pub fn scale_target(m: &MediaFile, policy: ScalePolicy) -> Option<(u32, u32)> {
-    if policy == ScalePolicy::Preserve {
-        return None;
-    }
     if m.width < 16 || m.height < 16 {
         return None;
     }
-    let cap_h: u32 = match policy {
+    // Uniform shrink factor (< 1.0), or None to keep the source
+    // resolution. Never upscales: sources already inside the cap/box
+    // stay untouched.
+    let k = match policy {
         ScalePolicy::Preserve => return None,
-        ScalePolicy::Force1080p => 1080,
-        ScalePolicy::Force720p => 720,
-        ScalePolicy::Force480p => 480,
+        ScalePolicy::Force1080p => short_side_k(m, 1080)?,
+        ScalePolicy::Force720p => short_side_k(m, 720)?,
+        ScalePolicy::Force480p => short_side_k(m, 480)?,
+        ScalePolicy::Custom(bw, bh) => {
+            let (bw, bh) = (bw.max(2), bh.max(2));
+            if m.width <= bw && m.height <= bh {
+                return None;
+            }
+            (bw as f64 / m.width as f64).min(bh as f64 / m.height as f64)
+        }
     };
-    // Only act on true downscales: short side at/below the cap stays.
-    let short = m.width.min(m.height);
-    if short <= cap_h {
-        return None;
-    }
-    let k = cap_h as f64 / short as f64;
     let even = |v: u32| (((v as f64 * k) / 2.0).round() as u32 * 2).max(2);
     Some((even(m.width), even(m.height)))
+}
+
+/// Shrink factor for a short-side cap, or `None` when the source already
+/// fits (short side at/below the cap).
+fn short_side_k(m: &MediaFile, cap: u32) -> Option<f64> {
+    let short = m.width.min(m.height);
+    if short <= cap {
+        return None;
+    }
+    Some(cap as f64 / short as f64)
 }
 
 /// [`scale_target`] plus the mandatory even-dimensions fix: NVENC,
@@ -969,6 +1037,9 @@ mod tests {
             scale: ScalePolicy::Preserve,
             opus_bps: Some(DEFAULT_OPUS_BPS),
             all_audio: false,
+            image_cq: 28,
+            image_scale: ScalePolicy::Preserve,
+            image_preserve_format: false,
         }
     }
 
@@ -1027,6 +1098,9 @@ mod tests {
             scale: ScalePolicy::Preserve,
             opus_bps: Some(DEFAULT_OPUS_BPS),
             all_audio: false,
+            image_cq: 28,
+            image_scale: ScalePolicy::Preserve,
+            image_preserve_format: false,
         };
         let x265_params = EstParams {
             backend: VideoBackend::CpuX265,
@@ -1215,6 +1289,54 @@ mod tests {
             scale_target(&uhd_port, ScalePolicy::Force1080p),
             Some((1080, 1920))
         );
+    }
+
+    #[test]
+    fn custom_scale_fits_inside_the_box() {
+        // Landscape hits the width cap: 4000x3000 into 1920x1080.
+        let land = file("h264", 4000, 3000, 1_000_000_000, Some(12_000_000));
+        assert_eq!(
+            scale_target(&land, ScalePolicy::Custom(1920, 1080)),
+            Some((1440, 1080))
+        );
+        // Portrait hits the height cap instead (the preset short-side cap
+        // would have left this file untouched — the box must not).
+        let port = file("h264", 3000, 4000, 1_000_000_000, Some(12_000_000));
+        assert_eq!(
+            scale_target(&port, ScalePolicy::Custom(1920, 1080)),
+            Some((810, 1080))
+        );
+        // Sources already inside the box are never upscaled.
+        let small = file("h264", 1280, 720, 500_000_000, Some(6_000_000));
+        assert_eq!(scale_target(&small, ScalePolicy::Custom(1920, 1080)), None);
+        // Aspect is preserved on non-16:9 sources.
+        let sq = file("h264", 2000, 2000, 1_000_000_000, Some(12_000_000));
+        assert_eq!(
+            scale_target(&sq, ScalePolicy::Custom(1000, 500)),
+            Some((500, 500))
+        );
+        // Degenerate boxes are sanitized to something encodable.
+        assert_eq!(
+            scale_target(&land, ScalePolicy::Custom(0, 0)),
+            Some((2, 2))
+        );
+    }
+
+    #[test]
+    fn scale_policy_parse_round_trips() {
+        assert_eq!(ScalePolicy::parse("preserve"), Some(ScalePolicy::Preserve));
+        assert_eq!(ScalePolicy::parse("720p"), Some(ScalePolicy::Force720p));
+        assert_eq!(
+            ScalePolicy::parse("1920x1080"),
+            Some(ScalePolicy::Custom(1920, 1080))
+        );
+        assert_eq!(
+            ScalePolicy::parse("1920X1080"),
+            Some(ScalePolicy::Custom(1920, 1080))
+        );
+        assert_eq!(ScalePolicy::parse("bogus"), None);
+        assert_eq!(ScalePolicy::parse("1920"), None);
+        assert_eq!(ScalePolicy::parse("axb"), None);
     }
 
     #[test]

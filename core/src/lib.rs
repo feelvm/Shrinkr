@@ -6,6 +6,7 @@ pub mod bench;
 pub mod convert;
 pub mod ffmpeg;
 pub mod hw;
+pub mod images;
 pub mod log;
 pub mod media;
 pub mod pipeline;
