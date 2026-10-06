@@ -5,13 +5,14 @@
 //! 2. Tag releases as `v0.x.y` (e.g. `v0.2.0`) — the tag MUST be valid
 //!    semver with a leading `v`; the updater compares it against the
 //!    running binary's `CARGO_PKG_VERSION`.
-//! 3. Attach a bare `shrinkr.exe` (no target triple, no zip) as the
-//!    release asset. `asset_identifier` below is what makes the crate
-//!    pick it up: its default asset matching only looks for names
-//!    containing the target triple (`x86_64-pc-windows-msvc`), and the
-//!    bare exe would be reported as "no release found with an asset for
-//!    target". A `.exe` extension is detected as a plain file (not an
-//!    archive) and installed verbatim.
+//! 3. Attach one archive per release target, named `shrinkr-<triple>.zip`
+//!    (e.g. `shrinkr-x86_64-pc-windows-msvc.zip`), each with the binary
+//!    at its root — the release workflow does this. No `asset_identifier`
+//!    is configured, so the crate matches an asset whose name contains
+//!    the running binary's compile-time target triple: every platform
+//!    downloads exactly its own archive, and a missing one fails as "no
+//!    release found for target" instead of installing another platform's
+//!    file.
 //!
 //! GUI rules: never block the UI thread (callers run these on worker
 //! threads and report back via `JobMsg`), never prompt on stdin
@@ -24,7 +25,8 @@ use anyhow::{bail, Context, Result};
 pub const REPO_OWNER: &str = "feelvm";
 /// GitHub repo name.
 pub const REPO_NAME: &str = "Shrinkr";
-/// Binary name of the release asset (`shrinkr.exe` on Windows).
+/// Binary name inside the release archives (`shrinkr.exe` on Windows,
+/// `shrinkr` elsewhere — the platform exe suffix is appended by the crate).
 pub const BIN_NAME: &str = "shrinkr";
 
 /// True when the constants above were left as placeholders.
@@ -48,12 +50,12 @@ fn updater(current_version: &str) -> Result<self_update::backends::github::Updat
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
         .current_version(current_version)
-        // Releases carry a bare `shrinkr.exe`, whose name contains neither
-        // the target triple nor arch/os tokens, so the crate's default asset
-        // matching finds nothing. The identifier fallback matches by plain
-        // substring instead. Any target-named asset uploaded in the future
-        // still wins over it (target match is tried first).
-        .asset_identifier(BIN_NAME)
+        // No `asset_identifier` (crate default `None`): matching then
+        // requires the asset name to contain the compile-time target
+        // triple, so each platform picks its own `shrinkr-<triple>.zip`
+        // and nothing else. Setting an identifier would enable a plain
+        // substring fallback that, with multi-platform releases, could
+        // select another platform's asset when this one is missing.
         // The update check reports the newest release; without this the
         // default "compatible" strategy could install an older same-major
         // one instead of what the UI just showed the user.

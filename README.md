@@ -1,6 +1,6 @@
 # Shrinkr
 
-**Shrink video. Shrink images. Convert anything.** Shrinkr is a fast, batch-friendly media compressor and converter for Windows with a clean desktop GUI *and* a headless CLI. It re-encodes video to dramatically smaller files using your NVIDIA GPU when available (NVENC, zero-copy NVDEC → CUDA → NVENC path) and falls back to CPU encoders automatically. Still images ride the same pipeline: JPEG/WebP re-encode or PNG/BMP/TIFF → JPEG conversion. Built in Rust on top of FFmpeg.
+**Shrink video. Shrink images. Convert anything.** Shrinkr is a fast, batch-friendly media compressor and converter for Windows, macOS and Linux with a clean desktop GUI *and* a headless CLI. It re-encodes video to dramatically smaller files using your NVIDIA GPU when available (NVENC, zero-copy NVDEC → CUDA → NVENC path) and falls back to CPU encoders automatically. Still images ride the same pipeline: JPEG/WebP re-encode or PNG/BMP/TIFF → JPEG conversion. Built in Rust on top of FFmpeg.
 
 ## Features
 
@@ -44,10 +44,18 @@ Runs the same source through a matrix — x264 CRF 28 baseline plus HEVC NVENC C
 - **NVIDIA GPU** (optional) — enables the NVENC hardware path. Without it, Shrinkr uses CPU encoders (x264 / x265 / SVT-AV1).
 - **LibreOffice** (optional) — only needed for document conversion.
 
-### Prebuilt binary (Windows x64)
+### Prebuilt binaries
 
-1. Grab the latest `shrinkr-x86_64-pc-windows-msvc.zip` from [Releases](../../releases).
-2. Unzip and run `shrinkr.exe` — no installer, nothing else to configure.
+Grab the archive for your platform from the latest [release](../../releases), unzip, and run the `shrinkr` binary inside — no installer, nothing else to configure.
+
+| Archive | Platform |
+| --- | --- |
+| `shrinkr-x86_64-pc-windows-msvc.zip` | Windows x64 |
+| `shrinkr-aarch64-apple-darwin.zip` | macOS (Apple Silicon / M-series) |
+| `shrinkr-x86_64-unknown-linux-gnu.zip` | Linux x64 |
+
+- **macOS** — the binary is unsigned, so Gatekeeper blocks the first launch: right-click it and choose *Open*, or clear the quarantine flag with `xattr -cr shrinkr`.
+- **Linux** — the GUI needs WebKitGTK 4.1 and GTK 3 at runtime (`sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0` on Debian/Ubuntu, or your distro's equivalent); `shrinkr-cli` has no such requirement.
 
 ### Build from source
 
@@ -143,4 +151,4 @@ The repo is a Cargo workspace:
 | `dioxus-app` (`shrinkr`) | Dioxus desktop GUI |
 | `cli` (`shrinkr-cli`) | Headless CLI driving the same core |
 
-Releases are cut by tagging (`v0.x.y`); the GitHub Actions workflow builds the Windows GUI, packages `shrinkr.exe` into a zip, and publishes it to Releases — which is also what the in-app updater checks.
+Releases are cut by tagging (`v0.x.y`); the GitHub Actions workflow builds the GUI for Windows x64, macOS (Apple Silicon) and Linux x64, packages each binary into a `shrinkr-<target-triple>.zip`, and publishes all three to Releases — which is also what the in-app updater checks (each platform picks the archive matching its own target triple).

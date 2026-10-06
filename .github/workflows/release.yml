@@ -9,32 +9,67 @@ permissions:
   contents: write
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  build:
+    strategy:
+      # One platform failing must not cancel the others' uploads.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest # arm64 runner — the Apple Silicon build
+            target: aarch64-apple-darwin
+          # Oldest still-supported runner: the artifact's glibc
+          # requirement is that of the build machine, so building on
+          # 22.04 keeps the binary runnable on older distros.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    env:
+      # self_update matches assets by target triple, so the name must be
+      # exactly `shrinkr-<triple>.zip` with the binary at the archive root.
+      ARCHIVE: shrinkr-${{ matrix.target }}.zip
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Dioxus desktop (wry/tao) needs WebKitGTK + GTK headers to build on
+      # Linux — and the same libs at runtime on users' machines.
+      - name: Install Linux GUI deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev
 
       - name: Build GUI
-        run: cargo build --release -p shrinkr
+        run: cargo build --release --target ${{ matrix.target }} -p shrinkr
 
-      # self_update picks the asset containing the target triple.
-      # The zip must contain shrinkr.exe at its root.
-      - name: Package zip
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd "target/${{ matrix.target }}/release"
+          zip -j "$GITHUB_WORKSPACE/${{ env.ARCHIVE }}" shrinkr
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $target = "x86_64-pc-windows-msvc"
-          $zip = "shrinkr-$target.zip"
-          Compress-Archive -Path "target/release/shrinkr.exe" -DestinationPath $zip -Force
-          Get-ChildItem $zip
+          Compress-Archive -Path "target/${{ matrix.target }}/release/shrinkr.exe" `
+            -DestinationPath "${{ env.ARCHIVE }}" -Force
+          Get-ChildItem ${{ env.ARCHIVE }}
 
       - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # First matrix job to arrive creates the release; the rest skip
+          # straight to uploading their own archive (--clobber re-uploads
+          # safely on retry).
           gh release create "${{ github.ref_name }}" \
             --title "${{ github.ref_name }}" \
-            --generate-notes \
-            "shrinkr-x86_64-pc-windows-msvc.zip"
+            --generate-notes 2>/dev/null || true
+          gh release upload "${{ github.ref_name }}" "${{ env.ARCHIVE }}" --clobber
