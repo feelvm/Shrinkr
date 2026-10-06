@@ -1158,6 +1158,21 @@ mod tests {
     use crate::pipeline::{NvencPreset, StreamPlan};
     use std::fs;
 
+    /// A genuinely failing `ExitStatus` for the error-snippet tests:
+    /// `cmd /c exit 1` on Windows, `false` elsewhere.
+    fn failing_status() -> std::process::ExitStatus {
+        if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/c", "exit", "1"])
+                .status()
+                .expect("cmd for a failing ExitStatus")
+        } else {
+            std::process::Command::new("false")
+                .status()
+                .expect("false for a failing ExitStatus")
+        }
+    }
+
     fn tmp_dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "shrinkr-test-{}-{}",
@@ -1469,10 +1484,7 @@ mod tests {
 [libx264 @ 0000028869018e80] coded y,uvDC,uvAC intra: 0.0%\n\
 [libx264 @ 0000028869018e80] Weighted P-Frames: Y:0.0% UV:0.0%\n\
 Conversion failed!\n";
-        let status = std::process::Command::new("cmd")
-            .args(["/c", "exit", "1"])
-            .status()
-            .expect("cmd for a failing ExitStatus");
+        let status = failing_status();
         let s = error_snippet(tail, status);
         assert!(s.contains("Conversion failed"), "{s}");
         assert!(!s.contains("i16 v,h"), "{s}");
@@ -1602,10 +1614,7 @@ Conversion failed!\n";
 
     #[test]
     fn error_snippet_without_stderr_names_the_exit() {
-        let status = std::process::Command::new("cmd")
-            .args(["/c", "exit", "1"])
-            .status()
-            .expect("cmd for a failing ExitStatus");
+        let status = failing_status();
         let s = error_snippet("", status);
         assert!(s.contains("exited with"), "{s}");
     }
