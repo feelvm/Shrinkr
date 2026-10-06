@@ -28,6 +28,9 @@ pub struct ExecCfg {
 #[derive(Clone, Debug)]
 pub struct ExecItem {
     pub name: String,
+    /// Source resolution ("1920x1080"; "?" when the file has no
+    /// dimensions, e.g. audio).
+    pub res: String,
     pub frac: f64,
     pub fps: f64,
     pub done: bool,
@@ -35,9 +38,10 @@ pub struct ExecItem {
 }
 
 impl ExecItem {
-    pub fn new(name: String) -> Self {
+    pub fn new(name: String, res: String) -> Self {
         Self {
             name,
+            res,
             frac: 0.0,
             fps: 0.0,
             done: false,
@@ -404,8 +408,9 @@ impl AppState {
         )
     }
 
-    /// (filename, will_shrink, reason) rows for the plan list.
-    pub fn preflight_rows(&self) -> Vec<(String, bool, String)> {
+    /// (filename, resolution, will_shrink, reason) rows for the plan
+    /// list. Resolution is "?" when the file has no dimensions.
+    pub fn preflight_rows(&self) -> Vec<(String, String, bool, String)> {
         let p = self.est_params();
         let t = self.threshold();
         self.files
@@ -417,9 +422,10 @@ impl AppState {
                     .and_then(|s| s.to_str())
                     .unwrap_or("?")
                     .to_string();
+                let res = f.res_label();
                 match preflight_auto(f, &p, t) {
-                    Preflight::Shrink { reason } => (name, true, reason),
-                    Preflight::Skip { reason } => (name, false, reason),
+                    Preflight::Shrink { reason } => (name, res, true, reason),
+                    Preflight::Skip { reason } => (name, res, false, reason),
                 }
             })
             .collect()

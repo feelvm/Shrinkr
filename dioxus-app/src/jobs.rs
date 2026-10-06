@@ -971,6 +971,7 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                                 .and_then(|x| x.to_str())
                                 .unwrap_or("?")
                                 .to_string(),
+                            f.res_label(),
                         )
                     })
                     .collect();

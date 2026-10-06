@@ -415,9 +415,9 @@ fn Sidebar() -> Element {
                     }
                 }
             }
-            // Run control, pinned to the bottom of the sidebar: the
-            // Shrink button when idle, batch progress + cancel mid-run.
-            div { class: "mt-auto flex flex-col gap-2",
+            // Run control, directly under the Library card: the Shrink
+            // button when idle, batch progress + cancel mid-run.
+            div { class: "flex flex-col gap-2",
                 if !executing {
                     Button {
                         variant: ButtonVariant::Default,
@@ -434,6 +434,9 @@ fn Sidebar() -> Element {
                             div { class: "flex flex-col gap-1",
                                 div { class: "flex items-center gap-2",
                                     span { class: "min-w-0 flex-1 truncate font-mono text-xs", "{item.name}" }
+                                    if item.res != "?" {
+                                        span { class: "shrink-0 text-xs text-muted-foreground", "{item.res}" }
+                                    }
                                     span { class: "shrink-0 text-xs text-muted-foreground", "{item.status_text()}" }
                                 }
                                 Progress { value: item.frac * 100.0 }
@@ -1033,7 +1036,7 @@ fn EstimateCard() -> Element {
     let rows: Vec<(String, String, String)> = s
         .preflight_rows()
         .into_iter()
-        .map(|(name, go, reason)| {
+        .map(|(name, res, go, reason)| {
             let mark = if go {
                 "✓".to_string()
             } else {
@@ -1044,7 +1047,12 @@ fn EstimateCard() -> Element {
             } else {
                 "text-xs text-muted-foreground".to_string()
             };
-            (mark, format!("{name}: {reason}"), cls)
+            let label = if res == "?" {
+                format!("{name}: {reason}")
+            } else {
+                format!("{name} · {res}: {reason}")
+            };
+            (mark, label, cls)
         })
         .collect();
     let target_text = s.target_text.clone();
@@ -1208,6 +1216,7 @@ fn shrink_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
                         .and_then(|x| x.to_str())
                         .unwrap_or("?")
                         .to_string(),
+                    f.res_label(),
                 )
             })
             .collect();
@@ -1598,6 +1607,13 @@ fn ConvertCard() -> Element {
                                     let kind = f.kind.label().to_string();
                                     let src = f.src_ext.clone();
                                     let target = f.target_ext.clone();
+                                    // Source dimensions once probed (hidden
+                                    // for audio/documents, which have none).
+                                    let res = f
+                                        .media
+                                        .as_ref()
+                                        .map(|m| m.res_label())
+                                        .unwrap_or_default();
                                     let options = f.feasible_options();
                                     let est = f.estimate_text();
                                     let status = f.status_text();
@@ -1630,6 +1646,9 @@ fn ConvertCard() -> Element {
                                                 span { class: "min-w-0 flex-1 truncate font-mono text-xs", "{name}" }
                                                 Badge { variant: BadgeVariant::Secondary, "{kind}" }
                                                 span { class: "shrink-0 text-xs text-muted-foreground", ".{src}" }
+                                                if !res.is_empty() && res != "?" {
+                                                    span { class: "shrink-0 text-xs text-muted-foreground", "{res}" }
+                                                }
                                                 if is_extract {
                                                     Badge { variant: BadgeVariant::Secondary, "→audio" }
                                                 }
