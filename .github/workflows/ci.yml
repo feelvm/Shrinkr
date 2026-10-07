@@ -15,10 +15,18 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: macos-latest # arm64 runner — the Apple Silicon build
             target: aarch64-apple-darwin
+          # Intel Mac: cross-compiled from the Apple Silicon runner
+          # (no free hosted Intel macOS image remains), so this job
+          # only checks — it can't execute Intel test binaries.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            check_only: true
           # Same image the release workflow builds on, so a glibc/library
           # mismatch shows up here first, on every push.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +55,10 @@ jobs:
         run: choco install ffmpeg -y --no-progress
 
       - name: Check (all targets)
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --target ${{ matrix.target }}
 
+      # check-only jobs (e.g. Intel Mac cross-compiled from an Apple
+      # Silicon runner) can't execute the target's test binaries.
       - name: Test
-        run: cargo test --workspace
+        if: matrix.check_only != true
+        run: cargo test --workspace --target ${{ matrix.target }}
