@@ -118,6 +118,57 @@ jobs:
           ) -DestinationPath "${{ env.ARCHIVE }}" -Force
           Get-ChildItem ${{ env.ARCHIVE }}
 
+      # User-facing drag-to-install image. The zip above stays the
+      # self-update asset (matched by target triple); the DMG is an
+      # additional download. Sidecars live in Contents/MacOS/ next to
+      # the executables, where process::cmd's sidecar lookup finds them.
+      - name: Build app bundle and DMG (macOS)
+        if: runner.os == 'macOS'
+        env:
+          DMG: shrinkr-${{ matrix.target }}.dmg
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP="Shrinkr.app"
+          rm -rf "$APP" icon.iconset
+          mkdir -p icon.iconset "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          ICON="dioxus-app/assets/icons/icon.png"
+          sips -z 16 16       "$ICON" --out icon.iconset/icon_16x16.png
+          sips -z 32 32       "$ICON" --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32       "$ICON" --out icon.iconset/icon_32x32.png
+          sips -z 64 64       "$ICON" --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128     "$ICON" --out icon.iconset/icon_128x128.png
+          sips -z 256 256     "$ICON" --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256     "$ICON" --out icon.iconset/icon_256x256.png
+          sips -z 512 512     "$ICON" --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512     "$ICON" --out icon.iconset/icon_512x512.png
+          sips -z 1024 1024   "$ICON" --out icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o "$APP/Contents/Resources/Shrinkr.icns"
+          cp "target/${{ matrix.target }}/release/shrinkr" "$APP/Contents/MacOS/Shrinkr"
+          cp "target/${{ matrix.target }}/release/shrinkr-cli" "$APP/Contents/MacOS/"
+          cp sidecars/ffmpeg sidecars/ffprobe "$APP/Contents/MacOS/"
+          chmod +x "$APP"/Contents/MacOS/*
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>Shrinkr</string>
+            <key>CFBundleDisplayName</key><string>Shrinkr</string>
+            <key>CFBundleIdentifier</key><string>com.shrinkr.app</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleExecutable</key><string>Shrinkr</string>
+            <key>CFBundleIconFile</key><string>Shrinkr</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          EOF
+          # Ad-hoc signature: launches locally, no paid cert. Users still
+          # clear Gatekeeper once (right-click > Open) without notarization.
+          codesign --force --deep --sign - "$APP"
+          hdiutil create -volname "Shrinkr" -srcfolder "$APP" -ov -format UDZO "$GITHUB_WORKSPACE/$DMG"
+
       - name: Publish GitHub Release
         shell: bash
         env:
@@ -130,3 +181,13 @@ jobs:
             --title "${{ github.ref_name }}" \
             --generate-notes 2>/dev/null || true
           gh release upload "${{ github.ref_name }}" "${{ env.ARCHIVE }}" --clobber
+
+      # Runs after Publish in the same job, so the release is guaranteed
+      # to exist by now (created by this job or an earlier matrix job).
+      - name: Publish DMG (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" "shrinkr-${{ matrix.target }}.dmg" --clobber

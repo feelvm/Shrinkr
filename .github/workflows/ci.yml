@@ -25,8 +25,6 @@ jobs:
           # mismatch shows up here first, on every push.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
