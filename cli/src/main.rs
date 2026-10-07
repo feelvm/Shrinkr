@@ -319,7 +319,12 @@ fn cli_shrink(
         ok_str(tool_ok("ffprobe"))
     );
     if !tool_ok("ffmpeg") || !tool_ok("ffprobe") {
-        eprintln!("ffmpeg/ffprobe missing on PATH — install them first.");
+        eprintln!(
+            "ffmpeg/ffprobe not found (checked next to the executable, then PATH).\n\
+             The release zip ships both next to the binary — or install ffmpeg\n\
+             yourself (https://ffmpeg.org). On Windows the GUI's Download FFmpeg\n\
+             button fetches them into the same folder."
+        );
         return 1;
     }
     // Videos + still images; --no-images drops the image half.

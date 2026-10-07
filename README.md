@@ -34,19 +34,20 @@ Runs the same source through a matrix — x264 CRF 28 baseline plus HEVC NVENC C
 
 - **Hardware capability detection** — Shrinkr asks FFmpeg what actually works on your GPU instead of hard-coding model lists (e.g. it correctly avoids AV1 NVENC on GPUs that list it but can't run it).
 - **Desktop GUI** — dark, shadcn-style interface (Dioxus + Tailwind) with drag & drop, per-file progress, and a full in-app log panel.
-- **Self-update** — the GUI can check GitHub Releases and update itself in place.
+- **Self-update** — the GUI can check GitHub Releases and update itself (and the bundled FFmpeg) in place.
 
 ## Installation
 
 ### Requirements
 
-- **FFmpeg + ffprobe on `PATH`** (required). Any recent build works; NVENC encoders are used only if present.
-- **NVIDIA GPU** (optional) — enables the NVENC hardware path. Without it, Shrinkr uses CPU encoders (x264 / x265 / SVT-AV1).
+Nothing, for core functionality: the release archives bundle `ffmpeg` and `ffprobe` next to the binary, so Shrinkr runs with zero system dependencies. Optional extras:
+
+- **NVIDIA GPU driver** (optional) — enables the NVENC hardware path. Without it, Shrinkr uses CPU encoders (x264 / x265 / SVT-AV1).
 - **LibreOffice** (optional) — only needed for document conversion.
 
 ### Prebuilt binaries
 
-Grab the archive for your platform from the latest [release](../../releases), unzip, and run the `shrinkr` binary inside — no installer, nothing else to configure.
+Grab the archive for your platform from the latest [release](../../releases), unzip, and run the `shrinkr` binary inside — no installer, nothing else to install or configure. Each archive contains everything: the GUI (`shrinkr`), the headless CLI (`shrinkr-cli`), and static `ffmpeg` / `ffprobe` builds (see `FFMPEG-NOTES.txt` in the archive for sources and licensing).
 
 | Archive | Platform |
 | --- | --- |
@@ -54,12 +55,14 @@ Grab the archive for your platform from the latest [release](../../releases), un
 | `shrinkr-aarch64-apple-darwin.zip` | macOS (Apple Silicon / M-series) |
 | `shrinkr-x86_64-unknown-linux-gnu.zip` | Linux x64 |
 
-- **macOS** — the binary is unsigned, so Gatekeeper blocks the first launch: right-click it and choose *Open*, or clear the quarantine flag with `xattr -cr shrinkr`.
+Shrinkr prefers the bundled FFmpeg over any system-wide installation, so behavior is identical on every machine. If you lost the sidecars (bare binary, source build) on Windows, the GUI header offers a one-click **Download FFmpeg** button that fetches a static build into the app's folder; on macOS/Linux, use a package manager (`brew install ffmpeg`, `apt install ffmpeg`, …).
+
+- **macOS** — the binaries are unsigned, so Gatekeeper blocks the first launch: right-click `shrinkr` and choose *Open*, or clear the quarantine flag on the whole folder with `xattr -cr .` from inside it.
 - **Linux** — the GUI needs WebKitGTK 4.1 and GTK 3 at runtime (`sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0` on Debian/Ubuntu, or your distro's equivalent); `shrinkr-cli` has no such requirement.
 
 ### Build from source
 
-Requires a stable [Rust](https://rustup.rs) toolchain.
+Building yourself is a developer path — at runtime you still need `ffmpeg` on `PATH` (or copied next to the binary). Requires a stable [Rust](https://rustup.rs) toolchain.
 
 ```sh
 git clone https://github.com/feelvm/shrinkr.git

@@ -27,7 +27,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       # self_update matches assets by target triple, so the name must be
-      # exactly `shrinkr-<triple>.zip` with the binary at the archive root.
+      # exactly `shrinkr-<triple>.zip` with all files at the archive root.
       ARCHIVE: shrinkr-${{ matrix.target }}.zip
     steps:
       - uses: actions/checkout@v4
@@ -45,21 +45,77 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev
 
-      - name: Build GUI
-        run: cargo build --release --target ${{ matrix.target }} -p shrinkr
+      - name: Build GUI and CLI
+        run: cargo build --release --target ${{ matrix.target }} -p shrinkr -p shrinkr-cli
+
+      # The archives ship static ffmpeg/ffprobe sidecars so users don't
+      # need to install anything. Sources per platform (see
+      # FFMPEG-NOTES.txt for attribution/licensing):
+      #   Windows/Linux : BtbN FFmpeg-Builds (permanent "latest" URLs)
+      #   macOS arm64   : osxexperts.net (versioned names — scrape the page)
+      - name: Download FFmpeg sidecars (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-build
+          New-Item -ItemType Directory -Force sidecars | Out-Null
+          Copy-Item (Get-ChildItem -Recurse ffmpeg-build -Filter ffmpeg.exe | Select-Object -First 1).FullName sidecars/ffmpeg.exe
+          Copy-Item (Get-ChildItem -Recurse ffmpeg-build -Filter ffprobe.exe | Select-Object -First 1).FullName sidecars/ffprobe.exe
+
+      - name: Download FFmpeg sidecars (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          mkdir ffmpeg-build sidecars
+          tar -xf ffmpeg.tar.xz -C ffmpeg-build
+          cp -v "$(find ffmpeg-build -type f -name ffmpeg -print -quit)" sidecars/ffmpeg
+          cp -v "$(find ffmpeg-build -type f -name ffprobe -print -quit)" sidecars/ffprobe
+
+      - name: Download FFmpeg sidecars (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          page=$(curl -fsSL https://www.osxexperts.net/)
+          ff=$(echo "$page" | grep -o 'ffmpeg[0-9]*arm\.zip' | head -n1)
+          fp=$(echo "$page" | grep -o 'ffprobe[0-9]*arm\.zip' | head -n1)
+          if [ -z "$ff" ] || [ -z "$fp" ]; then
+            echo "could not locate ffmpeg/ffprobe Apple Silicon zips on osxexperts.net" >&2
+            exit 1
+          fi
+          curl -fsSL -o ffmpeg.zip "https://www.osxexperts.net/$ff"
+          curl -fsSL -o ffprobe.zip "https://www.osxexperts.net/$fp"
+          mkdir ffmpeg-build ffprobe-build sidecars
+          unzip -j ffmpeg.zip -d ffmpeg-build
+          unzip -j ffprobe.zip -d ffprobe-build
+          cp -v "$(find ffmpeg-build -type f -name 'ffmpeg*' -print -quit)" sidecars/ffmpeg
+          cp -v "$(find ffprobe-build -type f -name 'ffprobe*' -print -quit)" sidecars/ffprobe
 
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
-          cd "target/${{ matrix.target }}/release"
-          zip -j "$GITHUB_WORKSPACE/${{ env.ARCHIVE }}" shrinkr
+          chmod +x "target/${{ matrix.target }}/release/shrinkr" \
+                   "target/${{ matrix.target }}/release/shrinkr-cli" \
+                   sidecars/ffmpeg sidecars/ffprobe
+          zip -j "$GITHUB_WORKSPACE/${{ env.ARCHIVE }}" \
+            "target/${{ matrix.target }}/release/shrinkr" \
+            "target/${{ matrix.target }}/release/shrinkr-cli" \
+            sidecars/ffmpeg sidecars/ffprobe \
+            FFMPEG-NOTES.txt
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/shrinkr.exe" `
-            -DestinationPath "${{ env.ARCHIVE }}" -Force
+          Compress-Archive -Path @(
+            "target/${{ matrix.target }}/release/shrinkr.exe",
+            "target/${{ matrix.target }}/release/shrinkr-cli.exe",
+            "sidecars/ffmpeg.exe",
+            "sidecars/ffprobe.exe",
+            "FFMPEG-NOTES.txt"
+          ) -DestinationPath "${{ env.ARCHIVE }}" -Force
           Get-ChildItem ${{ env.ARCHIVE }}
 
       - name: Publish GitHub Release

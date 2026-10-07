@@ -5,6 +5,7 @@
 pub mod bench;
 pub mod convert;
 pub mod ffmpeg;
+pub mod ffmpeg_fetch;
 pub mod hw;
 pub mod images;
 pub mod log;

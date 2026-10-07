@@ -121,6 +121,9 @@ pub struct AppState {
     pub hw_summary: String,
     pub ffmpeg_ok: bool,
     pub ffprobe_ok: bool,
+    // ── One-click ffmpeg fetch (header, when ffmpeg is missing) ──
+    pub ffmpeg_fetching: bool,
+    pub ffmpeg_fetch_pct: f64,
     // ── Convert tab ──
     pub convert_files: Vec<ConvertItem>,
     pub convert_scanning: bool,
@@ -291,6 +294,8 @@ impl Default for AppState {
             hw_summary: shrinkr_core::hw::caps().summary(),
             ffmpeg_ok: tool_ok("ffmpeg"),
             ffprobe_ok: tool_ok("ffprobe"),
+            ffmpeg_fetching: false,
+            ffmpeg_fetch_pct: 0.0,
             convert_files: vec![],
             convert_scanning: false,
             convert_executing: false,

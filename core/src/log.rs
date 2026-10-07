@@ -198,6 +198,17 @@ mod tests {
     }
 
     #[test]
+    fn convert_summaries_color_by_outcome() {
+        // The clean-run summary must dodge the word "fail" (contains-check
+        // below puts any such line in the red lane) and lead with "done".
+        assert_eq!(classify("done: 1 file(s) converted in 0s."), Level::Success);
+        assert_eq!(
+            classify("Convert done in 2s: 1 converted, 2 failed."),
+            Level::Error
+        );
+    }
+
+    #[test]
     fn skips_and_commands_have_their_own_lanes() {
         assert_eq!(
             classify("  ✗ movie.mp4: already hevc — negligible"),

@@ -130,6 +130,9 @@ fn Header() -> Element {
     let available = s.update_available.clone();
     let ready = s.update_ready.clone();
     let busy = s.executing || s.convert_executing;
+    let fetching = s.ffmpeg_fetching;
+    let fetch_pct = s.ffmpeg_fetch_pct;
+    let fetch_supported = shrinkr_core::ffmpeg_fetch::supported();
     drop(s);
     rsx! {
         header { class: "relative flex shrink-0 items-center justify-between border-b border-border bg-card px-5 py-3",
@@ -144,6 +147,25 @@ fn Header() -> Element {
                 }
             }
             div { class: "flex items-center gap-2",
+                if !tools_ok {
+                    if fetching {
+                        div { class: "flex items-center gap-2 text-xs text-muted-foreground",
+                            Spinner {}
+                            "Downloading ffmpeg… {(fetch_pct * 100.0) as u32}%"
+                        }
+                    } else if fetch_supported {
+                        Button {
+                            variant: ButtonVariant::Default,
+                            disabled: busy,
+                            onclick: move |_| fetch_clicked(state),
+                            "Download FFmpeg"
+                        }
+                    } else {
+                        div { class: "text-xs text-muted-foreground",
+                            "Get the release archive — it bundles ffmpeg"
+                        }
+                    }
+                }
                 Badge { variant: BadgeVariant::Secondary, "{hw}" }
                 if let Some(v) = ready {
                     Badge { variant: BadgeVariant::Success, "v{v} installed" }
@@ -191,6 +213,16 @@ fn Header() -> Element {
             }
         }
     }
+}
+
+/// UI-thread part of "Download FFmpeg": flag + worker handoff.
+fn fetch_clicked(mut state: Signal<AppState>) {
+    state.write().ffmpeg_fetching = true;
+    state.write().ffmpeg_fetch_pct = 0.0;
+    state
+        .write()
+        .push_log("Downloading FFmpeg (bundled builds come from github.com/BtbN/FFmpeg-Builds)…".into());
+    crate::jobs::start_ffmpeg_fetch(pump_tx());
 }
 
 /// UI-thread part of "Check for updates": flag + worker handoff.
@@ -1138,9 +1170,10 @@ fn shrink_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         .is_err()
     {
         drop(s);
-        state
-            .write()
-            .push_log("ERROR: ffmpeg not found on PATH.".into());
+        state.write().push_log(
+            "ERROR: ffmpeg not found — press Download FFmpeg in the header, or grab a release archive (FFmpeg is bundled)."
+                .into(),
+        );
         return;
     }
     let files: Vec<_> = idx.iter().map(|&i| s.files[i].clone()).collect();
@@ -1805,9 +1838,10 @@ fn convert_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         .is_err()
     {
         drop(s);
-        state
-            .write()
-            .push_log("ERROR: ffmpeg not found on PATH.".into());
+        state.write().push_log(
+            "ERROR: ffmpeg not found — press Download FFmpeg in the header, or grab a release archive (FFmpeg is bundled)."
+                .into(),
+        );
         return;
     }
     let files = s.convert_files.clone();

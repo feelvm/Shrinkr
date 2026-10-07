@@ -5,7 +5,7 @@
 //! `Signal<AppState>`. (Dioxus 0.7 signals use unsync storage, so this
 //! separation is required — and it keeps every race in one place.)
 
-use crate::state::AppState;
+use crate::state::{tool_ok, AppState};
 use dioxus::prelude::*;
 use futures_channel::mpsc::UnboundedSender;
 use shrinkr_core::bench;
@@ -91,6 +91,8 @@ pub enum JobMsg {
     },
     UpdateChecked(Result<Option<shrinkr_core::update::AvailableUpdate>, String>),
     UpdateInstalled(Result<String, String>),
+    FfmpegFetchProgress(f64),
+    FfmpegFetched(Result<String, String>),
 }
 
 fn send(tx: &UnboundedSender<JobMsg>, msg: JobMsg) {
@@ -559,6 +561,29 @@ pub fn start_update_install(tx: UnboundedSender<JobMsg>, current_version: String
         match r {
             Ok(v) => send(&tx, JobMsg::UpdateInstalled(Ok(v))),
             Err(e) => send(&tx, JobMsg::UpdateInstalled(Err(format!("{e:#}")))),
+        }
+    });
+}
+
+/// One-click FFmpeg fetch into the executable's directory (worker thread).
+/// Streams progress; the shell cleanup happens in core.
+pub fn start_ffmpeg_fetch(tx: UnboundedSender<JobMsg>) {
+    thread::spawn(move || {
+        let progress_tx = tx.clone();
+        let r = shrinkr_core::ffmpeg_fetch::fetch(move |done, total| {
+            if let Some(total) = total.filter(|t| *t > 0) {
+                send(
+                    &progress_tx,
+                    JobMsg::FfmpegFetchProgress((done as f64 / total as f64).min(1.0)),
+                );
+            }
+        });
+        match r {
+            Ok(p) => send(
+                &tx,
+                JobMsg::FfmpegFetched(Ok(p.to_string_lossy().into_owned())),
+            ),
+            Err(e) => send(&tx, JobMsg::FfmpegFetched(Err(format!("{e:#}")))),
         }
     });
 }
@@ -1108,10 +1133,15 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             } else {
                 let done = s.convert_files.iter().filter(|f| f.done).count();
                 let failed = s.convert_files.iter().filter(|f| f.failed).count();
-                s.push_log(format!(
-                    "Convert done in {:.0}s: {done} converted, {failed} failed.",
-                    elapsed_s
-                ));
+                // Log lanes are classified from the text itself: "failed"
+                // would put a clean run in the red ERR lane, while a "done"
+                // prefix lands it green next to the per-file lines.
+                let summary = if failed == 0 {
+                    format!("done: {done} file(s) converted in {elapsed_s:.0}s.")
+                } else {
+                    format!("Convert done in {elapsed_s:.0}s: {done} converted, {failed} failed.")
+                };
+                s.push_log(summary);
             }
         }
         JobMsg::ConvertError { job, msg } => {
@@ -1177,6 +1207,25 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 Err(e) => {
                     s.update_error = Some(e.clone());
                     s.push_log(format!("ERROR: update failed: {e}"));
+                }
+            }
+        }
+        JobMsg::FfmpegFetchProgress(p) => {
+            s.ffmpeg_fetch_pct = p;
+        }
+        JobMsg::FfmpegFetched(r) => {
+            s.ffmpeg_fetching = false;
+            s.ffmpeg_fetch_pct = 0.0;
+            match r {
+                Ok(p) => {
+                    // Re-check through the same path the app uses (sidecar
+                    // resolution now finds the downloaded copies).
+                    s.ffmpeg_ok = tool_ok("ffmpeg");
+                    s.ffprobe_ok = tool_ok("ffprobe");
+                    s.push_log(format!("FFmpeg downloaded to {p} — ready."));
+                }
+                Err(e) => {
+                    s.push_log(format!("ERROR: ffmpeg download failed: {e}"));
                 }
             }
         }

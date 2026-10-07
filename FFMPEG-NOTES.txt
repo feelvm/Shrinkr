@@ -1,0 +1,19 @@
+Bundled FFmpeg
+==============
+
+This Shrinkr archive ships FFmpeg binaries (ffmpeg, ffprobe) next to
+the application so it works out of the box — no system-wide FFmpeg
+installation required.
+
+These are unmodified static builds downloaded from the following
+upstream projects:
+
+  Windows x64 : github.com/BtbN/FFmpeg-Builds        (GPL build)
+  Linux x64   : github.com/BtbN/FFmpeg-Builds        (GPL build)
+  macOS arm64 : www.osxexperts.net                   (GPL build)
+
+FFmpeg is an open-source project: https://ffmpeg.org
+This build is licensed under the GNU General Public License — see
+https://ffmpeg.org/legal.html and the upstream project pages above
+for source code, versions, and license texts. Shrinkr launches these
+binaries as separate processes and does not modify them.
