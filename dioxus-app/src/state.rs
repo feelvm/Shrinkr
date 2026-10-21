@@ -6,7 +6,8 @@ use shrinkr_core::convert::MediaKind;
 use shrinkr_core::log::{LevelFilter, LogEntry};
 use shrinkr_core::media::MediaFile;
 use shrinkr_core::pipeline::{
-    estimate_file, preflight_auto, EstParams, NvencPreset, Preflight, ScalePolicy, VideoBackend,
+    estimate_file, preflight_auto_with, EstParams, NvencPreset, Preflight, ScalePolicy,
+    ThresholdPolicy, VideoBackend,
 };
 use std::path::PathBuf;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -20,6 +21,7 @@ pub struct ExecCfg {
     pub parallel: usize,
     pub replace: bool,
     pub threshold: f64,
+    pub threshold_policy: ThresholdPolicy,
     pub extra_args: Vec<String>,
 }
 
@@ -97,7 +99,7 @@ pub struct AppState {
     /// Opus target in bps for re-encoded audio (`None` = Off: keep all
     /// audio tracks as-is). Drives plan, estimate and encode together.
     pub opus_bps: Option<u32>,
-    /// Raw advanced free-text ffmpeg flags (parsed + validated at Shrink).
+    /// Raw advanced free-text ffmpeg flags (parsed + validated at Process).
     pub extra_args: String,
     /// Raw target-size text for the solver (e.g. "400MB", "2x").
     pub target_text: String,
@@ -105,6 +107,11 @@ pub struct AppState {
     pub executing: bool,
     pub exec_items: Vec<ExecItem>,
     pub exec_total: usize,
+    /// Files in this batch whose encode finished but produced a result that
+    /// wasn't smaller than the source (discarded, original kept). Reported
+    /// in the batch summary so "finished but nothing was written" explains
+    /// itself.
+    pub exec_discarded: usize,
     pub cancel: Option<Arc<AtomicBool>>,
     /// Files probed while a batch runs. Drained into a chained batch at
     /// ExecDone (same settings); discarded to the library on cancel.
@@ -282,6 +289,7 @@ impl Default for AppState {
             executing: false,
             exec_items: vec![],
             exec_total: 0,
+            exec_discarded: 0,
             cancel: None,
             pending: vec![],
             exec_cfg: None,
@@ -321,12 +329,37 @@ pub fn tool_ok(prog: &str) -> bool {
 }
 
 impl AppState {
+    /// The configured minimum-saving percentage. With
+    /// [`Self::threshold_policy`] set to [`ThresholdPolicy::Warn`] this
+    /// is advisory (plan warnings); with `Skip` it removes files.
     pub fn threshold(&self) -> f64 {
+        self.min_saving_pct
+    }
+
+    /// Checked "Skip already-efficient files" removes below-threshold
+    /// files; unchecked keeps them in the run and only warns.
+    pub fn threshold_policy(&self) -> ThresholdPolicy {
         if self.skip_efficient {
-            self.min_saving_pct
+            ThresholdPolicy::Skip
         } else {
-            0.0
+            ThresholdPolicy::Warn
         }
+    }
+
+    /// `(shrink, warned, skipped)` over the probed library.
+    pub fn plan_counts(&self) -> (usize, usize, usize) {
+        let p = self.est_params();
+        let t = self.threshold();
+        let policy = self.threshold_policy();
+        let mut counts = (0, 0, 0);
+        for f in &self.files {
+            match preflight_auto_with(f, &p, t, policy) {
+                Preflight::Shrink { .. } => counts.0 += 1,
+                Preflight::Warn { .. } => counts.1 += 1,
+                Preflight::Skip { .. } => counts.2 += 1,
+            }
+        }
+        counts
     }
 
     pub fn est_params(&self) -> EstParams {
@@ -361,20 +394,24 @@ impl AppState {
     pub fn eligible(&self) -> Vec<usize> {
         let p = self.est_params();
         let t = self.threshold();
+        let policy = self.threshold_policy();
         self.files
             .iter()
             .enumerate()
-            .filter(|(_, f)| matches!(preflight_auto(f, &p, t), Preflight::Shrink { .. }))
+            .filter(|(_, f)| preflight_auto_with(f, &p, t, policy).will_shrink())
             .map(|(i, _)| i)
             .collect()
     }
 
-    /// (eligible_input_bytes, new_bytes, saved_bytes, est_seconds).
-    /// Skipped files count toward neither input nor output — the headline
-    /// describes exactly the bytes Shrink will touch. Images use their own
-    /// size model and a flat per-file time (they encode in well under a
-    /// second; the frames-per-second model doesn't apply to single frames).
-    pub fn estimate(&self) -> (u64, u64, u64, f64) {
+    /// (eligible_input_bytes, new_bytes, byte delta, est_seconds). The
+    /// delta is signed: positive means the estimate grows, negative means
+    /// it shrinks — never clamped, so a growing plan reports its real
+    /// increase instead of a misleading 0%. Skipped files count toward
+    /// neither input nor output — the headline describes exactly the bytes
+    /// Process will touch. Images use their own size model and a flat
+    /// per-file time (they encode in well under a second; the
+    /// frames-per-second model doesn't apply to single frames).
+    pub fn estimate(&self) -> (u64, u64, i64, f64) {
         let p = self.est_params();
         let idx = self.eligible();
         let mut new_b = 0u64;
@@ -396,7 +433,7 @@ impl AppState {
             }
         }
         let total_b: u64 = idx.iter().map(|&i| self.files[i].bytes).sum();
-        let saved = total_b.saturating_sub(new_b);
+        let saved = new_b as i64 - total_b as i64;
         let fps = match self.backend {
             VideoBackend::CpuX264 => 90.0,
             VideoBackend::CpuX265 => 45.0,
@@ -405,19 +442,16 @@ impl AppState {
         };
         let video_secs = total_frames / fps / (self.parallel.max(1) as f64);
         let image_secs = image_count as f64 * 0.35 / (self.parallel.max(1) as f64);
-        (
-            total_b,
-            new_b,
-            saved,
-            video_secs + image_secs,
-        )
+        (total_b, new_b, saved, video_secs + image_secs)
     }
 
-    /// (filename, resolution, will_shrink, reason) rows for the plan
-    /// list. Resolution is "?" when the file has no dimensions.
-    pub fn preflight_rows(&self) -> Vec<(String, String, bool, String)> {
+    /// (filename, resolution, verdict) rows for the plan list. Resolution
+    /// is "?" when the file has no dimensions. `Preflight::Warn` rows are
+    /// part of the run but flagged for the user.
+    pub fn preflight_rows(&self) -> Vec<(String, String, Preflight)> {
         let p = self.est_params();
         let t = self.threshold();
+        let policy = self.threshold_policy();
         self.files
             .iter()
             .map(|f| {
@@ -427,11 +461,7 @@ impl AppState {
                     .and_then(|s| s.to_str())
                     .unwrap_or("?")
                     .to_string();
-                let res = f.res_label();
-                match preflight_auto(f, &p, t) {
-                    Preflight::Shrink { reason } => (name, res, true, reason),
-                    Preflight::Skip { reason } => (name, res, false, reason),
-                }
+                (name, f.res_label(), preflight_auto_with(f, &p, t, policy))
             })
             .collect()
     }

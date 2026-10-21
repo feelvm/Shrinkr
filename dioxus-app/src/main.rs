@@ -30,7 +30,9 @@ use jobs::JobMsg;
 use shrinkr_core::images::{jpeg_q_for, webp_quality_for};
 use shrinkr_core::log::{Level, LogEntry};
 use shrinkr_core::media::human_bytes;
-use shrinkr_core::pipeline::{preflight_auto, NvencPreset, Preflight, ScalePolicy, VideoBackend};
+use shrinkr_core::pipeline::{
+    preflight_auto_with, size_change_label, NvencPreset, Preflight, ScalePolicy, VideoBackend,
+};
 use state::AppState;
 use std::sync::{atomic::AtomicBool, Arc};
 
@@ -44,23 +46,157 @@ fn app_icon() -> dioxus::desktop::tao::window::Icon {
 }
 
 fn main() {
+    // A panic in a Dioxus event/coroutine takes the window down with it,
+    // and the log panel is memory-only — so record panics (with a
+    // backtrace when the build carries one) in the on-disk log before the
+    // process dies. This is what makes "it just closes, no logs" diagnosable.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        shrinkr_core::log::to_file(&format!("PANIC: {info}\n{bt}"));
+        default_hook(info);
+    }));
+    if let Some(path) = shrinkr_core::log::log_file() {
+        shrinkr_core::log::to_file(&format!(
+            "--- Shrinkr {} starting (log: {}) ---",
+            env!("CARGO_PKG_VERSION"),
+            path.display()
+        ));
+    }
     // NOTE: dioxus-desktop forces always-on-top in DEBUG builds unless told
     // otherwise ("so we can see it while we work"). A shrink tool that pins
     // itself above file dialogs is unusable, so spell out a normal window.
     use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
+    let config = Config::new().with_window(
+        WindowBuilder::new()
+            .with_title("Shrinkr")
+            .with_window_icon(Some(app_icon()))
+            .with_inner_size(LogicalSize::new(1280.0, 900.0))
+            .with_min_inner_size(LogicalSize::new(1024.0, 700.0))
+            .with_decorations(true)
+            .with_always_on_top(false),
+    );
+    #[cfg(target_os = "windows")]
+    let config = match webview_data_dir() {
+        Some(dir) => config.with_data_directory(dir),
+        None => config,
+    };
     dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            Config::new().with_window(
-                WindowBuilder::new()
-                    .with_title("Shrinkr")
-                    .with_window_icon(Some(app_icon()))
-                    .with_inner_size(LogicalSize::new(1280.0, 900.0))
-                    .with_min_inner_size(LogicalSize::new(1024.0, 700.0))
-                    .with_decorations(true)
-                    .with_always_on_top(false),
-            ),
-        )
+        .with_cfg(config)
         .launch(App);
+}
+
+/// WebView2 keeps its profile in a user-data directory. A profile left by an
+/// older runtime, an elevated run, or a sandboxed run can make controller
+/// creation fail with `ERROR_BUSY`; Dioxus then waits forever for a window
+/// that never appears. Use a fresh, versioned profile for every launch and
+/// fall back to the temp directory (then the executable's directory) if the
+/// preferred location isn't writable.
+#[cfg(target_os = "windows")]
+fn webview_data_dir() -> Option<std::path::PathBuf> {
+    let version = webview2_runtime_version().unwrap_or_else(|| "unknown".to_string());
+    // A fresh profile per launch means a stale lock or crashed WebView2
+    // process can never leave the next launch waiting forever.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let unique = format!("shrinkr-webview-{version}-{}-{stamp}", std::process::id());
+
+    let mut candidates = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(std::path::PathBuf::from(local).join(&unique));
+    }
+    candidates.push(std::env::temp_dir().join(&unique));
+    if let Some(exe) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+    {
+        candidates.push(exe.join(&unique));
+    }
+
+    for dir in candidates {
+        if writable_dir(&dir) {
+            if let Some(base) = dir.parent() {
+                cleanup_old_webview_profiles(base, &dir);
+            }
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// Best-effort cleanup: stale per-launch profiles older than a week are
+/// removed. Locked or in-use dirs simply stay behind.
+#[cfg(target_os = "windows")]
+fn cleanup_old_webview_profiles(base: &std::path::Path, current: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path == current || !name.starts_with("shrinkr-webview-") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .map(|age| age.as_secs() > 7 * 24 * 60 * 60)
+            .unwrap_or(false);
+        if old {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+/// Installed WebView2 runtime version, used to version its profile directory.
+#[cfg(target_os = "windows")]
+fn webview2_runtime_version() -> Option<String> {
+    let mut roots = Vec::new();
+    for key in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Some(base) = std::env::var_os(key) {
+            roots.push(std::path::PathBuf::from(base).join(r"Microsoft\EdgeWebView\Application"));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(std::path::PathBuf::from(local).join(r"Microsoft\EdgeWebView\Application"));
+    }
+
+    let mut versions = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && path.join("msedgewebview2.exe").is_file()
+            {
+                versions.push(name);
+            }
+        }
+    }
+    versions.sort_by_key(|v| {
+        v.split('.')
+            .map(|part| part.parse::<u32>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    });
+    versions.pop()
+}
+
+#[cfg(target_os = "windows")]
+fn writable_dir(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".write-test-{}", std::process::id()));
+    let ok = std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
 }
 
 /// Styles are inlined (rather than linked as manganis assets) so the
@@ -219,9 +355,9 @@ fn Header() -> Element {
 fn fetch_clicked(mut state: Signal<AppState>) {
     state.write().ffmpeg_fetching = true;
     state.write().ffmpeg_fetch_pct = 0.0;
-    state
-        .write()
-        .push_log("Downloading FFmpeg (bundled builds come from github.com/BtbN/FFmpeg-Builds)…".into());
+    state.write().push_log(
+        "Downloading FFmpeg (bundled builds come from github.com/BtbN/FFmpeg-Builds)…".into(),
+    );
     crate::jobs::start_ffmpeg_fetch(pump_tx());
 }
 
@@ -247,7 +383,9 @@ fn update_clicked(mut state: Signal<AppState>) {
     }
     state.write().update_installing = true;
     state.write().update_error = None;
-    state.write().push_log("Downloading + installing update…".into());
+    state
+        .write()
+        .push_log("Downloading + installing update…".into());
     crate::jobs::start_update_install(pump_tx(), env!("CARGO_PKG_VERSION").to_string());
 }
 
@@ -264,7 +402,7 @@ fn Sidebar() -> Element {
     let probe_done = s.probe_done;
     let probe_total = s.probe_total;
     let files_summary = crate::sidebar_summary(&s);
-    // Run state — the Shrink button and its batch progress live at the
+    // Run state — the Process button and its batch progress live at the
     // bottom of this sidebar, next to the import controls.
     let executing = s.executing;
     let exec_done = s.exec_done();
@@ -283,11 +421,15 @@ fn Sidebar() -> Element {
         "Working {exec_done}/{exec_total} — {:.0}%",
         exec_overall * 100.0
     );
-    let shrink_label = format!("Shrink {n_eligible} file(s)");
+    let process_label = format!("Process {n_eligible} file(s)");
     // OS drag & drop onto the sidebar queues shrink sources.
     let drop_tx = pump_tx();
     let mut drag_over = use_signal(|| false);
-    let drag_cls = if drag_over() { "ring-2 ring-inset ring-primary" } else { "" };
+    let drag_cls = if drag_over() {
+        "ring-2 ring-inset ring-primary"
+    } else {
+        ""
+    };
     rsx! {
         aside {
             class: "flex w-80 shrink-0 flex-col gap-4 overflow-y-auto border-r border-border bg-card p-4 {drag_cls}",
@@ -447,15 +589,15 @@ fn Sidebar() -> Element {
                     }
                 }
             }
-            // Run control, directly under the Library card: the Shrink
+            // Run control, directly under the Library card: the Process
             // button when idle, batch progress + cancel mid-run.
             div { class: "flex flex-col gap-2",
                 if !executing {
                     Button {
                         variant: ButtonVariant::Default,
                         class: "w-full",
-                        onclick: move |_| crate::shrink_clicked(state, pump_tx()),
-                        "{shrink_label}"
+                        onclick: move |_| crate::process_clicked(state, pump_tx()),
+                        "{process_label}"
                     }
                 } else {
                     Progress { value: exec_overall * 100.0 }
@@ -556,7 +698,11 @@ fn Main() -> Element {
 fn ShrinkEmpty() -> Element {
     let drop_tx = pump_tx();
     let mut drag_over = use_signal(|| false);
-    let drag_cls = if drag_over() { "ring-2 ring-inset ring-primary" } else { "" };
+    let drag_cls = if drag_over() {
+        "ring-2 ring-inset ring-primary"
+    } else {
+        ""
+    };
     rsx! {
         Card {
             CardContent {
@@ -728,16 +874,26 @@ fn PipelineCard() -> Element {
                                 };
                             },
                             option { value: "off", selected: opus_bps.is_none(), "Off (keep as-is)" }
-                            option { value: "32", selected: opus_bps == Some(32_000), "Opus 32k" }
-                            option { value: "48", selected: opus_bps == Some(48_000), "Opus 48k" }
-                            option { value: "64", selected: opus_bps == Some(64_000), "Opus 64k" }
-                            option { value: "96", selected: opus_bps == Some(96_000), "Opus 96k" }
-                            option { value: "128", selected: opus_bps == Some(128_000), "Opus 128k" }
-                            option { value: "192", selected: opus_bps == Some(192_000), "Opus 192k" }
-                            option { value: "256", selected: opus_bps == Some(256_000), "Opus 256k" }
+                            for kbps in shrinkr_core::pipeline::OPUS_TARGETS_KBPS {
+                                {
+                                    let max = kbps == shrinkr_core::pipeline::MAX_OPUS_BPS / 1000;
+                                    let label = if max {
+                                        format!("Opus {kbps}k (max)")
+                                    } else {
+                                        format!("Opus {kbps}k")
+                                    };
+                                    rsx! {
+                                        option {
+                                            value: "{kbps}",
+                                            selected: opus_bps == Some(kbps * 1000),
+                                            "{label}"
+                                        }
+                                    }
+                                }
+                            }
                         }
                         p { class: "text-xs text-muted-foreground",
-                            "Tracks at/below target are copied. Exotic layouts → AAC."
+                            "Tracks at/below target are copied. In 'Copy video (audio/subs only)' mode the target is always encoded, so the file grows. Opus caps at 256k/channel; exotic layouts → AAC."
                         }
                     }
                     div { class: "flex items-center gap-3",
@@ -874,6 +1030,13 @@ fn PipelineCard() -> Element {
                                     on_checked_change: move |v| state.write().replace = v,
                                 }
                                 "Replace originals after verified encode"
+                            }
+                            p { class: "text-xs text-muted-foreground",
+                                if skip_efficient {
+                                    "Files estimated to save less than the minimum are skipped."
+                                } else {
+                                    "Files estimated to save less than the minimum are still queued — the plan warns instead of skipping."
+                                }
                             }
                         }
                         div { class: "flex items-center gap-3",
@@ -1031,7 +1194,9 @@ fn EstimateCard() -> Element {
     let elig_idx = s.eligible();
     let elig = elig_idx.len();
     let skipped = s.files.len() - elig;
-    let (elig_b, new_b, saved_b, secs) = s.estimate();
+    let (_, warned, _) = s.plan_counts();
+    let threshold = s.threshold();
+    let (elig_b, new_b, _delta_b, secs) = s.estimate();
     let skipped_b: u64 = s
         .files
         .iter()
@@ -1039,52 +1204,51 @@ fn EstimateCard() -> Element {
         .filter(|(i, _)| !elig_idx.contains(i))
         .map(|(_, f)| f.bytes)
         .sum();
-    let pct = if elig_b > 0 {
-        saved_b as f64 / elig_b as f64 * 100.0
-    } else {
-        0.0
-    };
+    // Signed wording: a growing plan says how much it grows (bytes and
+    // percent) instead of showing the same total with a 0% difference.
+    let change = size_change_label(elig_b, new_b);
     let headline = format!(
-        "{} eligible • {} → {} (free ~{} • {:.0}%)",
+        "{} eligible • {} → {} • {}",
         elig,
         human_bytes(elig_b),
         human_bytes(new_b),
-        human_bytes(saved_b),
-        pct
+        change
     );
+    let warn_note = if warned > 0 {
+        format!(" • {warned} below {threshold:.0}% (warned, still queued)")
+    } else {
+        String::new()
+    };
     let subline = if skipped > 0 {
         format!(
-            "{} skipped file(s) ({} excluded) • About {:.1}h — change any Pipeline setting and this updates",
+            "{} skipped file(s) ({} excluded){warn_note} • About {:.1}h — change any Pipeline setting and this updates",
             skipped,
             human_bytes(skipped_b),
             secs / 3600.0
         )
     } else {
         format!(
-            "About {:.1}h — change any Pipeline setting and this updates",
+            "About {:.1}h{warn_note} — change any Pipeline setting and this updates",
             secs / 3600.0
         )
     };
     let rows: Vec<(String, String, String)> = s
         .preflight_rows()
         .into_iter()
-        .map(|(name, res, go, reason)| {
-            let mark = if go {
-                "✓".to_string()
-            } else {
-                "✗".to_string()
-            };
-            let cls = if go {
-                "text-xs text-green-500".to_string()
-            } else {
-                "text-xs text-muted-foreground".to_string()
+        .map(|(name, res, verdict)| {
+            // Warn rows are part of the run (they count as eligible) but
+            // stand out from clean shrinks so the threshold is visible.
+            let (mark, cls, reason) = match verdict {
+                Preflight::Shrink { reason } => ("✓", "text-xs text-green-500", reason),
+                Preflight::Warn { reason } => ("⚠", "text-xs text-orange-300", reason),
+                Preflight::Skip { reason } => ("✗", "text-xs text-muted-foreground", reason),
             };
             let label = if res == "?" {
                 format!("{name}: {reason}")
             } else {
                 format!("{name} · {res}: {reason}")
             };
-            (mark, label, cls)
+            (mark.to_string(), label, cls.to_string())
         })
         .collect();
     let target_text = s.target_text.clone();
@@ -1098,7 +1262,7 @@ fn EstimateCard() -> Element {
         Card {
             CardHeader {
                 CardTitle { "Estimate & plan" }
-                CardDescription { "Which files Shrink will touch, and why the rest skip" }
+                CardDescription { "Which files will be processed, and why the rest skip" }
             }
             CardContent {
                 p { class: "text-sm font-semibold", "{headline}" }
@@ -1135,33 +1299,43 @@ fn EstimateCard() -> Element {
     }
 }
 
-/// UI-thread part of Shrink: eligibility gate with loud skip reasons,
+/// UI-thread part of Process: eligibility gate with loud skip reasons,
 /// then state setup + worker handoff.
-fn shrink_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
+fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     use shrinkr_core::ffmpeg::{build_args, command_line};
     use shrinkr_core::hw::caps;
-    use shrinkr_core::pipeline::{plan_streams, select_levels_for_media};
+    use shrinkr_core::pipeline::{plan_streams_with, select_levels_for_media};
     let s = state.read();
     let idx = s.eligible();
     if idx.is_empty() {
         let files = s.files.clone();
         let p = s.est_params();
         let t = s.threshold();
+        let policy = s.threshold_policy();
+        let skip_efficient = s.skip_efficient;
         drop(s);
         let mut w = state.write();
-        w.push_log("Shrink pressed but 0 files eligible — reasons:".into());
+        w.push_log("Process pressed but 0 files eligible — reasons:".into());
         if files.is_empty() {
             w.push_log("  (no probed files — Scan first)".into());
         }
         for f in files.iter().take(10) {
-            if let Preflight::Skip { reason } = preflight_auto(f, &p, t) {
+            if let Preflight::Skip { reason } = preflight_auto_with(f, &p, t, policy) {
                 let name = f.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
                 w.push_log(format!("  ✗ {}: {}", name, reason));
             }
         }
-        w.push_log(
-            "  hint: uncheck 'Skip already-efficient files' or lower 'Min. saving %'.".into(),
-        );
+        if skip_efficient {
+            w.push_log(
+                "  hint: uncheck 'Skip already-efficient files' to queue low-gain files with a warning, or lower 'Min. saving %'."
+                    .into(),
+            );
+        } else {
+            w.push_log(
+                "  hint: these files can't be shrunk even with the threshold off (see the reasons above)."
+                    .into(),
+            );
+        }
         return;
     }
     if shrinkr_core::process::cmd("ffmpeg")
@@ -1182,6 +1356,7 @@ fn shrink_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     let parallel = s.parallel.clamp(1, 8);
     let replace = s.replace;
     let threshold = s.threshold();
+    let threshold_policy = s.threshold_policy();
     // Parse the advanced flags now so typos fail fast with a log line,
     // not halfway through a batch.
     let extra_args = match shrinkr_core::ffmpeg::parse_extra_args(&s.extra_args) {
@@ -1200,18 +1375,24 @@ fn shrink_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
             shrinkr_core::images::plan_image(f0, params.image_preserve_format)
                 .ok()
                 .map(|plan| {
-                command_line(&shrinkr_core::images::build_image_args(
-                    f0,
-                    &plan,
-                    params.image_cq,
-                    params.image_scale,
-                    std::path::Path::new(&format!("<tmp>.{}", plan.target_ext)),
-                ))
-            })
+                    command_line(&shrinkr_core::images::build_image_args(
+                        f0,
+                        &plan,
+                        params.image_cq,
+                        params.image_scale,
+                        std::path::Path::new(&format!("<tmp>.{}", plan.target_ext)),
+                    ))
+                })
         } else {
             let levels = select_levels_for_media(params.backend, caps(), f0);
             levels.first().map(|l0| {
-                let plan = plan_streams(f0, keep_subs, params.opus_bps, params.all_audio);
+                let plan = plan_streams_with(
+                    f0,
+                    keep_subs,
+                    params.opus_bps,
+                    params.all_audio,
+                    shrinkr_core::pipeline::forces_audio_reencode(params.backend, params.opus_bps),
+                );
                 let args = build_args(
                     f0,
                     *l0,
@@ -1235,6 +1416,7 @@ fn shrink_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         parallel,
         replace,
         threshold,
+        threshold_policy,
         extra_args: extra_args.clone(),
     };
     {
@@ -1254,6 +1436,7 @@ fn shrink_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
             })
             .collect();
         w.exec_total = files.len();
+        w.exec_discarded = 0;
         w.cancel = Some(cancel.clone());
         w.exec_cfg = Some(cfg);
         w.push_log(format!(
@@ -1271,7 +1454,16 @@ fn shrink_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         }
     }
     crate::jobs::start_exec(
-        tx, files, params, keep_subs, parallel, replace, threshold, extra_args, cancel,
+        tx,
+        files,
+        params,
+        keep_subs,
+        parallel,
+        replace,
+        threshold,
+        threshold_policy,
+        extra_args,
+        cancel,
     );
 }
 
@@ -1556,7 +1748,11 @@ fn ConvertCard() -> Element {
     let has_office = shrinkr_core::convert::caps().has_office();
     // Drop-zone highlight.
     let mut drag_over = use_signal(|| false);
-    let drag_cls = if drag_over() { "border-primary" } else { "border-border" };
+    let drag_cls = if drag_over() {
+        "border-primary"
+    } else {
+        "border-border"
+    };
     let convert_label = format!("Convert {ready} file(s)");
     rsx! {
         Card {

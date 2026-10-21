@@ -53,7 +53,7 @@ fn cli_help() -> String {
      \u{20}                      (deflate); conversions off (default: off)\n\
      --keep-subs / --no-subs  subtitle copy (default keep)\n\
      --all-audio              keep every audio track (default: primary only)\n\
-     --audio <off|32|48|64|96|128|192|256>  Opus kbps, off keeps as-is (default 64)\n\
+     --audio <off|8-512>       Opus kbps, off keeps as-is (default 64, max 512)\n\
      --extra-args \"...\"      extra ffmpeg output flags, e.g. \"-tune grain\"\n\
      --dry-run                print ffmpeg commands without encoding\n\
      --probe <file>           dump media inspection\n\
@@ -184,9 +184,14 @@ fn parse_cli() -> i32 {
                     match args[i].as_str() {
                         "off" => opus_bps = None,
                         v => match v.parse::<u32>() {
-                            Ok(k) if (8..=512).contains(&k) => opus_bps = Some(k * 1000),
+                            Ok(k) if (8..=pipeline::MAX_OPUS_BPS / 1000).contains(&k) => {
+                                opus_bps = Some(k * 1000)
+                            }
                             _ => {
-                                eprintln!("--audio rejected: {v:?} — use off or kbps 8–512");
+                                eprintln!(
+                                    "--audio rejected: {v:?} — use off or kbps 8–{}",
+                                    pipeline::MAX_OPUS_BPS / 1000
+                                );
                                 return 2;
                             }
                         },
@@ -362,9 +367,15 @@ fn cli_shrink(
     );
     let be = ffmpeg::FfmpegBackend;
     let cancel = Arc::new(AtomicBool::new(false));
-    let tmp_root = std::env::temp_dir().join("shrinkr-cli");
-    let _ = std::fs::create_dir_all(&tmp_root);
+    let tmp_root = match ffmpeg::work_root() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
     let mut failed = 0;
+    let mut skipped_no_gain = 0;
     // CLI shrink uses the P5 default like the GUI default.
     let wp = pipeline::EstParams {
         backend,
@@ -393,6 +404,14 @@ fn cli_shrink(
             }
             pipeline::Preflight::Shrink { reason } => {
                 println!("[{n}] {} ({} → {})", p.display(), m.res_label(), reason);
+            }
+            pipeline::Preflight::Warn { reason } => {
+                println!(
+                    "[{n}] WARN {} ({} → {})",
+                    p.display(),
+                    m.res_label(),
+                    reason
+                );
             }
         }
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
@@ -503,7 +522,13 @@ fn cli_shrink(
             let caps = hw::caps();
             let levels = pipeline::select_levels_for_media(backend, caps, &m);
             if let Some(l0) = levels.first() {
-                let plan = pipeline::plan_streams(&m, keep_subs, opus_bps, all_audio);
+                let plan = pipeline::plan_streams_with(
+                    &m,
+                    keep_subs,
+                    opus_bps,
+                    all_audio,
+                    pipeline::forces_audio_reencode(backend, opus_bps),
+                );
                 let args = ffmpeg::build_args(
                     &m,
                     *l0,
@@ -544,6 +569,22 @@ fn cli_shrink(
                 continue;
             }
         };
+        // Same rule as the GUI: never place — or with --replace overwrite —
+        // a source with a result that isn't actually smaller. Re-encoding an
+        // already-encoded file usually grows it. Audio-only passes are the
+        // exception: the video is copied and the audio re-encoded on
+        // request, so a bigger file is the intended outcome.
+        if backend != VideoBackend::CopyVideo && er.output_bytes >= m.bytes {
+            let _ = std::fs::remove_file(&tmp_out);
+            println!(
+                "  SKIP: encoded result is {} but the source is {} — original kept \
+                 (re-encoding an already-efficient file usually grows it)",
+                human_bytes(er.output_bytes),
+                human_bytes(m.bytes)
+            );
+            skipped_no_gain += 1;
+            continue;
+        }
         match ffmpeg::place_output(&m.path, &tmp_out, replace, "mkv") {
             Ok((saved, dest)) => match probe_file(&dest) {
                 Ok(vf) => println!(
@@ -578,6 +619,12 @@ fn cli_shrink(
                 failed += 1;
             }
         }
+    }
+    if skipped_no_gain > 0 {
+        eprintln!(
+            "{skipped_no_gain} file(s) encoded but discarded: the result wasn't smaller than the source \
+             (originals kept). Keep the min-saving threshold on to skip these before encoding."
+        );
     }
     if failed > 0 {
         eprintln!("{failed} file(s) failed/skipped-by-error.");

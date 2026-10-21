@@ -88,7 +88,12 @@ pub fn check_for_update(current_version: &str) -> Result<Option<AvailableUpdate>
     match upd.is_update_available().context("check releases")? {
         Some(release) => Ok(Some(AvailableUpdate {
             version: release.version().to_string(),
-            notes: release.body().unwrap_or_default().chars().take(500).collect(),
+            notes: release
+                .body()
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect(),
         })),
         None => Ok(None),
     }
@@ -159,8 +164,7 @@ pub fn install_update(current_version: &str) -> Result<String> {
 
     let scratch = install_dir.join(format!(".shrinkr-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir_all(&scratch)
-            .with_context(|| format!("create {}", scratch.display()))?;
+    std::fs::create_dir_all(&scratch).with_context(|| format!("create {}", scratch.display()))?;
     let result = install_from_asset(&asset, &scratch, &install_dir);
     // Best-effort: on Windows the stashed copy of the *running* binary
     // cannot be deleted until this process exits, so the dir can linger

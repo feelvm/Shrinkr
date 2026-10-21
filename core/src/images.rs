@@ -31,7 +31,10 @@
 //! fallback in [`encode_image_with_fallback`] disabled.
 
 use crate::media::{human_bytes, MediaFile};
-use crate::pipeline::{cq_factor, scale_factor, scale_target, Preflight, ScalePolicy};
+use crate::pipeline::{
+    below_threshold, cq_factor, scale_factor, scale_target, size_change_label, Preflight,
+    ScalePolicy, ThresholdPolicy,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -119,13 +122,19 @@ static ROTATES_JPEG: OnceLock<bool> = OnceLock::new();
 /// (path, size) per session — plan/estimate call this on every UI render.
 fn exif_orientation_cached(path: &Path, len: u64) -> u16 {
     let key = (path.to_path_buf(), len);
-    if let Ok(g) = ORIENT_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+    if let Ok(g) = ORIENT_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
         if let Some(&o) = g.get(&key) {
             return o;
         }
     }
     let o = exif_orientation(path);
-    if let Ok(mut g) = ORIENT_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+    if let Ok(mut g) = ORIENT_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
         g.insert(key, o);
     }
     o
@@ -263,7 +272,9 @@ fn detect_jpeg_rotation() -> Option<bool> {
         .status()
         .ok()?;
     let dims = if st.success() {
-        crate::media::probe_file(&out).ok().map(|m| (m.width, m.height))
+        crate::media::probe_file(&out)
+            .ok()
+            .map(|m| (m.width, m.height))
     } else {
         None
     };
@@ -347,7 +358,11 @@ pub struct ImageEncode {
 /// either way), but a custom WxH box is user-visible geometry, so the
 /// policy is evaluated on the displayed image: portrait 3000x4000 in a
 /// 1920x1080 box lands 810x1080, not 1080x1440.
-fn oriented_scale_target(m: &MediaFile, orientation: u16, scale: ScalePolicy) -> Option<(u32, u32)> {
+fn oriented_scale_target(
+    m: &MediaFile,
+    orientation: u16,
+    scale: ScalePolicy,
+) -> Option<(u32, u32)> {
     if matches!(orientation, 5..=8) {
         let mut display = m.clone();
         std::mem::swap(&mut display.width, &mut display.height);
@@ -395,10 +410,7 @@ fn png_facts_cached(m: &MediaFile) -> Option<PngFacts> {
 /// when the decode fails, the stream ends early, or the pixel count
 /// exceeds [`FACTS_MAX_PIXELS`].
 fn measure_png_facts(m: &MediaFile) -> Option<PngFacts> {
-    if m.width == 0
-        || m.height == 0
-        || m.width as u64 * m.height as u64 > FACTS_MAX_PIXELS
-    {
+    if m.width == 0 || m.height == 0 || m.width as u64 * m.height as u64 > FACTS_MAX_PIXELS {
         return None;
     }
     use std::io::Read;
@@ -616,7 +628,7 @@ pub fn plan_image(m: &MediaFile, preserve: bool) -> Result<ImageEncode, String> 
                 // WebP keeps alpha on re-encode, so no transparency check.
                 if !crate::convert::caps().has_encoder("libwebp") {
                     return Err(
-                        "this ffmpeg build lacks libwebp — webp cannot be re-encoded".into()
+                        "this ffmpeg build lacks libwebp — webp cannot be re-encoded".into(),
                     );
                 }
                 ImageEncode {
@@ -730,7 +742,9 @@ pub fn jpeg_q_for(cq: u32) -> u32 {
 
 /// CQ slider → libwebp `-quality` (higher = better, clamped 60–95).
 pub fn webp_quality_for(cq: u32) -> u32 {
-    (100.0 - (cq.clamp(18, 40) as f64 - 18.0) * 1.4).round().clamp(60.0, 95.0) as u32
+    (100.0 - (cq.clamp(18, 40) as f64 - 18.0) * 1.4)
+        .round()
+        .clamp(60.0, 95.0) as u32
 }
 /// Conservative output/input byte ratio for one image encode, mirroring
 /// the video estimator's shape: format base × CQ curve × resolution.
@@ -771,6 +785,27 @@ pub fn preflight_image(
     preserve: bool,
     min_saving_pct: f64,
 ) -> Preflight {
+    preflight_image_with(
+        m,
+        cq,
+        scale,
+        preserve,
+        min_saving_pct,
+        ThresholdPolicy::Skip,
+    )
+}
+
+/// [`preflight_image`] with an explicit below-threshold policy: warning
+/// mode keeps low-gain stills in the run (the encode's no-gain guard
+/// still keeps the original if the output isn't actually smaller).
+pub fn preflight_image_with(
+    m: &MediaFile,
+    cq: u32,
+    scale: ScalePolicy,
+    preserve: bool,
+    min_saving_pct: f64,
+    policy: ThresholdPolicy,
+) -> Preflight {
     if m.bytes < MIN_IMAGE_BYTES {
         return Preflight::Skip {
             reason: format!("already small ({})", human_bytes(m.bytes)),
@@ -785,6 +820,7 @@ pub fn preflight_image(
     let ratio = estimate_image_ratio(m, &plan, cq, scale);
     let new_bytes = (m.bytes as f64 * ratio) as u64;
     let saving = (1.0 - ratio) * 100.0;
+    let change = size_change_label(m.bytes, new_bytes);
     // Images use the plain short-side cap on display-oriented dims (no
     // even-dimension shave — JPEG/WebP accept odd sizes, and a needless
     // 1px resample costs quality for nothing). ICOs never resize: their
@@ -801,22 +837,26 @@ pub fn preflight_image(
     } else {
         m.res_label()
     };
-    if saving < min_saving_pct {
-        Preflight::Skip {
-            reason: format!(
-                "est. {} → {} ({:.0}% < {:.0}% threshold; {}, {})",
+    if new_bytes >= m.bytes || saving < min_saving_pct {
+        let shortfall = if new_bytes >= m.bytes {
+            format!("below {:.0}% saving threshold", min_saving_pct)
+        } else {
+            format!("{:.0}% < {:.0}% threshold", saving, min_saving_pct)
+        };
+        below_threshold(
+            format!(
+                "est. {} → {} ({change}; {shortfall}; {}, {})",
                 human_bytes(m.bytes),
                 human_bytes(new_bytes),
-                saving,
-                min_saving_pct,
                 plan.note,
                 res_note
             ),
-        }
+            policy,
+        )
     } else {
         Preflight::Shrink {
             reason: format!(
-                "est. {} → {} ({:.0}% off; {}, {})",
+                "est. {} → {} ({change}; {:.0}% off; {}, {})",
                 human_bytes(m.bytes),
                 human_bytes(new_bytes),
                 saving,
@@ -846,7 +886,11 @@ pub fn build_image_args(
     ];
     let mut filters: Vec<String> = vec![];
     if plan.orientation >= 2 && !ffmpeg_rotates_jpeg() {
-        filters.extend(rotation_filters(plan.orientation).iter().map(|s| s.to_string()));
+        filters.extend(
+            rotation_filters(plan.orientation)
+                .iter()
+                .map(|s| s.to_string()),
+        );
     }
     if plan.scalable {
         if let Some((w, h)) = oriented_scale_target(m, plan.orientation, scale) {
@@ -970,12 +1014,10 @@ pub fn encode_image(
     cancel: &AtomicBool,
 ) -> Result<ImageOutcome, String> {
     let args = build_image_args(m, plan, cq, scale, out_path);
+    crate::ffmpeg::ensure_output_dir(out_path)?;
     crate::ffmpeg::log::debug_log(&format!(
         "[image {}] {}",
-        m.path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?"),
+        m.path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
         crate::ffmpeg::command_line(&args)
     ));
     let _ = std::fs::remove_file(out_path);
@@ -1035,11 +1077,7 @@ pub fn encode_image(
     if !status.success() {
         let _ = std::fs::remove_file(out_path);
         let tail = stderr_tail.lock().map(|g| g.clone()).unwrap_or_default();
-        let last = tail
-            .lines()
-            .last()
-            .unwrap_or("ffmpeg failed")
-            .to_string();
+        let last = tail.lines().last().unwrap_or("ffmpeg failed").to_string();
         return Err(format!(
             "ffmpeg ({}) failed: {}",
             plan.encoder,
@@ -1063,7 +1101,9 @@ pub fn encode_image(
     }
     let elapsed = t0.elapsed().as_secs_f64().max(0.01);
     if out_bytes as f64 > m.bytes as f64 * (1.0 - MIN_IMPROVEMENT) {
-        return Ok(ImageOutcome::NoGain { output_bytes: out_bytes });
+        return Ok(ImageOutcome::NoGain {
+            output_bytes: out_bytes,
+        });
     }
     Ok(ImageOutcome::Done(ImageResult {
         encoder: plan.encoder.into(),
@@ -1130,7 +1170,10 @@ pub fn encode_image_with_fallback(
         }
         Ok(ImageOutcome::NoGain { output_bytes }) => {
             let _ = std::fs::remove_file(&webp_path);
-            Ok((out_path.to_path_buf(), ImageOutcome::NoGain { output_bytes }))
+            Ok((
+                out_path.to_path_buf(),
+                ImageOutcome::NoGain { output_bytes },
+            ))
         }
         Err(e) => {
             let _ = std::fs::remove_file(&webp_path);
@@ -1150,7 +1193,10 @@ pub fn collect_shrink_inputs(arg: &Path) -> Vec<PathBuf> {
         return vec![arg.to_path_buf()];
     }
     let mut hits = vec![];
-    for e in walkdir::WalkDir::new(arg).into_iter().filter_map(|e| e.ok()) {
+    for e in walkdir::WalkDir::new(arg)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if !e.file_type().is_file() {
             continue;
         }
@@ -1212,12 +1258,24 @@ mod tests {
         assert_eq!(p.target_ext, "jpg");
         assert!(p.note.contains("png→jpeg"), "{}", p.note);
         // bmp and tiff convert to jpeg with the format in the note.
-        assert_eq!(plan_image(&img("s.bmp", "rgb24", 800, 600, 1_000_000), false).unwrap().note, "bmp→jpeg");
-        assert!(plan_image(&img("s.tiff", "rgb24", 800, 600, 1_000_000), false)
-            .unwrap()
-            .note
-            .starts_with("tiff→jpeg"));
-        assert_eq!(plan_image(&img("s.tif", "rgb24", 800, 600, 1_000_000), false).unwrap().target_ext, "jpg");
+        assert_eq!(
+            plan_image(&img("s.bmp", "rgb24", 800, 600, 1_000_000), false)
+                .unwrap()
+                .note,
+            "bmp→jpeg"
+        );
+        assert!(
+            plan_image(&img("s.tiff", "rgb24", 800, 600, 1_000_000), false)
+                .unwrap()
+                .note
+                .starts_with("tiff→jpeg")
+        );
+        assert_eq!(
+            plan_image(&img("s.tif", "rgb24", 800, 600, 1_000_000), false)
+                .unwrap()
+                .target_ext,
+            "jpg"
+        );
     }
 
     #[test]
@@ -1250,9 +1308,11 @@ mod tests {
         still.duration_s = 0.04;
         assert!(plan_image(&still, false).is_ok());
         // Unsupported image formats skip with a reason.
-        assert!(plan_image(&img("f.avif", "yuv420p", 800, 600, 100_000), false)
-            .unwrap_err()
-            .contains("shrinkable"));
+        assert!(
+            plan_image(&img("f.avif", "yuv420p", 800, 600, 100_000), false)
+                .unwrap_err()
+                .contains("shrinkable")
+        );
     }
 
     #[test]
@@ -1296,7 +1356,10 @@ mod tests {
         let p = plan_image(&png, true).unwrap();
         let r18 = estimate_image_ratio(&png, &p, 18, ScalePolicy::Preserve);
         let r40 = estimate_image_ratio(&png, &p, 40, ScalePolicy::Preserve);
-        assert!((r18 - r40).abs() < 1e-9, "lossless plans ignore cq: {r18} vs {r40}");
+        assert!(
+            (r18 - r40).abs() < 1e-9,
+            "lossless plans ignore cq: {r18} vs {r40}"
+        );
         // A jpeg plan (slider-driven) does move with cq.
         let jpg = img("p.jpg", "yuvj420p", 800, 600, 1_000_000);
         let jp = plan_image(&jpg, false).unwrap();
@@ -1326,7 +1389,10 @@ mod tests {
         let args = build_image_args(&pal, &plan, 28, ScalePolicy::Preserve, Path::new("o.png"));
         let joined = args.join(" ");
         assert!(joined.contains("-filter_complex"), "{joined}");
-        assert!(joined.contains("palettegen=reserve_transparent=0"), "{joined}");
+        assert!(
+            joined.contains("palettegen=reserve_transparent=0"),
+            "{joined}"
+        );
         assert!(joined.contains("paletteuse=dither=none"), "{joined}");
         assert!(joined.contains("-map [out]"), "{joined}");
         assert!(!joined.contains("-vf"), "{joined}");
@@ -1436,7 +1502,10 @@ mod tests {
         let r_jpg = estimate_image_ratio(&jpg, &pjpg, cq, scale);
         let r_png = estimate_image_ratio(&png, &ppng, cq, scale);
         assert!(r_jpg < 1.0, "jpg re-encode must predict a saving");
-        assert!(r_png < r_jpg, "png→jpeg ({r_png}) must beat jpg→jpg ({r_jpg})");
+        assert!(
+            r_png < r_jpg,
+            "png→jpeg ({r_png}) must beat jpg→jpg ({r_jpg})"
+        );
         // Higher CQ (worse quality) predicts a smaller file.
         let r40 = estimate_image_ratio(&jpg, &pjpg, 40, scale);
         assert!(r40 < r_jpg);
@@ -1452,26 +1521,57 @@ mod tests {
                 assert!(reason.contains("png→jpeg"), "{reason}");
                 assert!(reason.contains("4000x3000"), "{reason}");
             }
-            Preflight::Skip { reason } => panic!("70% off should shrink: {reason}"),
+            Preflight::Skip { reason } | Preflight::Warn { reason } => {
+                panic!("70% off should shrink: {reason}")
+            }
         }
         // Downscale appears in the reason and lowers the estimate.
         match preflight_image(&m, 28, ScalePolicy::Force1080p, false, 10.0) {
             Preflight::Shrink { reason } => assert!(reason.contains("1440x1080"), "{reason}"),
-            Preflight::Skip { reason } => panic!("should shrink: {reason}"),
+            Preflight::Skip { reason } | Preflight::Warn { reason } => {
+                panic!("should shrink: {reason}")
+            }
         }
         // JPEG→JPEG at max quality predicts growth (0.75 × 2.0) → skip
         // with the threshold reason. Conversions (png→jpeg) don't hit
         // this — even at q2 they legitimately predict a saving.
         let jpg = img("big.jpg", "yuvj420p", 4000, 3000, 12_000_000);
         match preflight_image(&jpg, 18, ScalePolicy::Preserve, false, 10.0) {
-            Preflight::Skip { reason } => assert!(reason.contains("threshold"), "{reason}"),
-            Preflight::Shrink { reason } => panic!("q2 re-encode must skip: {reason}"),
+            Preflight::Skip { reason } => {
+                assert!(reason.contains("threshold"), "{reason}");
+                // Growth is described as growth, never as a negative saving.
+                assert!(reason.contains("larger"), "{reason}");
+                assert!(!reason.contains("-%"), "{reason}");
+            }
+            Preflight::Shrink { reason } | Preflight::Warn { reason } => {
+                panic!("q2 re-encode must skip: {reason}")
+            }
         }
-        // Tiny files skip outright.
+        // Unchecking "skip already-efficient" downgrades the threshold
+        // verdict to a warning: the still is queued and the plan says so.
+        match preflight_image_with(
+            &jpg,
+            18,
+            ScalePolicy::Preserve,
+            false,
+            10.0,
+            ThresholdPolicy::Warn,
+        ) {
+            Preflight::Warn { reason } => {
+                assert!(reason.contains("threshold"), "{reason}");
+                assert!(reason.contains("warned"), "{reason}");
+                assert!(reason.contains("larger"), "{reason}");
+            }
+            Preflight::Shrink { reason } => panic!("q2 re-encode should warn: {reason}"),
+            Preflight::Skip { reason } => panic!("warn mode must not skip: {reason}"),
+        }
+        // Tiny files skip outright — the 16 KB floor is not a threshold.
         m.bytes = 1_000;
         match preflight_image(&m, 28, ScalePolicy::Preserve, false, 0.0) {
             Preflight::Skip { reason } => assert!(reason.contains("already small"), "{reason}"),
-            Preflight::Shrink { .. } => panic!("16 KB floor must hold"),
+            Preflight::Shrink { .. } | Preflight::Warn { .. } => {
+                panic!("16 KB floor must hold")
+            }
         }
     }
 
@@ -1573,7 +1673,9 @@ mod tests {
     }
 
     fn hflip(g: &[Vec<char>]) -> Vec<Vec<char>> {
-        g.iter().map(|r| r.iter().rev().cloned().collect()).collect()
+        g.iter()
+            .map(|r| r.iter().rev().cloned().collect())
+            .collect()
     }
 
     fn vflip(g: &[Vec<char>]) -> Vec<Vec<char>> {
@@ -1645,7 +1747,9 @@ mod tests {
         let tiff_le: Vec<u8> = {
             let mut t = vec![b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
             t.extend([0x01, 0x00]); // 1 IFD entry
-            t.extend([0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00]);
+            t.extend([
+                0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+            ]);
             t.extend([0x00, 0x00, 0x00, 0x00]); // next IFD
             t
         };
@@ -1662,7 +1766,9 @@ mod tests {
         // Big-endian TIFF header (MM) with orientation 8.
         let mut tiff_be = vec![b'M', b'M', 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08];
         tiff_be.extend([0x00, 0x01]);
-        tiff_be.extend([0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x00]);
+        tiff_be.extend([
+            0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x00,
+        ]);
         tiff_be.extend([0x00, 0x00, 0x00, 0x00]);
         let p = d.join("o8.tif");
         std::fs::write(&p, &tiff_be).unwrap();
@@ -1690,7 +1796,10 @@ mod tests {
         // The plan doesn't key on the probed codec — a single
         // conservative base keeps both paths honest (measured: bmp
         // entries shrink ~90%, png entries ~same → guard).
-        assert_eq!(plan_image(&png_ico, false).unwrap().base_ratio, p.base_ratio);
+        assert_eq!(
+            plan_image(&png_ico, false).unwrap().base_ratio,
+            p.base_ratio
+        );
         // Args: all entry streams mapped, no frame limit, no scale even
         // when the policy asks for one.
         let args = build_image_args(&ico, &p, 28, ScalePolicy::Force1080p, Path::new("out.ico"));
@@ -1712,7 +1821,10 @@ mod tests {
         let p = plan_image(&ico, false).unwrap();
         let r1 = estimate_image_ratio(&ico, &p, 28, ScalePolicy::Preserve);
         let r2 = estimate_image_ratio(&ico, &p, 28, ScalePolicy::Force480p);
-        assert_eq!(r1, r2, "ico is never resized — policy can't change the estimate");
+        assert_eq!(
+            r1, r2,
+            "ico is never resized — policy can't change the estimate"
+        );
         assert!(r1 < 1.0);
     }
 
@@ -1730,10 +1842,7 @@ mod tests {
         let p = d.join("probe.jpg");
         std::fs::write(&p, EXIF_PROBE_JPEG).unwrap();
         let m = img("probe.jpg", "yuvj420p", 32, 16, 200_000);
-        let m = MediaFile {
-            path: p,
-            ..m
-        };
+        let m = MediaFile { path: p, ..m };
         let plan = plan_image(&m, false).unwrap();
         assert_eq!(plan.orientation, 6);
         assert!(plan.note.contains("+rot90"), "{}", plan.note);
@@ -1767,7 +1876,10 @@ mod tests {
         // Animated webp always skips (checked before encoder presence).
         let mut anim = img("anim.webp", "yuv420p", 800, 600, 1_000_000);
         anim.duration_s = 3.0;
-        assert_eq!(estimate_image_bytes(&anim, 28, ScalePolicy::Preserve, false), anim.bytes);
+        assert_eq!(
+            estimate_image_bytes(&anim, 28, ScalePolicy::Preserve, false),
+            anim.bytes
+        );
         let jpg = img("p.jpg", "yuvj420p", 4000, 3000, 4_000_000);
         assert!(estimate_image_bytes(&jpg, 28, ScalePolicy::Preserve, false) < jpg.bytes);
         // cq_factor(28) == 1.0, so the estimate is exactly base × bytes.

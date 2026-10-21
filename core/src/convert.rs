@@ -57,8 +57,8 @@ impl MediaKind {
 }
 
 pub const VIDEO_EXTS: &[&str] = &[
-    "mp4", "mkv", "avi", "mov", "wmv", "m4v", "ts", "m2ts", "mts", "mpg", "mpeg", "webm",
-    "ogv", "flv", "f4v", "3gp", "3g2", "vob", "asf", "rm",
+    "mp4", "mkv", "avi", "mov", "wmv", "m4v", "ts", "m2ts", "mts", "mpg", "mpeg", "webm", "ogv",
+    "flv", "f4v", "3gp", "3g2", "vob", "asf", "rm",
 ];
 pub const AUDIO_EXTS: &[&str] = &[
     "mp3", "m4a", "aac", "opus", "ogg", "oga", "flac", "wav", "wma", "aiff", "aif", "mka", "ac3",
@@ -155,9 +155,7 @@ pub fn kind_for(path: &Path, media: Option<&MediaFile>) -> Option<MediaKind> {
 /// stream next to real audio. Only used to keep `.mp3`+cover in Audio.
 fn is_cover_art_video(m: &MediaFile) -> bool {
     m.video_stream_count > 0
-        && (m.width < 16
-            || m.height < 16
-            || matches!(m.vcodec.as_str(), "mjpeg" | "png" | "bmp"))
+        && (m.width < 16 || m.height < 16 || matches!(m.vcodec.as_str(), "mjpeg" | "png" | "bmp"))
 }
 
 /// One offered output type.
@@ -177,23 +175,83 @@ pub struct ConvertTarget {
 pub fn targets_for(kind: MediaKind) -> Vec<ConvertTarget> {
     match kind {
         MediaKind::Video => vec![
-            ConvertTarget { ext: "mp4", label: "MP4 (H.264 + AAC)", muxer: "mp4", encoder: "libx264" },
-            ConvertTarget { ext: "mkv", label: "MKV (H.264 + Opus)", muxer: "matroska", encoder: "libx264" },
-            ConvertTarget { ext: "webm", label: "WebM (VP9 + Opus)", muxer: "webm", encoder: "libvpx-vp9" },
-            ConvertTarget { ext: "mov", label: "MOV (H.264 + AAC)", muxer: "mov", encoder: "libx264" },
-            ConvertTarget { ext: "avi", label: "AVI (H.264 + MP3)", muxer: "avi", encoder: "libx264" },
+            ConvertTarget {
+                ext: "mp4",
+                label: "MP4 (H.264 + AAC)",
+                muxer: "mp4",
+                encoder: "libx264",
+            },
+            ConvertTarget {
+                ext: "mkv",
+                label: "MKV (H.264 + Opus)",
+                muxer: "matroska",
+                encoder: "libx264",
+            },
+            ConvertTarget {
+                ext: "webm",
+                label: "WebM (VP9 + Opus)",
+                muxer: "webm",
+                encoder: "libvpx-vp9",
+            },
+            ConvertTarget {
+                ext: "mov",
+                label: "MOV (H.264 + AAC)",
+                muxer: "mov",
+                encoder: "libx264",
+            },
+            ConvertTarget {
+                ext: "avi",
+                label: "AVI (H.264 + MP3)",
+                muxer: "avi",
+                encoder: "libx264",
+            },
         ],
         MediaKind::Audio => audio_targets(),
         MediaKind::Image => vec![
-            ConvertTarget { ext: "jpg", label: "JPEG q2", muxer: "image2", encoder: "mjpeg" },
-            ConvertTarget { ext: "png", label: "PNG", muxer: "image2", encoder: "png" },
-            ConvertTarget { ext: "webp", label: "WebP q85", muxer: "image2", encoder: "libwebp" },
-            ConvertTarget { ext: "gif", label: "GIF", muxer: "gif", encoder: "gif" },
+            ConvertTarget {
+                ext: "jpg",
+                label: "JPEG q2",
+                muxer: "image2",
+                encoder: "mjpeg",
+            },
+            ConvertTarget {
+                ext: "png",
+                label: "PNG",
+                muxer: "image2",
+                encoder: "png",
+            },
+            ConvertTarget {
+                ext: "webp",
+                label: "WebP q85",
+                muxer: "image2",
+                encoder: "libwebp",
+            },
+            ConvertTarget {
+                ext: "gif",
+                label: "GIF",
+                muxer: "gif",
+                encoder: "gif",
+            },
         ],
         MediaKind::Subtitle => vec![
-            ConvertTarget { ext: "srt", label: "SubRip (.srt)", muxer: "srt", encoder: "srt" },
-            ConvertTarget { ext: "vtt", label: "WebVTT (.vtt)", muxer: "webvtt", encoder: "webvtt" },
-            ConvertTarget { ext: "ass", label: "ASS (.ass)", muxer: "ass", encoder: "ass" },
+            ConvertTarget {
+                ext: "srt",
+                label: "SubRip (.srt)",
+                muxer: "srt",
+                encoder: "srt",
+            },
+            ConvertTarget {
+                ext: "vtt",
+                label: "WebVTT (.vtt)",
+                muxer: "webvtt",
+                encoder: "webvtt",
+            },
+            ConvertTarget {
+                ext: "ass",
+                label: "ASS (.ass)",
+                muxer: "ass",
+                encoder: "ass",
+            },
         ],
         // Union of all families (probed files are narrowed to their
         // family by `feasible_targets`; this is the unprobed fallback).
@@ -205,12 +263,42 @@ pub fn targets_for(kind: MediaKind) -> Vec<ConvertTarget> {
 /// video→audio extraction (same codecs, bitrates and capability gates).
 pub fn audio_targets() -> Vec<ConvertTarget> {
     vec![
-        ConvertTarget { ext: "mp3", label: "MP3 192k", muxer: "mp3", encoder: "libmp3lame" },
-        ConvertTarget { ext: "m4a", label: "M4A/AAC 128k", muxer: "mp4", encoder: "aac" },
-        ConvertTarget { ext: "opus", label: "Opus 96k", muxer: "opus", encoder: "libopus" },
-        ConvertTarget { ext: "ogg", label: "Ogg Vorbis q5", muxer: "ogg", encoder: "libvorbis" },
-        ConvertTarget { ext: "flac", label: "FLAC (lossless)", muxer: "flac", encoder: "flac" },
-        ConvertTarget { ext: "wav", label: "WAV (PCM)", muxer: "wav", encoder: "pcm_s16le" },
+        ConvertTarget {
+            ext: "mp3",
+            label: "MP3 192k",
+            muxer: "mp3",
+            encoder: "libmp3lame",
+        },
+        ConvertTarget {
+            ext: "m4a",
+            label: "M4A/AAC 128k",
+            muxer: "mp4",
+            encoder: "aac",
+        },
+        ConvertTarget {
+            ext: "opus",
+            label: "Opus 96k",
+            muxer: "opus",
+            encoder: "libopus",
+        },
+        ConvertTarget {
+            ext: "ogg",
+            label: "Ogg Vorbis q5",
+            muxer: "ogg",
+            encoder: "libvorbis",
+        },
+        ConvertTarget {
+            ext: "flac",
+            label: "FLAC (lossless)",
+            muxer: "flac",
+            encoder: "flac",
+        },
+        ConvertTarget {
+            ext: "wav",
+            label: "WAV (PCM)",
+            muxer: "wav",
+            encoder: "pcm_s16le",
+        },
     ]
 }
 
@@ -218,8 +306,7 @@ pub fn audio_targets() -> Vec<ConvertTarget> {
 /// output (video → mp3 and friends). Extraction maps just the primary
 /// audio stream; video/subs/attachments are dropped.
 pub fn is_audio_extract(kind: MediaKind, target_ext: &str) -> bool {
-    kind == MediaKind::Video
-        && AUDIO_EXTS.contains(&target_ext.to_lowercase().as_str())
+    kind == MediaKind::Video && AUDIO_EXTS.contains(&target_ext.to_lowercase().as_str())
 }
 
 /// Every document target across families (deduplicated by extension).
@@ -243,22 +330,82 @@ pub fn doc_targets(family: DocFamily) -> Vec<ConvertTarget> {
     const O: &str = OFFICE_ENGINE;
     match family {
         DocFamily::Word => vec![
-            ConvertTarget { ext: "pdf", label: "PDF", muxer: O, encoder: O },
-            ConvertTarget { ext: "docx", label: "Word (.docx)", muxer: O, encoder: O },
-            ConvertTarget { ext: "odt", label: "ODT", muxer: O, encoder: O },
-            ConvertTarget { ext: "txt", label: "Plain text", muxer: O, encoder: O },
-            ConvertTarget { ext: "html", label: "HTML", muxer: O, encoder: O },
+            ConvertTarget {
+                ext: "pdf",
+                label: "PDF",
+                muxer: O,
+                encoder: O,
+            },
+            ConvertTarget {
+                ext: "docx",
+                label: "Word (.docx)",
+                muxer: O,
+                encoder: O,
+            },
+            ConvertTarget {
+                ext: "odt",
+                label: "ODT",
+                muxer: O,
+                encoder: O,
+            },
+            ConvertTarget {
+                ext: "txt",
+                label: "Plain text",
+                muxer: O,
+                encoder: O,
+            },
+            ConvertTarget {
+                ext: "html",
+                label: "HTML",
+                muxer: O,
+                encoder: O,
+            },
         ],
         DocFamily::Calc => vec![
-            ConvertTarget { ext: "pdf", label: "PDF", muxer: O, encoder: O },
-            ConvertTarget { ext: "xlsx", label: "Excel (.xlsx)", muxer: O, encoder: O },
-            ConvertTarget { ext: "ods", label: "ODS", muxer: O, encoder: O },
-            ConvertTarget { ext: "csv", label: "CSV", muxer: O, encoder: O },
+            ConvertTarget {
+                ext: "pdf",
+                label: "PDF",
+                muxer: O,
+                encoder: O,
+            },
+            ConvertTarget {
+                ext: "xlsx",
+                label: "Excel (.xlsx)",
+                muxer: O,
+                encoder: O,
+            },
+            ConvertTarget {
+                ext: "ods",
+                label: "ODS",
+                muxer: O,
+                encoder: O,
+            },
+            ConvertTarget {
+                ext: "csv",
+                label: "CSV",
+                muxer: O,
+                encoder: O,
+            },
         ],
         DocFamily::Impress => vec![
-            ConvertTarget { ext: "pdf", label: "PDF", muxer: O, encoder: O },
-            ConvertTarget { ext: "pptx", label: "PowerPoint (.pptx)", muxer: O, encoder: O },
-            ConvertTarget { ext: "odp", label: "ODP", muxer: O, encoder: O },
+            ConvertTarget {
+                ext: "pdf",
+                label: "PDF",
+                muxer: O,
+                encoder: O,
+            },
+            ConvertTarget {
+                ext: "pptx",
+                label: "PowerPoint (.pptx)",
+                muxer: O,
+                encoder: O,
+            },
+            ConvertTarget {
+                ext: "odp",
+                label: "ODP",
+                muxer: O,
+                encoder: O,
+            },
         ],
     }
 }
@@ -380,7 +527,10 @@ fn find_office() -> Option<String> {
     .into_iter()
     .flatten()
     {
-        let p = PathBuf::from(dir).join("LibreOffice").join("program").join("soffice.exe");
+        let p = PathBuf::from(dir)
+            .join("LibreOffice")
+            .join("program")
+            .join("soffice.exe");
         if p.is_file() {
             return Some(p.to_string_lossy().into_owned());
         }
@@ -416,11 +566,7 @@ fn cmd_names(prog: &str, args: &[&str]) -> Vec<String> {
 /// ffmpeg build cannot write. Video files additionally offer audio
 /// extraction (`mp3 | m4a | opus | ogg | flac | wav`): those entries map
 /// only the audio stream. Empty = "cannot convert this file".
-pub fn feasible_targets(
-    kind: MediaKind,
-    src_ext: &str,
-    caps: &ConvertCaps,
-) -> Vec<ConvertTarget> {
+pub fn feasible_targets(kind: MediaKind, src_ext: &str, caps: &ConvertCaps) -> Vec<ConvertTarget> {
     let src = src_ext.to_lowercase();
     let norm_src = if src == "jpeg" { "jpg".into() } else { src };
     // Documents narrow to their sub-family (a spreadsheet never offers
@@ -439,8 +585,7 @@ pub fn feasible_targets(
     } else {
         targets_for(kind)
     };
-    pool
-        .into_iter()
+    pool.into_iter()
         .filter(|t| t.ext != norm_src)
         .filter(|t| caps.has_muxer(t.muxer) && caps.has_encoder(t.encoder))
         .collect()
@@ -471,10 +616,20 @@ pub fn copy_compatible(m: &MediaFile, kind: MediaKind, target_ext: &str) -> bool
                         v,
                         "h264" | "hevc" | "av1" | "vp9" | "mpeg4" | "mpeg2video" | "vc1" | "mjpeg"
                     ) && audio_ok(&[
-                        "aac", "mp3", "opus", "vorbis", "flac", "ac3", "dts", "pcm_s16le", "none",
+                        "aac",
+                        "mp3",
+                        "opus",
+                        "vorbis",
+                        "flac",
+                        "ac3",
+                        "dts",
+                        "pcm_s16le",
+                        "none",
                     ])
                 }
-                "webm" => matches!(v, "vp8" | "vp9" | "av1") && audio_ok(&["opus", "vorbis", "none"]),
+                "webm" => {
+                    matches!(v, "vp8" | "vp9" | "av1") && audio_ok(&["opus", "vorbis", "none"])
+                }
                 "avi" => {
                     matches!(v, "h264" | "mpeg4" | "mjpeg" | "msmpeg4" | "xvid")
                         && audio_ok(&["mp3", "ac3", "pcm_s16le", "none"])
@@ -513,7 +668,10 @@ fn audio_remux_compatible(m: &MediaFile, target_ext: &str) -> bool {
     if m.audio_stream_count == 0 {
         return false;
     }
-    let a = m.primary_audio().map(|t| t.codec.as_str()).unwrap_or("none");
+    let a = m
+        .primary_audio()
+        .map(|t| t.codec.as_str())
+        .unwrap_or("none");
     match target_ext.to_lowercase().as_str() {
         "m4a" => matches!(a, "aac" | "alac"),
         "opus" => a == "opus",
@@ -769,7 +927,12 @@ pub fn build_copy_args(
 fn push_audio_encode_args(a: &mut Vec<String>, target_ext: &str) {
     match target_ext.to_lowercase().as_str() {
         "mp3" => {
-            a.extend(["-c:a".into(), "libmp3lame".into(), "-b:a".into(), "192k".into()]);
+            a.extend([
+                "-c:a".into(),
+                "libmp3lame".into(),
+                "-b:a".into(),
+                "192k".into(),
+            ]);
         }
         "m4a" => {
             a.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "128k".into()]);
@@ -836,17 +999,25 @@ pub fn build_reencode_args(
             a.push("-dn".into());
             if target_ext == "webm" {
                 a.extend([
-                    "-c:v".into(), "libvpx-vp9".into(),
-                    "-crf".into(), "32".into(),
-                    "-b:v".into(), "0".into(),
-                    "-c:a".into(), "libopus".into(),
-                    "-b:a".into(), "96k".into(),
+                    "-c:v".into(),
+                    "libvpx-vp9".into(),
+                    "-crf".into(),
+                    "32".into(),
+                    "-b:v".into(),
+                    "0".into(),
+                    "-c:a".into(),
+                    "libopus".into(),
+                    "-b:a".into(),
+                    "96k".into(),
                 ]);
             } else {
                 a.extend([
-                    "-c:v".into(), "libx264".into(),
-                    "-crf".into(), "20".into(),
-                    "-preset".into(), "veryfast".into(),
+                    "-c:v".into(),
+                    "libx264".into(),
+                    "-crf".into(),
+                    "20".into(),
+                    "-preset".into(),
+                    "veryfast".into(),
                 ]);
                 let (acodec, abitrate) = match target_ext {
                     "avi" => ("libmp3lame", "192k"),
@@ -923,13 +1094,19 @@ pub fn run_convert(
     if is_audio_extract(kind, target_ext) && m.audio_stream_count == 0 {
         return Err("no audio track to extract — this video is silent".into());
     }
+    // A wiped temp folder must not read as a codec/container failure.
+    crate::ffmpeg::ensure_output_dir(out_path)?;
     let copy_ok = copy_compatible(m, kind, target_ext);
     if copy_ok {
         let args = build_copy_args(&m.path, kind, target_ext, out_path);
         match run_once(&args, m.duration_s, progress, cancel) {
             Ok((bytes, elapsed)) => {
                 verify_output(out_path, kind, target_ext)?;
-                return Ok(ConvertResult { output_bytes: bytes, elapsed_s: elapsed, copied: true });
+                return Ok(ConvertResult {
+                    output_bytes: bytes,
+                    elapsed_s: elapsed,
+                    copied: true,
+                });
             }
             Err(e) => {
                 let _ = std::fs::remove_file(out_path);
@@ -945,7 +1122,11 @@ pub fn run_convert(
     let args = build_reencode_args(m, kind, target_ext, out_path);
     let (bytes, elapsed) = run_once(&args, m.duration_s, progress, cancel)?;
     verify_output(out_path, kind, target_ext)?;
-    Ok(ConvertResult { output_bytes: bytes, elapsed_s: elapsed, copied: false })
+    Ok(ConvertResult {
+        output_bytes: bytes,
+        elapsed_s: elapsed,
+        copied: false,
+    })
 }
 
 // ── LibreOffice document runner ──────────────────────────────
@@ -1001,7 +1182,10 @@ pub fn run_document_convert(
     // Bound the run: poll so Cancel kills promptly (5 min per file).
     let deadline = t0 + std::time::Duration::from_secs(300);
     let status = loop {
-        match child.try_wait().map_err(|e| format!("wait libreoffice: {e}"))? {
+        match child
+            .try_wait()
+            .map_err(|e| format!("wait libreoffice: {e}"))?
+        {
             Some(st) => break st,
             None => {
                 if cancel.load(Ordering::Relaxed) {
@@ -1043,18 +1227,17 @@ pub fn run_document_convert(
             }
         }
     }
-    let produced =
-        produced.ok_or_else(|| "libreoffice produced no output — format may be unsupported".to_string())?;
+    let produced = produced
+        .ok_or_else(|| "libreoffice produced no output — format may be unsupported".to_string())?;
     std::fs::rename(&produced, out_path)
         .or_else(|_| {
-            std::fs::copy(&produced, out_path).map(|_| ()).and_then(|()| {
-                std::fs::remove_file(&produced).map(|_| ()).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("tmp cleanup: {e}"),
-                    )
+            std::fs::copy(&produced, out_path)
+                .map(|_| ())
+                .and_then(|()| {
+                    std::fs::remove_file(&produced).map(|_| ()).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, format!("tmp cleanup: {e}"))
+                    })
                 })
-            })
         })
         .map_err(|e| format!("collect libreoffice output: {e}"))?;
     let _ = std::fs::remove_dir_all(&work);
@@ -1122,7 +1305,10 @@ fn run_once(
     if !st.success() {
         let tail = stderr_tail.lock().map(|g| g.clone()).unwrap_or_default();
         let last = tail.lines().last().unwrap_or("ffmpeg failed").to_string();
-        return Err(format!("ffmpeg failed: {}", last.chars().take(300).collect::<String>()));
+        return Err(format!(
+            "ffmpeg failed: {}",
+            last.chars().take(300).collect::<String>()
+        ));
     }
     let out_path = PathBuf::from(args.last().cloned().unwrap_or_default());
     let bytes = std::fs::metadata(&out_path).map(|x| x.len()).unwrap_or(0);
@@ -1137,7 +1323,9 @@ fn run_once(
         1024
     };
     if bytes < floor {
-        return Err(format!("output too small ({bytes} bytes) — likely failed encode"));
+        return Err(format!(
+            "output too small ({bytes} bytes) — likely failed encode"
+        ));
     }
     Ok((bytes, t0.elapsed().as_secs_f64().max(0.01)))
 }
@@ -1149,7 +1337,9 @@ fn verify_output(out_path: &Path, kind: MediaKind, target_ext: &str) -> Result<(
         return if bytes > 512 {
             Ok(())
         } else {
-            Err(format!("output too small ({bytes} bytes) — conversion failed"))
+            Err(format!(
+                "output too small ({bytes} bytes) — conversion failed"
+            ))
         };
     }
     // Video→audio extraction yields an audio-only file.
@@ -1202,7 +1392,10 @@ pub fn place_converted_output(
     };
     let mut dest = join(format!("{stem}.{target_ext}"));
     if dest.exists() {
-        if replace && dest == orig.with_extension(target_ext) && orig.extension().and_then(|s| s.to_str()) == Some(target_ext) {
+        if replace
+            && dest == orig.with_extension(target_ext)
+            && orig.extension().and_then(|s| s.to_str()) == Some(target_ext)
+        {
             // Same name only when extensions already match — excluded
             // upstream, but never clobber blindly.
         }
@@ -1258,7 +1451,10 @@ pub fn collect_inputs(arg: &Path) -> Vec<PathBuf> {
         return vec![arg.to_path_buf()];
     }
     let mut hits = vec![];
-    for e in walkdir::WalkDir::new(arg).into_iter().filter_map(|e| e.ok()) {
+    for e in walkdir::WalkDir::new(arg)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if !e.file_type().is_file() {
             continue;
         }
@@ -1286,8 +1482,20 @@ mod tests {
             .map(str::to_string)
             .collect(),
             encoders: vec![
-                "libx264", "libvpx-vp9", "libmp3lame", "aac", "libopus", "libvorbis", "flac",
-                "mjpeg", "png", "libwebp", "gif", "srt", "webvtt", "ass",
+                "libx264",
+                "libvpx-vp9",
+                "libmp3lame",
+                "aac",
+                "libopus",
+                "libvorbis",
+                "flac",
+                "mjpeg",
+                "png",
+                "libwebp",
+                "gif",
+                "srt",
+                "webvtt",
+                "ass",
             ]
             .into_iter()
             .map(str::to_string)
@@ -1326,19 +1534,13 @@ mod tests {
 
     #[test]
     fn kind_from_extension() {
+        assert_eq!(kind_for(Path::new("a.mp4"), None), Some(MediaKind::Video));
+        assert_eq!(kind_for(Path::new("a.MP3"), None), Some(MediaKind::Audio));
+        assert_eq!(kind_for(Path::new("a.jpeg"), None), Some(MediaKind::Image));
         assert_eq!(
-            kind_for(Path::new("a.mp4"), None),
-            Some(MediaKind::Video)
+            kind_for(Path::new("a.txt"), None),
+            Some(MediaKind::Document)
         );
-        assert_eq!(
-            kind_for(Path::new("a.MP3"), None),
-            Some(MediaKind::Audio)
-        );
-        assert_eq!(
-            kind_for(Path::new("a.jpeg"), None),
-            Some(MediaKind::Image)
-        );
-        assert_eq!(kind_for(Path::new("a.txt"), None), Some(MediaKind::Document));
         assert_eq!(kind_for(Path::new("a.xyz"), None), None);
     }
 
@@ -1444,14 +1646,12 @@ mod tests {
         let joined = copy_args.join(" ");
         assert!(joined.contains("0:a:0"), "{joined}");
         assert!(!joined.contains("-map 0 "), "{joined}");
-        let re_args =
-            build_reencode_args(&m, MediaKind::Video, "mp3", out);
+        let re_args = build_reencode_args(&m, MediaKind::Video, "mp3", out);
         let rj = re_args.join(" ");
         assert!(rj.contains("libmp3lame"), "{rj}");
         assert!(rj.contains("-vn"), "{rj}");
         // Plain video re-encode still maps video.
-        let rv =
-            build_reencode_args(&m, MediaKind::Video, "mp4", Path::new("out.mp4"));
+        let rv = build_reencode_args(&m, MediaKind::Video, "mp4", Path::new("out.mp4"));
         assert!(rv.join(" ").contains("0:v:0"));
     }
 
@@ -1518,20 +1718,29 @@ mod tests {
         assert!(!subs.contains(&"srt".to_string()));
         assert!(!subs.contains(&"mp4".to_string()));
         // New kinds resolve by extension without any probe.
-        assert_eq!(kind_for(Path::new("a.srt"), None), Some(MediaKind::Subtitle));
-        assert_eq!(kind_for(Path::new("report.DOCX"), None), Some(MediaKind::Document));
-        assert_eq!(kind_for(Path::new("sheet.xlsx"), None), Some(MediaKind::Document));
-        assert_eq!(kind_for(Path::new("clip.flv"), None), Some(MediaKind::Video));
+        assert_eq!(
+            kind_for(Path::new("a.srt"), None),
+            Some(MediaKind::Subtitle)
+        );
+        assert_eq!(
+            kind_for(Path::new("report.DOCX"), None),
+            Some(MediaKind::Document)
+        );
+        assert_eq!(
+            kind_for(Path::new("sheet.xlsx"), None),
+            Some(MediaKind::Document)
+        );
+        assert_eq!(
+            kind_for(Path::new("clip.flv"), None),
+            Some(MediaKind::Video)
+        );
     }
 
     #[test]
     fn office_override_and_graceful_absence() {
         // Explicit override wins (custom installs, tests).
         std::env::set_var("SHRINKR_SOFFICE", "C:\\fake\\soffice.exe");
-        assert_eq!(
-            find_office(),
-            Some("C:\\fake\\soffice.exe".to_string())
-        );
+        assert_eq!(find_office(), Some("C:\\fake\\soffice.exe".to_string()));
         std::env::remove_var("SHRINKR_SOFFICE");
         // On machines without LibreOffice the document runner fails
         // loudly instead of spawning garbage.

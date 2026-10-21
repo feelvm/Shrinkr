@@ -11,12 +11,20 @@ use futures_channel::mpsc::UnboundedSender;
 use shrinkr_core::bench;
 use shrinkr_core::ffmpeg::{place_output, EncodeBackend, FfmpegBackend};
 use shrinkr_core::media::{human_bytes, probe_file, MediaFile};
-use shrinkr_core::pipeline::{preflight_auto, EstParams, Preflight};
+use shrinkr_core::pipeline::{preflight_auto_with, EstParams, Preflight, ThresholdPolicy};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicBool, atomic::AtomicUsize, atomic::Ordering, Arc};
 use std::thread;
 use std::time::Instant;
+
+/// How many files in a row may be encoded and then discarded (result not
+/// smaller than the source) before the batch stops itself. A library that
+/// is already efficiently encoded hits this on every single file, and
+/// grinding through the whole thing writes nothing — one real run spent
+/// 7 hours that way. One success resets the streak, so a mixed library
+/// still runs to completion.
+const NO_GAIN_STOP_AFTER: usize = 10;
 
 #[derive(Debug)]
 pub enum JobMsg {
@@ -34,13 +42,36 @@ pub enum JobMsg {
         frac: f64,
         fps: f64,
     },
+    /// A queued file is below the min-saving threshold but the user chose
+    /// to run it anyway; surfaces the warning without failing the job.
+    ExecWarn {
+        msg: String,
+    },
     ExecFileDone {
         job: usize,
         detail: String,
     },
+    /// The encode finished but its result was not smaller than the source,
+    /// so it was thrown away and the original kept. Distinct from an
+    /// error: nothing went wrong, there was simply nothing to gain — the
+    /// usual outcome for files that are already efficiently encoded.
+    ExecNoGain {
+        job: usize,
+        detail: String,
+    },
+    /// A file was still encoding when the run ended (user cancel, or the
+    /// repeated-no-gain stop). Neither success nor failure — there is
+    /// nothing wrong to report, so it must not surface as an error.
+    ExecAborted {
+        job: usize,
+    },
     ExecDone {
         freed: i64,
         elapsed_s: f64,
+        /// True when the batch stopped itself after
+        /// [`NO_GAIN_STOP_AFTER`] consecutive discards, rather than the
+        /// user cancelling.
+        stopped_no_gain: bool,
     },
     ExecError {
         job: Option<usize>,
@@ -183,6 +214,14 @@ pub fn start_scan(tx: UnboundedSender<JobMsg>, targets: Vec<PathBuf>) {
     });
 }
 
+/// Result of one file: either an output was placed, or the encode was
+/// thrown away because it didn't beat the source. Both are "expected"
+/// outcomes — only `Err` is a failure.
+enum JobOutcome {
+    Placed { saved: i64, detail: String },
+    NoGain { detail: String },
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_one_job(
     tx: &UnboundedSender<JobMsg>,
@@ -190,14 +229,24 @@ fn run_one_job(
     params: EstParams,
     keep_subs: bool,
     threshold: f64,
+    threshold_policy: ThresholdPolicy,
     tmp_root: &Path,
     job_idx: usize,
     replace: bool,
     extra_args: Vec<String>,
     cancel: &Arc<AtomicBool>,
-) -> Result<(i64, String), String> {
-    if let Preflight::Skip { reason } = preflight_auto(&f, &params, threshold) {
-        return Err(format!("skip {}: {}", f.path.display(), reason));
+) -> Result<JobOutcome, String> {
+    match preflight_auto_with(&f, &params, threshold, threshold_policy) {
+        Preflight::Skip { reason } => {
+            return Err(format!("skip {}: {}", f.path.display(), reason));
+        }
+        Preflight::Warn { reason } => send(
+            tx,
+            JobMsg::ExecWarn {
+                msg: format!("warn {}: {}", f.path.display(), reason),
+            },
+        ),
+        Preflight::Shrink { .. } => {}
     }
     // Still images take the image branch: dedicated encoder, temp
     // extension and placement ext; the video pipeline never sees them.
@@ -239,6 +288,25 @@ fn run_one_job(
         cancel,
     );
     let er = r?;
+    // The preflight estimate is only a prediction. Never replace a source
+    // with a file that isn't actually smaller — warn mode deliberately
+    // queues below-threshold files, and the no-gain guard keeps that safe.
+    // Audio-only passes are the exception: the video is copied untouched
+    // and the audio was re-encoded on request, so a larger file is the
+    // intended result, not a failed encode.
+    if params.backend != shrinkr_core::pipeline::VideoBackend::CopyVideo
+        && er.output_bytes >= f.bytes
+    {
+        let _ = std::fs::remove_file(&tmp_out);
+        return Ok(JobOutcome::NoGain {
+            detail: format!(
+                "skip {fname}: no gain — encoded {} but the source is {}; original kept. \
+                 Re-encoding already-compressed video usually grows it.",
+                human_bytes(er.output_bytes),
+                human_bytes(f.bytes)
+            ),
+        });
+    }
     let scale_note = match er.scaled_to {
         Some((w, h)) => format!(" scale_cuda→{}x{}", w, h),
         None => String::new(),
@@ -265,7 +333,7 @@ fn run_one_job(
             format!("kept, wrote {dest_name}")
         }
     );
-    Ok((saved, detail))
+    Ok(JobOutcome::Placed { saved, detail })
 }
 
 /// One still image through the image pipeline: plan → temp encode →
@@ -281,7 +349,7 @@ fn run_one_image_job(
     job_idx: usize,
     replace: bool,
     cancel: &Arc<AtomicBool>,
-) -> Result<(i64, String), String> {
+) -> Result<JobOutcome, String> {
     use shrinkr_core::images::{encode_image_with_fallback, plan_image, ImageOutcome};
     let fname = f
         .path
@@ -289,9 +357,8 @@ fn run_one_image_job(
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string();
-    let mut plan =
-        plan_image(&f, params.image_preserve_format)
-            .map_err(|reason| format!("skip {fname}: {reason}"))?;
+    let mut plan = plan_image(&f, params.image_preserve_format)
+        .map_err(|reason| format!("skip {fname}: {reason}"))?;
     let stem = f.path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let tmp_out = tmp_root.join(format!("{}-{}.{}", stem, job_idx, plan.target_ext));
     let _ = std::fs::remove_file(&tmp_out);
@@ -310,11 +377,13 @@ fn run_one_image_job(
         ImageOutcome::Done(r) => r,
         ImageOutcome::NoGain { output_bytes } => {
             let _ = std::fs::remove_file(&tmp_out);
-            return Err(format!(
-                "skip {fname}: no gain ({} → {}) — kept original",
-                human_bytes(f.bytes),
-                human_bytes(output_bytes)
-            ));
+            return Ok(JobOutcome::NoGain {
+                detail: format!(
+                    "skip {fname}: no gain — encoded {} but the source is {}; original kept",
+                    human_bytes(output_bytes),
+                    human_bytes(f.bytes)
+                ),
+            });
         }
     };
     let (saved, dest) = place_output(&f.path, &tmp_final, replace, plan.target_ext)?;
@@ -335,7 +404,7 @@ fn run_one_image_job(
             format!("kept, wrote {dest_name}")
         }
     );
-    Ok((saved, detail))
+    Ok(JobOutcome::Placed { saved, detail })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -347,20 +416,46 @@ pub fn start_exec(
     parallel: usize,
     replace: bool,
     threshold: f64,
+    threshold_policy: ThresholdPolicy,
     extra_args: Vec<String>,
     cancel: Arc<AtomicBool>,
 ) {
     // Caller guarantees non-empty files; the worker always ends with ExecDone.
     thread::spawn(move || {
         let t0 = Instant::now();
-        let tmp_root = std::env::temp_dir().join("shrinkr");
-        let _ = std::fs::create_dir_all(&tmp_root);
+        // Never start a batch into a folder this process can't write to:
+        // every file would fail on its output instead. `work_root` probes
+        // temp and app data, and explains a sandboxed/restricted launch
+        // (which can write nowhere in the user profile) when both fail.
+        let tmp_root = match shrinkr_core::ffmpeg::work_root() {
+            Ok(d) => d,
+            Err(e) => {
+                send(
+                    &tx,
+                    JobMsg::ExecError {
+                        job: None,
+                        msg: format!("work folder unusable, so every encode would fail: {e}"),
+                    },
+                );
+                send(
+                    &tx,
+                    JobMsg::ExecDone {
+                        freed: 0,
+                        elapsed_s: 0.0,
+                        stopped_no_gain: false,
+                    },
+                );
+                return;
+            }
+        };
         // Work-stealing pool: workers pull
         // file indices from a shared queue so stragglers can't idle a batch.
         use std::sync::atomic::AtomicI64;
         let files = Arc::new(files);
         let next = Arc::new(AtomicUsize::new(0));
         let freed = Arc::new(AtomicI64::new(0));
+        let no_gain_streak = Arc::new(AtomicUsize::new(0));
+        let stopped_no_gain = Arc::new(AtomicBool::new(false));
         let extra_args = Arc::new(extra_args);
         let mut handles = Vec::with_capacity(parallel.max(1));
         for _ in 0..parallel.max(1) {
@@ -368,6 +463,8 @@ pub fn start_exec(
             let files = files.clone();
             let next = next.clone();
             let freed = freed.clone();
+            let no_gain_streak = no_gain_streak.clone();
+            let stopped_no_gain = stopped_no_gain.clone();
             let extra_args = extra_args.clone();
             let tmp_root = tmp_root.clone();
             let cancel = cancel.clone();
@@ -385,22 +482,50 @@ pub fn start_exec(
                     params,
                     keep_subs,
                     threshold,
+                    threshold_policy,
                     &tmp_root,
                     i,
                     replace,
                     extra_args.as_ref().clone(),
                     &cancel,
                 ) {
-                    Ok((saved, detail)) => {
+                    Ok(JobOutcome::Placed { saved, detail }) => {
+                        no_gain_streak.store(0, Ordering::Relaxed);
                         freed.fetch_add(saved, Ordering::Relaxed);
                         send(&tx, JobMsg::ExecFileDone { job: i, detail });
                     }
+                    Ok(JobOutcome::NoGain { detail }) => {
+                        // A library that is already efficiently encoded
+                        // discards *every* file: the first run of that kind
+                        // burned 7 hours to write nothing. Stop shortly
+                        // after the pattern is clear instead of encoding
+                        // the rest for the same outcome.
+                        let streak = no_gain_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                        send(&tx, JobMsg::ExecNoGain { job: i, detail });
+                        if streak >= NO_GAIN_STOP_AFTER {
+                            stopped_no_gain.store(true, Ordering::Relaxed);
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) if e.contains("cancelled") => {
+                        // The run ended under this file (user cancel or the
+                        // repeated-no-gain stop). Not an error, and the
+                        // batch summary already explains why.
+                        send(&tx, JobMsg::ExecAborted { job: i });
+                    }
                     Err(e) => {
+                        // Name the file: "all backends failed: …" without a
+                        // filename leaves no way to find the offender.
+                        let name = files[i]
+                            .path
+                            .file_name()
+                            .and_then(|x| x.to_str())
+                            .unwrap_or("?");
                         send(
                             &tx,
                             JobMsg::ExecError {
                                 job: Some(i),
-                                msg: e,
+                                msg: format!("{name}: {e}"),
                             },
                         );
                     }
@@ -418,7 +543,9 @@ pub fn start_exec(
                 );
             }
         }
-        if cancel.load(Ordering::Relaxed) {
+        let elapsed = t0.elapsed().as_secs_f64();
+        let stopped = stopped_no_gain.load(Ordering::Relaxed);
+        if cancel.load(Ordering::Relaxed) && !stopped {
             send(
                 &tx,
                 JobMsg::ExecError {
@@ -427,12 +554,12 @@ pub fn start_exec(
                 },
             );
         }
-        let elapsed = t0.elapsed().as_secs_f64();
         send(
             &tx,
             JobMsg::ExecDone {
                 freed: freed.load(Ordering::Relaxed),
                 elapsed_s: elapsed,
+                stopped_no_gain: stopped,
             },
         );
     });
@@ -446,7 +573,9 @@ pub fn start_bench(
     keep_subs: bool,
 ) {
     thread::spawn(move || {
-        let out_dir = std::env::temp_dir().join("shrinkr-bench");
+        let out_dir = shrinkr_core::ffmpeg::work_root()
+            .map(|d| d.join("bench"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("shrinkr-bench"));
         let rows = bench::run_on_file(&m, &out_dir, cq, scale, keep_subs, false, &|line| {
             send(
                 &tx,
@@ -488,7 +617,9 @@ pub fn start_target_solve(
             .and_then(|x| x.to_str())
             .unwrap_or("?")
             .to_string();
-        let work = std::env::temp_dir().join("shrinkr-target");
+        let work = shrinkr_core::ffmpeg::work_root()
+            .map(|d| d.join("target"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("shrinkr-target"));
         let r = solve_crf_for_file(
             &file,
             backend,
@@ -670,7 +801,13 @@ pub fn start_convert_scan(tx: UnboundedSender<JobMsg>, paths: Vec<PathBuf>) {
                                     k.label()
                                 )
                             };
-                            send(&tx, JobMsg::ConvertOne { item, err: Some(why) });
+                            send(
+                                &tx,
+                                JobMsg::ConvertOne {
+                                    item,
+                                    err: Some(why),
+                                },
+                            );
                         }
                     }
                 }
@@ -711,8 +848,8 @@ fn run_one_convert(
         ));
     }
     let tmp_root = std::env::temp_dir().join("shrinkr-convert");
-    let _ = std::fs::create_dir_all(&tmp_root);
     let tmp_out = tmp_root.join(format!("conv-{job_idx}.tmp.{}", item.target_ext));
+    shrinkr_core::ffmpeg::ensure_output_dir(&tmp_out)?;
     let _ = std::fs::remove_file(&tmp_out);
     // Documents need no probe (ffprobe can't read them) and run through
     // LibreOffice instead of ffmpeg.
@@ -726,7 +863,8 @@ fn run_one_convert(
             },
             cancel,
         )?;
-        let (saved, dest) = place_converted_output(&item.path, &tmp_out, &item.target_ext, replace)?;
+        let (saved, dest) =
+            place_converted_output(&item.path, &tmp_out, &item.target_ext, replace)?;
         let _ = std::fs::remove_file(&tmp_out);
         return Ok(format!(
             "done {}: {} → {} (office) in {:.0}s [{}] orig={}",
@@ -818,7 +956,13 @@ pub fn start_convert_exec(
                 }
                 match run_one_convert(&tx, files[i].clone(), i, replace, &cancel) {
                     Ok(detail) => send(&tx, JobMsg::ConvertFileDone { job: i, detail }),
-                    Err(e) => send(&tx, JobMsg::ConvertError { job: Some(i), msg: e }),
+                    Err(e) => send(
+                        &tx,
+                        JobMsg::ConvertError {
+                            job: Some(i),
+                            msg: e,
+                        },
+                    ),
                 }
             }));
         }
@@ -826,19 +970,27 @@ pub fn start_convert_exec(
             if h.join().is_err() {
                 send(
                     &tx,
-                    JobMsg::ConvertError { job: None, msg: "worker panic".into() },
+                    JobMsg::ConvertError {
+                        job: None,
+                        msg: "worker panic".into(),
+                    },
                 );
             }
         }
         if cancel.load(Ordering::Relaxed) {
             send(
                 &tx,
-                JobMsg::ConvertError { job: None, msg: "Cancelled.".into() },
+                JobMsg::ConvertError {
+                    job: None,
+                    msg: "Cancelled.".into(),
+                },
             );
         }
         send(
             &tx,
-            JobMsg::ConvertDone { elapsed_s: t0.elapsed().as_secs_f64() },
+            JobMsg::ConvertDone {
+                elapsed_s: t0.elapsed().as_secs_f64(),
+            },
         );
     });
 }
@@ -887,7 +1039,7 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 if !s.files.iter().any(|x| x.path == f.path) {
                     s.files.push(f.clone());
                     // Probed while a batch runs: join its queue instead of
-                    // waiting for the next manual Shrink (preflight-filtered
+                    // waiting for the next manual Process (preflight-filtered
                     // now; the worker re-checks at run time).
                     if s.executing {
                         let name = f
@@ -897,16 +1049,27 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                             .unwrap_or("?")
                             .to_string();
                         let p = s.est_params();
-                        let t = s.threshold();
-                        if matches!(
-                            shrinkr_core::pipeline::preflight_auto(&f, &p, t),
-                            shrinkr_core::pipeline::Preflight::Shrink { .. }
-                        ) {
+                        // Join with the running batch's own settings, so a
+                        // mid-run scan can't flip warn-only into skipping.
+                        let (t, policy) = s
+                            .exec_cfg
+                            .as_ref()
+                            .map(|c| (c.threshold, c.threshold_policy))
+                            .unwrap_or((s.threshold(), s.threshold_policy()));
+                        let verdict = preflight_auto_with(&f, &p, t, policy);
+                        if verdict.will_shrink() {
                             s.pending.push(f);
                             let waiting = s.pending.len();
-                            s.push_log(format!(
-                                "queued {name} ({waiting} waiting behind the running batch)"
-                            ));
+                            if verdict.is_warn() {
+                                s.push_log(format!(
+                                    "queued {name} with a warning ({waiting} waiting): {}",
+                                    verdict.reason()
+                                ));
+                            } else {
+                                s.push_log(format!(
+                                    "queued {name} ({waiting} waiting behind the running batch)"
+                                ));
+                            }
                         } else {
                             s.push_log(format!("{name} would skip — in library, not queued"));
                         }
@@ -924,17 +1087,29 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 return;
             }
             let n_files = s.files.len();
-            let skipped = n_files - s.eligible().len();
             let total = s.total_bytes();
             let t = s.threshold();
-            s.push_log(format!(
-                "Probed {} files, {} total ({} would skip at {:.0}% threshold).",
-                n_files,
-                human_bytes(total),
-                skipped,
-                t
-            ));
+            let (_, warned, skipped) = s.plan_counts();
+            if s.skip_efficient {
+                s.push_log(format!(
+                    "Probed {} files, {} total ({} would skip at {:.0}% threshold).",
+                    n_files,
+                    human_bytes(total),
+                    skipped,
+                    t
+                ));
+            } else {
+                s.push_log(format!(
+                    "Probed {} files, {} total ({} below {:.0}% will warn, {} skip).",
+                    n_files,
+                    human_bytes(total),
+                    warned,
+                    t,
+                    skipped
+                ));
+            }
         }
+        JobMsg::ExecWarn { msg } => s.push_log(msg),
         JobMsg::ExecProgress { job, frac, fps } => {
             if let Some(item) = s.exec_items.get_mut(job) {
                 // Fractions only move forward; fps-only lines (frac<0)
@@ -954,18 +1129,61 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             }
             s.push_log(detail);
         }
-        JobMsg::ExecDone { freed, elapsed_s } => {
-            let cancelled = s.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+        JobMsg::ExecNoGain { job, detail } => {
+            // Encoded, but the result wasn't smaller, so nothing was placed.
+            // Not an error — count it for the batch summary.
+            if let Some(item) = s.exec_items.get_mut(job) {
+                item.done = true;
+                item.frac = 1.0;
+            }
+            s.exec_discarded += 1;
+            s.push_log(detail);
+        }
+        JobMsg::ExecAborted { job } => {
+            // Still running when the batch ended: no result to report and
+            // nothing to explain per file (the summary does).
+            if let Some(item) = s.exec_items.get_mut(job) {
+                item.done = true;
+                item.frac = 1.0;
+            }
+        }
+        JobMsg::ExecDone {
+            freed,
+            elapsed_s,
+            stopped_no_gain,
+        } => {
+            let cancelled =
+                stopped_no_gain || s.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
             if cancelled {
-                // User-cancelled: pending files stay in the library, unrun.
+                // Pending files stay in the library, unrun.
                 let n = s.pending.len();
                 s.pending.clear();
                 s.executing = false;
-                s.push_log(format!(
-                    "Cancelled after {:.0}s. Freed {}. {n} queued file(s) kept in the library, not run.",
-                    elapsed_s,
-                    human_bytes(freed.max(0) as u64)
-                ));
+                if stopped_no_gain {
+                    let discarded = s.exec_discarded;
+                    s.exec_discarded = 0;
+                    // Only mention the queue when there is one.
+                    let queued = if n == 0 {
+                        String::new()
+                    } else {
+                        format!(" {n} queued file(s) kept in the library for later.")
+                    };
+                    s.push_log(format!(
+                        "Stopped after {:.0}s: {} file(s) in a row were encoded and then discarded because each result was larger than its source. This library is already efficiently encoded — nothing here can shrink at these settings. Leave 'Skip already-efficient files' checked (or lower the quality target) before running it again.{queued}",
+                        elapsed_s, discarded
+                    ));
+                } else {
+                    let queued = if n == 0 {
+                        String::new()
+                    } else {
+                        format!(" {n} queued file(s) kept in the library, not run.")
+                    };
+                    s.push_log(format!(
+                        "Cancelled after {:.0}s. Freed {}.{queued}",
+                        elapsed_s,
+                        human_bytes(freed.max(0) as u64)
+                    ));
+                }
                 return;
             }
             if !s.pending.is_empty() {
@@ -1001,6 +1219,7 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                     })
                     .collect();
                 s.exec_total = files.len();
+                s.exec_discarded = 0;
                 let cancel = Arc::new(AtomicBool::new(false));
                 s.cancel = Some(cancel.clone());
                 s.push_log(format!(
@@ -1015,6 +1234,7 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                     cfg.parallel,
                     cfg.replace,
                     cfg.threshold,
+                    cfg.threshold_policy,
                     cfg.extra_args,
                     cancel,
                 );
@@ -1027,6 +1247,18 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                     item.done = true;
                     item.frac = 1.0;
                 }
+            }
+            // The common confusing outcome: everything encoded, nothing
+            // written. Say why, once, in the summary instead of leaving the
+            // user with "finished but no files and no logs".
+            if s.exec_discarded > 0 {
+                let discarded = s.exec_discarded;
+                let total = s.exec_total;
+                s.push_log(format!(
+                    "{} of {} file(s) were discarded after encoding: the result was not smaller than the source, so the original was kept. Re-encoding an already-efficient file usually grows it — keep 'Skip already-efficient files' checked to skip these up front.",
+                    discarded, total
+                ));
+                s.exec_discarded = 0;
             }
             s.push_log(format!(
                 "Done in {:.0}s. Freed {}. Re-scan to confirm.",
@@ -1103,10 +1335,7 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 .iter()
                 .filter(|f| !f.target_ext.is_empty() && !f.done && !f.failed)
                 .count();
-            s.push_log(format!(
-                "Convert ready: {} file(s) convertible.",
-                ready
-            ));
+            s.push_log(format!("Convert ready: {} file(s) convertible.", ready));
         }
         JobMsg::ConvertProgress { job, frac } => {
             if let Some(item) = s.convert_files.get_mut(job) {

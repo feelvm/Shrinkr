@@ -2,10 +2,10 @@
 //!
 //! ```text
 //! Rust
-//! ├── media analysis   (media.rs)
-//! ├── pipeline select  (pipeline.rs)
-//! ├── FFmpeg backend   (this file: FfmpegBackend)
-//! └── future direct NVENC/NVDEC backend (implements EncodeBackend)
+//! â”œâ”€â”€ media analysis   (media.rs)
+//! â”œâ”€â”€ pipeline select  (pipeline.rs)
+//! â”œâ”€â”€ FFmpeg backend   (this file: FfmpegBackend)
+//! â””â”€â”€ future direct NVENC/NVDEC backend (implements EncodeBackend)
 //! ```
 //!
 //! Today only [`FfmpegBackend`] exists. A future Video Codec SDK backend
@@ -47,7 +47,7 @@ pub struct EncodeResult {
     pub gpu_avg: u32,
     pub gpu_max: u32,
     pub ratio: f64,
-    /// extra stages note (ffmpeg handles demux→mux internally; wall time
+    /// extra stages note (ffmpeg handles demuxâ†’mux internally; wall time
     /// is reported and `-benchmark` stderr tail is kept for drill-down).
     pub ffmpeg_bench_tail: String,
 }
@@ -108,12 +108,12 @@ impl EncodeBackend for FfmpegBackend {
     }
 }
 
-// ── Extra user flags ─────────────────────────────────────────
+// â”€â”€ Extra user flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ///
 /// The advanced free-text field is appended as output options (after all
 /// built-ins, before the output path), so it can tune (`-tune grain`,
-/// `-x265-params …`) and even override (`-crf 32`) the pipeline's own
-/// quality flags — ffmpeg lets the last occurrence win.
+/// `-x265-params â€¦`) and even override (`-crf 32`) the pipeline's own
+/// quality flags â€” ffmpeg lets the last occurrence win.
 ///
 /// Structural flags that would break the app's bookkeeping (inputs,
 /// stream maps, seeking, progress reporting, the output itself) are
@@ -196,28 +196,28 @@ pub fn split_extra_args(s: &str) -> Vec<String> {
 
 /// Split + validate the advanced free-text field. `Ok(vec![])` for blank
 /// input (no-op). Unterminated quotes are tolerated (rest of line is one
-/// token) — strictness belongs on dangerous flags, not on typing.
+/// token) â€” strictness belongs on dangerous flags, not on typing.
 pub fn parse_extra_args(s: &str) -> Result<Vec<String>, String> {
     let args = split_extra_args(s);
     for a in &args {
         let base = a.split('=').next().unwrap_or(a);
         if BLOCKED_EXTRA_FLAGS.contains(&base) {
             return Err(format!(
-                "{a} is managed by the app — pick another flag (see hint under the field)"
+                "{a} is managed by the app â€” pick another flag (see hint under the field)"
             ));
         }
     }
     Ok(args)
 }
 
-// ── Command builder ──────────────────────────────────────────
+// â”€â”€ Command builder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Exact FFmpeg arguments for one attempt level.
 ///
 /// Zero-copy GPU path (Level::HwHevc / HwH264):
 /// `-hwaccel cuda -hwaccel_output_format cuda` keeps NVDEC output resident;
 /// `scale_cuda` (when resizing) and `hevc_nvenc` then consume GPU frames
-/// with no GPU→CPU→GPU round-trip. CPU fallback levels omit the hwaccel
+/// with no GPUâ†’CPUâ†’GPU round-trip. CPU fallback levels omit the hwaccel
 /// flags so decode happens in system RAM and NVENC uploads once.
 pub fn build_args(
     media: &MediaFile,
@@ -360,7 +360,7 @@ pub fn build_args(
         }
         Level::CpuX265 => {
             // Max-compression path: slow preset squeezes ~15-25% smaller
-            // than medium at the same CRF. Slow on purpose — pair with
+            // than medium at the same CRF. Slow on purpose â€” pair with
             // overnight/parallel-1 runs.
             a.push("-c:v".into());
             a.push("libx265".into());
@@ -370,11 +370,11 @@ pub fn build_args(
             a.push("slow".into());
         }
         Level::CpuAv1 => {
-            // SVT-AV1 software encode (the Ryzen path on RTX 30 boxes —
+            // SVT-AV1 software encode (the Ryzen path on RTX 30 boxes â€”
             // Ampere has no AV1 NVENC). Preset 8 is the sweet spot for
-            // overnight jobs (6–7 = slower/better, 10 = ~2x faster); CRF
-            // comes from the shared CQ slider (28 ≈ high quality,
-            // 32–38 = shrink territory). 10-bit sources stay 10-bit.
+            // overnight jobs (6â€“7 = slower/better, 10 = ~2x faster); CRF
+            // comes from the shared CQ slider (28 â‰ˆ high quality,
+            // 32â€“38 = shrink territory). 10-bit sources stay 10-bit.
             a.push("-c:v".into());
             a.push("libsvtav1".into());
             a.push("-crf".into());
@@ -388,7 +388,7 @@ pub fn build_args(
         }
         Level::CopyVideo => {
             // Audio-only pass: video bytes untouched. No encoder flags at
-            // all — any of them would force (or break) an encode.
+            // all â€” any of them would force (or break) an encode.
             a.push("-c:v".into());
             a.push("copy".into());
         }
@@ -416,17 +416,27 @@ pub fn build_args(
     if plan.has_audio {
         if plan.all_audio {
             for (i, t) in media.audio.iter().enumerate() {
-                let codec = crate::pipeline::audio_track_codec(t, plan.opus_bps, plan.force_aac);
+                let codec = crate::pipeline::audio_track_codec(
+                    t,
+                    plan.opus_bps,
+                    plan.force_aac,
+                    plan.force_audio,
+                );
                 push_audio_codec(&mut a, Some(i), &codec);
             }
-            // NOTE: no `-ac 2` — channel count is preserved.
+            // NOTE: no `-ac 2` â€” channel count is preserved.
         } else if plan.audio_copy_eligible && !plan.force_aac {
             a.push("-c:a".into());
             a.push("copy".into());
         } else if let Some(t) = media.primary_audio() {
-            let codec = crate::pipeline::audio_track_codec(t, plan.opus_bps, plan.force_aac);
+            let codec = crate::pipeline::audio_track_codec(
+                t,
+                plan.opus_bps,
+                plan.force_aac,
+                plan.force_audio,
+            );
             push_audio_codec(&mut a, None, &codec);
-            // NOTE: no `-ac 2` — channel count is preserved.
+            // NOTE: no `-ac 2` â€” channel count is preserved.
         }
     }
 
@@ -503,7 +513,108 @@ pub fn command_line(args: &[String]) -> String {
     s
 }
 
-// ── Runner with fallback ─────────────────────────────────────
+// â”€â”€ Runner with fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/// Make sure the folder an encode writes into exists **and accepts writes**.
+///
+/// Callers create the batch work folder (`%TEMP%\shrinkr`, â€¦) once, but
+/// nothing guarantees it survives until the next file: Windows disk
+/// cleanup, Storage Sense, security/"booster" tools and users all wipe
+/// `%TEMP%` while an app is running. When that happens ffmpeg fails with
+/// `<out> Error opening output â€¦: No such file or directory` â€” which reads
+/// like a codec failure and burns the whole fallback ladder on one cause.
+/// Recreating the folder before every attempt costs one stat when it is
+/// already there and self-heals the wiped case.
+///
+/// Existence alone is not enough: a folder created by another token â€”
+/// an elevated run, another user, or the restricted token of a sandbox â€”
+/// exists but denies writes inside it, and ffmpeg would only report that
+/// later as a generic output error. A zero-byte probe proves it now.
+pub fn ensure_output_dir(out_path: &Path) -> Result<(), String> {
+    let Some(dir) = out_path.parent() else {
+        return Ok(()); // bare filename: the process CWD owns it
+    };
+    if dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("cannot create output folder {}: {e}", dir.display()))?;
+    let probe = dir.join(probe_name());
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "output folder {} is not writable: {e}",
+            dir.display()
+        )),
+    }
+}
+
+/// Unique, self-cleaning probe filename (parallel workers must not collide).
+fn probe_name() -> String {
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        ".shrinkr-write-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// True when this process can create files inside `dir`.
+pub fn writable_dir(dir: &Path) -> bool {
+    ensure_output_dir(&dir.join("probe")).is_ok()
+}
+
+/// Staging roots to try, best first: the process temp folder, then app
+/// data (which a sandboxed session may still own even when `%TEMP%` is
+/// off-limits).
+fn work_candidates() -> Vec<PathBuf> {
+    let mut v = vec![std::env::temp_dir().join("shrinkr")];
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        v.push(PathBuf::from(local).join("shrinkr").join("work"));
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(cache) = std::env::var_os("XDG_CACHE_HOME") {
+            v.push(PathBuf::from(cache).join("shrinkr"));
+        } else if let Some(home) = std::env::var_os("HOME") {
+            v.push(PathBuf::from(home).join(".cache").join("shrinkr"));
+        }
+    }
+    v
+}
+
+/// First staging root this process can actually write to. A missing or
+/// locked `%TEMP%` must not sink a whole batch, and "cannot create â€¦" on
+/// its own reads like a Shrinkr bug â€” the error names every candidate and
+/// the usual cause.
+pub fn work_root() -> Result<PathBuf, String> {
+    let mut rejected = vec![];
+    for dir in work_candidates() {
+        if writable_dir(&dir) {
+            return Ok(dir);
+        }
+        rejected.push(dir);
+    }
+    let tried = rejected
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "no writable work folder â€” tried {tried}. Every encode would fail before it started. \
+         Two known causes: Shrinkr is running in a sandboxed/restricted session (an agent or IDE \
+         sandbox, a \"run as\" wrapper), or the exe itself carries a Low integrity label â€” \
+         `icacls shrinkr.exe` shows it, and a low-integrity process may only write to \
+         low-integrity folders. Fix: start shrinkr.exe normally from Explorer or a plain terminal; \
+         if the label is Low, reset the folder tree with \
+         `icacls <folder> /setintegritylevel (OI)(CI)M /T`."
+    ))
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_fallback(
@@ -522,17 +633,30 @@ pub fn run_with_fallback(
     caps: &HwCaps,
 ) -> Result<EncodeResult, String> {
     let levels = crate::pipeline::select_levels_for_media(backend, caps, media);
-    let mut plan = crate::pipeline::plan_streams(media, keep_subs, opus_bps, all_audio);
+    // In an audio-only pass the chosen bitrate is an instruction, not a
+    // ceiling: re-encode the audio even when the source is already smaller,
+    // otherwise "192k" silently produces untouched 64k audio.
+    let mut plan = crate::pipeline::plan_streams_with(
+        media,
+        keep_subs,
+        opus_bps,
+        all_audio,
+        crate::pipeline::forces_audio_reencode(backend, opus_bps),
+    );
     // Every level's error is kept: the final message shows the whole chain
     // (each attempt truncated), so "the last fallback failed" never hides
     // the earlier, usually more informative, failures.
     let mut chain: Vec<String> = vec![];
-    // Subtitle mapping failures (e.g. mov_text→MKV edge cases) would poison
-    // every level identically — retry once with subs dropped instead of
+    // Subtitle mapping failures (e.g. mov_textâ†’MKV edge cases) would poison
+    // every level identically â€” retry once with subs dropped instead of
     // burning N full encodes on the same fatal mapping error.
     let mut subs_retried = false;
     let mut audio_retried = false;
     for level in levels {
+        // Recreate the work folder per attempt (see [`ensure_output_dir`]):
+        // a temp wipe mid-batch otherwise fails every level with the same
+        // misleading "No such file or directory" on the output.
+        ensure_output_dir(out_path)?;
         let args = build_args(
             media, level, preset, cq, scale, keep_subs, out_path, &plan, extra_args,
         );
@@ -623,7 +747,7 @@ pub fn run_with_fallback(
                     continue;
                 }
                 // CPU-level or non-HW errors (e.g. bad subs map on a file
-                // with no subs — shouldn't happen thanks to `?`, mux
+                // with no subs â€” shouldn't happen thanks to `?`, mux
                 // failure, disk full): still try the next level once, then
                 // give up. The final fallback is CPU x264; if that fails
                 // the file is genuinely broken.
@@ -650,13 +774,13 @@ pub fn run_with_fallback(
         .map(|e| {
             const CAP: usize = 300;
             if e.len() > CAP {
-                format!("{}…", &e[..CAP])
+                format!("{}â€¦", &e[..CAP])
             } else {
                 e.clone()
             }
         })
         .collect::<Vec<_>>()
-        .join("  ⟶  ");
+        .join("  âŸ¶  ");
     Err(format!("all backends failed: {chain}"))
 }
 
@@ -712,7 +836,7 @@ fn is_subs_error(e: &str) -> bool {
 }
 
 /// Pick the message lines that explain a failure out of a stderr tail.
-/// Encoder stat dumps (`i16 v,h,dc…`, `kb/s:…`) always land last and say
+/// Encoder stat dumps (`i16 v,h,dcâ€¦`, `kb/s:â€¦`) always land last and say
 /// nothing, so the old "last 6 lines" window showed exactly the wrong
 /// lines. Instead: up to 3 lines matching error patterns (in order),
 /// then the final line for the exit summary. Capped for the log panel.
@@ -785,7 +909,7 @@ fn error_snippet(tail: &str, status: std::process::ExitStatus) -> String {
     const CAP: usize = 600;
     let s = parts.join(" | ");
     if s.len() > CAP {
-        format!("{}…", &s[..CAP])
+        format!("{}â€¦", &s[..CAP])
     } else {
         s
     }
@@ -889,7 +1013,7 @@ fn run_once(
     // and the codec verify below is the real validity check.
     if new_len < 32 * 1024 {
         return Err(format!(
-            "output too small ({} bytes) — likely failed encode",
+            "output too small ({} bytes) â€” likely failed encode",
             new_len
         ));
     }
@@ -905,12 +1029,41 @@ fn run_once(
     }
     // Verify duration: exit-0 truncations (killed mux, full disk with
     // buffered writes) otherwise pass as good files and eat originals.
-    // No trim is ever applied, so ≥5% shrinkage means a broken output.
+    // No trim is ever applied, so â‰¥5% shrinkage means a broken output â€”
+    // unless the SOURCE is the one that ends early. A container header keeps
+    // advertising the original duration after the tail was never written
+    // (interrupted download, crashed remux), and then every decoder and
+    // every encoder stops at the same place while the header still claims
+    // the full length. Blaming the encoder there failed all five backend
+    // levels ("output truncated 1154.9s vs 1296.8s") on a file whose real
+    // content ends at 1154.9s. Check the source's last real packet first.
     if media.duration_s > 5.0 && vf.duration_s > 0.0 && vf.duration_s < media.duration_s * 0.95 {
-        return Err(format!(
-            "output truncated ({:.1}s vs {:.1}s source) — likely failed encode",
-            vf.duration_s, media.duration_s
-        ));
+        let source_end = source_last_pts(&media.path, media.duration_s);
+        let source_is_short = source_end.is_some_and(|end| end <= vf.duration_s + 2.0);
+        if source_is_short {
+            log::debug_log(&format!(
+                "{}: output {:.1}s < header {:.1}s, but the source's last packet is at {:.1}s â€” \
+                 the source itself is short, keeping the encode",
+                media
+                    .path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?"),
+                vf.duration_s,
+                media.duration_s,
+                source_end.unwrap_or(0.0)
+            ));
+        } else {
+            return Err(format!(
+                "output truncated ({:.1}s vs {:.1}s source{}) â€” likely failed encode",
+                vf.duration_s,
+                media.duration_s,
+                match source_end {
+                    Some(end) => format!(", source's last packet at {end:.1}s"),
+                    None => String::new(),
+                }
+            ));
+        }
     }
 
     let avg_fps = media.total_frames() / elapsed;
@@ -920,7 +1073,7 @@ fn run_once(
     // FFmpeg may silently fall back to software decode inside a HW-level
     // attempt (exit 0 + "Failed setup for format cuda" on stderr, e.g. for
     // yuv444p inputs whose CUDA path the driver rejects). The output is
-    // still correct — NVENC uploads from RAM — but report it honestly so
+    // still correct â€” NVENC uploads from RAM â€” but report it honestly so
     // benchmark hwdec flags and logs don't claim a GPU path we didn't get.
     let hw_decode_actual = level.uses_hw_decode() && !stderr_shows_sw_fallback(&bench_tail);
     let quality = match level {
@@ -964,9 +1117,62 @@ fn plan_out_path(args: &[String]) -> PathBuf {
     PathBuf::from(args.last().cloned().unwrap_or_default())
 }
 
+/// Timestamp of the source's last video packet, read from the tail of the
+/// file (cheap: no full decode).
+///
+/// A container header can advertise more duration than the file actually
+/// holds â€” an interrupted download or crashed remux leaves the original
+/// `Duration` in place while the data simply stops. Every decoder then
+/// stops at the same timestamp, which the output-duration guard would
+/// misread as an encoder truncation. `None` when ffprobe can't answer, in
+/// which case callers keep the strict check.
+///
+/// `header_dur` only seeds the read window: a seek past the real end is
+/// clamped by the demuxer to the last cluster, so a lying header still
+/// yields the file's true last packet.
+fn source_last_pts(path: &Path, header_dur: f64) -> Option<f64> {
+    let start = (header_dur * 0.75).max(0.0);
+    let span = (header_dur - start).max(5.0);
+    let out = crate::process::cmd("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-read_intervals",
+            &format!("{start:.3}%+{span:.3}"),
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut max: Option<f64> = None;
+    for line in text.lines() {
+        let field = line.split(',').next().unwrap_or("").trim();
+        let Ok(ts) = field.parse::<f64>() else {
+            continue; // "N/A" or blank
+        };
+        max = Some(match max {
+            Some(m) if m >= ts => m,
+            _ => ts,
+        });
+    }
+    max
+}
+
 /// Move a file robustly: fast `rename` when source and destination share
 /// a volume, copy+delete fallback when they don't (e.g. system TEMP on C:
-/// vs media library on D: or a NAS — plain `rename` fails there).
+/// vs media library on D: or a NAS â€” plain `rename` fails there).
 fn move_file_robust(src: &Path, dst: &Path) -> Result<(), String> {
     match std::fs::rename(src, dst) {
         Ok(()) => Ok(()),
@@ -976,7 +1182,7 @@ fn move_file_robust(src: &Path, dst: &Path) -> Result<(), String> {
             // verified copy so a full disk can't eat the only good output.
             let copied = std::fs::copy(src, dst).map_err(|e| {
                 format!(
-                    "move {} → {} failed (rename: {rename_err}; copy: {e})",
+                    "move {} â†’ {} failed (rename: {rename_err}; copy: {e})",
                     src.display(),
                     dst.display()
                 )
@@ -985,14 +1191,14 @@ fn move_file_robust(src: &Path, dst: &Path) -> Result<(), String> {
             if dst_len != copied {
                 let _ = std::fs::remove_file(dst);
                 return Err(format!(
-                    "move {} → {} failed: copied {copied} bytes but dest has {dst_len}",
+                    "move {} â†’ {} failed: copied {copied} bytes but dest has {dst_len}",
                     src.display(),
                     dst.display()
                 ));
             }
             std::fs::remove_file(src).map_err(|e| {
                 format!(
-                    "move {} → {}: copied ok but cleanup of tmp failed: {e}",
+                    "move {} â†’ {}: copied ok but cleanup of tmp failed: {e}",
                     src.display(),
                     dst.display()
                 )
@@ -1003,7 +1209,7 @@ fn move_file_robust(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// Pick a destination that doesn't clobber an unrelated existing file:
-/// `<stem>.<ext>`, then `<stem>.shrunk.<ext>`, `<stem>.shrunk-1.<ext>`, …
+/// `<stem>.<ext>`, then `<stem>.shrunk.<ext>`, `<stem>.shrunk-1.<ext>`, â€¦
 /// The extension comes from `base` itself, so images and videos share
 /// the same collision ladder.
 fn unique_dest(base: &Path) -> PathBuf {
@@ -1011,10 +1217,7 @@ fn unique_dest(base: &Path) -> PathBuf {
         return base.to_path_buf();
     }
     let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
-    let ext = base
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("out");
+    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("out");
     let parent = base.parent();
     let candidate = |name: String| match parent {
         Some(p) if !p.as_os_str().is_empty() => p.join(name),
@@ -1042,16 +1245,16 @@ fn unique_dest(base: &Path) -> PathBuf {
 
 /// Move a verified temp output to its final home.
 /// * `replace=true`: delete-then-move next to the original (safe on full
-///   disks). Same-name (ext→ext) goes through a `.orig.bak` swap.
-/// * `replace=false`: keep both; never overwrites — collides resolve to
-///   `<stem>.shrunk.<ext>`, `<stem>.shrunk-1.<ext>`, …
+///   disks). Same-name (extâ†’ext) goes through a `.orig.bak` swap.
+/// * `replace=false`: keep both; never overwrites â€” collides resolve to
+///   `<stem>.shrunk.<ext>`, `<stem>.shrunk-1.<ext>`, â€¦
 ///
 /// `dest_ext` is the output extension without dot (`"mkv"` for video,
-/// `"jpg"` for images) — conversions (avi→mkv, png→jpg) land on the new
+/// `"jpg"` for images) â€” conversions (aviâ†’mkv, pngâ†’jpg) land on the new
 /// extension next to the original.
 ///
 /// Cross-volume moves (TEMP vs media drive) fall back to copy+delete.
-/// Returns `(bytes saved, final dest path)` — saved is 0 when keeping both.
+/// Returns `(bytes saved, final dest path)` â€” saved is 0 when keeping both.
 pub fn place_output(
     orig: &Path,
     tmp_out: &Path,
@@ -1128,7 +1331,7 @@ fn stderr_shows_sw_fallback(tail: &str) -> bool {
     .any(|k| l.contains(k))
 }
 
-// ── Tiny internal logger (file + memory ring not needed) ─────
+// â”€â”€ Tiny internal logger (file + memory ring not needed) â”€â”€â”€â”€â”€
 
 pub mod log {
     use std::sync::{Mutex, OnceLock};
@@ -1202,7 +1405,7 @@ mod tests {
     fn unique_dest_never_clobbers() {
         let d = tmp_dir("unique");
         let base = d.join("movie.mkv");
-        assert_eq!(unique_dest(&base), base); // missing → as-is
+        assert_eq!(unique_dest(&base), base); // missing â†’ as-is
         fs::write(&base, b"orig").unwrap();
         assert_eq!(unique_dest(&base), d.join("movie.shrunk.mkv"));
         fs::write(d.join("movie.shrunk.mkv"), b"s1").unwrap();
@@ -1229,6 +1432,69 @@ mod tests {
     }
 
     #[test]
+    fn ensure_output_dir_recreates_a_wiped_work_folder() {
+        // Regression: a temp-cleanup tool can remove the batch folder while
+        // it runs. Recreating it per attempt turns "all backends failed:
+        // Error opening output â€¦: No such file or directory" (every ffmpeg
+        // level failing on the same missing folder) into a self-heal.
+        let d = tmp_dir("mkdir");
+        let work = d.join("shrinkr");
+        let out = work.join("episode-7.mkv");
+        fs::remove_dir_all(&work).ok();
+        ensure_output_dir(&out).unwrap();
+        assert!(work.is_dir(), "work folder must be recreated");
+        // Idempotent: an existing folder is not an error.
+        ensure_output_dir(&out).unwrap();
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn ensure_output_dir_reports_a_file_blocking_the_path() {
+        // Something owning the folder name must surface as a clear error,
+        // not as a misleading ffmpeg output failure later.
+        let d = tmp_dir("mkdir-blocked");
+        let blocker = d.join("shrinkr");
+        fs::write(&blocker, b"not a folder").unwrap();
+        let err = ensure_output_dir(&blocker.join("out.mkv")).unwrap_err();
+        assert!(err.contains("cannot create output folder"), "{err}");
+        assert!(err.contains("shrinkr"), "{err}");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn ensure_output_dir_accepts_a_bare_filename() {
+        // A bare output name is resolved against the CWD; there is no
+        // folder to create, so this must stay a no-op.
+        assert!(ensure_output_dir(Path::new("out.mkv")).is_ok());
+    }
+
+    #[test]
+    fn ensure_output_dir_cleans_up_its_write_probe() {
+        // The writability probe must not leave turds in the media folder
+        // or the work folder.
+        let d = tmp_dir("probe-clean");
+        ensure_output_dir(&d.join("out.mkv")).unwrap();
+        let leftovers: Vec<String> = fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".shrinkr-write"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray probes: {leftovers:?}");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn work_root_is_always_writable() {
+        // Whichever candidate wins (temp, app data), it must pass the same
+        // probe the encoders rely on.
+        match work_root() {
+            Ok(root) => assert!(writable_dir(&root), "{} not writable", root.display()),
+            Err(e) => panic!("no workable staging root in this environment: {e}"),
+        }
+    }
+
+    #[test]
     fn replace_same_name_swaps_atomically() {
         let d = tmp_dir("replace");
         let orig = d.join("movie.mkv");
@@ -1245,7 +1511,7 @@ mod tests {
 
     #[test]
     fn replace_new_extension_deletes_original_after_move() {
-        // The AVI case: movie.avi → movie.mkv, original must be gone and
+        // The AVI case: movie.avi â†’ movie.mkv, original must be gone and
         // the content must be the new encode.
         let d = tmp_dir("replace-ext");
         let orig = d.join("movie.avi");
@@ -1282,7 +1548,7 @@ mod tests {
 
     #[test]
     fn image_places_land_on_the_image_extension() {
-        // png → jpeg flows through the same placer: keep-both writes
+        // png â†’ jpeg flows through the same placer: keep-both writes
         // photo.jpg next to photo.png; replace deletes the png only after
         // the jpg is in place.
         let d = tmp_dir("image-place");
@@ -1306,7 +1572,7 @@ mod tests {
 
     #[test]
     fn image_replace_same_ext_swaps_in_place() {
-        // jpg → jpg replace keeps the same name via the bak swap.
+        // jpg â†’ jpg replace keeps the same name via the bak swap.
         let d = tmp_dir("image-replace");
         let orig = d.join("photo.jpg");
         let tmp = d.join("tmp-out.jpg");
@@ -1355,6 +1621,7 @@ mod tests {
             opus_bps: Some(crate::pipeline::DEFAULT_OPUS_BPS),
             all_audio: false,
             force_aac: false,
+            force_audio: false,
             audio_layout_note: "",
         };
         build_args(
@@ -1427,7 +1694,7 @@ mod tests {
     fn extra_args_reject_structural_flags() {
         assert!(parse_extra_args("").unwrap().is_empty());
         assert!(parse_extra_args("-tune grain -maxrate 8M -x265-params keyint=250").is_ok());
-        // Overrides of quality knobs are the point — allowed.
+        // Overrides of quality knobs are the point â€” allowed.
         assert!(parse_extra_args("-crf 32 -preset slow").is_ok());
         for bad in [
             "-i in.mkv",
@@ -1458,6 +1725,7 @@ mod tests {
             opus_bps: Some(crate::pipeline::DEFAULT_OPUS_BPS),
             all_audio: false,
             force_aac: false,
+            force_audio: false,
             audio_layout_note: "",
         };
         let extra = parse_extra_args("-tune grain -maxrate 8M").unwrap();
@@ -1560,6 +1828,72 @@ Conversion failed!\n";
     }
 
     #[test]
+    fn max_opus_target_emits_512k() {
+        let mut m = test_media();
+        m.audio = vec![crate::media::AudioTrack {
+            codec: "dts".into(),
+            bitrate: Some(768_000),
+            channels: 6,
+            layout: "5.1".into(),
+            sample_rate: Some(48000),
+        }];
+        m.acodec = "dts".into();
+        let plan =
+            crate::pipeline::plan_streams(&m, true, Some(crate::pipeline::MAX_OPUS_BPS), false);
+        assert_eq!(
+            plan.audio_codec,
+            crate::pipeline::AudioCodec::Opus(crate::pipeline::MAX_OPUS_BPS)
+        );
+        let args = build_args(
+            &m,
+            Level::CpuX264,
+            NvencPreset::P5,
+            28,
+            crate::pipeline::ScalePolicy::Preserve,
+            true,
+            Path::new("out.mkv"),
+            &plan,
+            &[],
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("-c:a libopus -b:a 512k"), "{joined}");
+        assert_eq!(crate::pipeline::audio_mode_label(&m, &plan), "opus512k");
+    }
+
+    #[test]
+    fn mono_opus_target_is_clamped_to_256k() {
+        let mut m = test_media();
+        m.audio = vec![crate::media::AudioTrack {
+            codec: "pcm_s16le".into(),
+            bitrate: Some(768_000),
+            channels: 1,
+            layout: "mono".into(),
+            sample_rate: Some(48000),
+        }];
+        m.acodec = "pcm_s16le".into();
+        let plan =
+            crate::pipeline::plan_streams(&m, true, Some(crate::pipeline::MAX_OPUS_BPS), false);
+        assert_eq!(
+            plan.audio_codec,
+            crate::pipeline::AudioCodec::Opus(crate::pipeline::OPUS_BPS_PER_CHANNEL)
+        );
+        let args = build_args(
+            &m,
+            Level::CpuX264,
+            NvencPreset::P5,
+            28,
+            crate::pipeline::ScalePolicy::Preserve,
+            true,
+            Path::new("out.mkv"),
+            &plan,
+            &[],
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("-c:a libopus -b:a 256k"), "{joined}");
+        assert_eq!(crate::pipeline::audio_mode_label(&m, &plan), "opus256k");
+    }
+
+    #[test]
     fn opus_layout_error_detector() {
         assert!(is_opus_layout_error(
             "ffmpeg (hevc_nvenc) failed: [libopus @ 000002084f9de580] Invalid channel layout 5.1(side) for specified mapping family -1."
@@ -1581,6 +1915,7 @@ Conversion failed!\n";
             opus_bps: Some(crate::pipeline::DEFAULT_OPUS_BPS),
             all_audio: false,
             force_aac: false,
+            force_audio: false,
             audio_layout_note: "",
         };
         let args = build_args(
@@ -1632,6 +1967,7 @@ Conversion failed!\n";
             opus_bps: Some(crate::pipeline::DEFAULT_OPUS_BPS),
             all_audio: false,
             force_aac: false,
+            force_audio: false,
             audio_layout_note: "",
         };
         let args = build_args(

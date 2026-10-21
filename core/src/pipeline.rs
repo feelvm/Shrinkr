@@ -285,10 +285,52 @@ pub fn select_levels_for_media(mode: VideoBackend, caps: &HwCaps, media: &MediaF
 
 // ── Preflight (intelligent early exit) ───────────────────────
 
+/// What preflight does when an estimate lands below `min_saving_pct`.
+///
+/// The GUI exposes this as the "Skip already-efficient files" checkbox:
+/// checked means below-threshold files are skipped; unchecked means they
+/// are still queued, but flagged as warnings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThresholdPolicy {
+    /// Skip estimates below the threshold (classic preflight).
+    Skip,
+    /// Queue below-threshold estimates anyway; the plan warns instead.
+    Warn,
+}
+
 #[derive(Clone, Debug)]
 pub enum Preflight {
-    Shrink { reason: String },
-    Skip { reason: String },
+    Shrink {
+        reason: String,
+    },
+    /// Eligible, but the estimate falls short of the configured threshold.
+    /// Only produced under [`ThresholdPolicy::Warn`].
+    Warn {
+        reason: String,
+    },
+    Skip {
+        reason: String,
+    },
+}
+
+impl Preflight {
+    /// True when the file is part of the run (shrink normally or warned).
+    pub fn will_shrink(&self) -> bool {
+        !matches!(self, Preflight::Skip { .. })
+    }
+
+    /// True when the file runs despite a below-threshold estimate.
+    pub fn is_warn(&self) -> bool {
+        matches!(self, Preflight::Warn { .. })
+    }
+
+    pub fn reason(&self) -> &str {
+        match self {
+            Preflight::Shrink { reason }
+            | Preflight::Warn { reason }
+            | Preflight::Skip { reason } => reason,
+        }
+    }
 }
 
 /// Expected output/input byte ratio for the NVENC HEVC CQ28 path.
@@ -354,10 +396,68 @@ pub struct EstParams {
 /// Default Opus target: transparent-ish stereo, lean 5.1.
 pub const DEFAULT_OPUS_BPS: u32 = 64_000;
 
+/// Highest fixed target the UI/CLI exposes. libopus allows 256 kbps per
+/// channel, so this is the ceiling for stereo (the common case); mono is
+/// clamped down by [`opus_bps_for_track`]. Going higher would be a no-op
+/// on stereo and make the preset labels lie about the real bitrate.
+pub const MAX_OPUS_BPS: u32 = 512_000;
+
+/// libopus's per-channel bitrate ceiling (FFmpeg enforces 256k/channel).
+pub const OPUS_BPS_PER_CHANNEL: u32 = 256_000;
+
+/// Opus targets offered by the GUI, in kbps (the CLI accepts any 8–512).
+/// The top presets are for fat lossless/DTS sources; stereo is already
+/// transparent well below them, so the extra headroom mainly helps
+/// multichannel tracks and avoids needless generational loss.
+pub const OPUS_TARGETS_KBPS: [u32; 11] = [32, 48, 64, 96, 128, 192, 256, 320, 384, 448, 512];
+
+/// Effective Opus bitrate for one track: the chosen target capped at
+/// libopus's per-channel limit. A mono track cannot take the stereo-max
+/// 512k preset — FFmpeg rejects an over-cap `-b:a` outright.
+pub fn opus_bps_for_track(t: &crate::media::AudioTrack, target: u32) -> u32 {
+    if t.channels == 0 {
+        // Unknown channel count: trust the target rather than assuming
+        // mono and needlessly halving it.
+        return target;
+    }
+    target.min(u32::from(t.channels).saturating_mul(OPUS_BPS_PER_CHANNEL))
+}
+
 /// AAC fallback bitrate for a given Opus target: AAC needs roughly twice
 /// the bits for similar quality (floored/ceilinged to sane bounds).
 pub fn aac_bps_for(opus_bps: u32) -> u32 {
     (opus_bps * 2).clamp(96_000, 320_000)
+}
+
+/// True for an audio-only pass with a bitrate target: video is copied and
+/// the audio is re-encoded at the chosen bitrate even when the source is
+/// already at/below it. In every other mode a "copy" decision is the
+/// smarter default; here the target is an instruction, not a ceiling.
+pub fn forces_audio_reencode(backend: VideoBackend, opus_bps: Option<u32>) -> bool {
+    backend == VideoBackend::CopyVideo && opus_bps.is_some()
+}
+
+/// Human label for an estimated size change: direction, byte delta and
+/// percentage in one phrase. Growing estimates read `250 MB larger (+25%)`
+/// instead of a confusing negative "saving"; shrinking ones read
+/// `250 MB smaller (−25%)`.
+pub fn size_change_label(input_bytes: u64, output_bytes: u64) -> String {
+    if output_bytes == input_bytes {
+        return "no size change".to_string();
+    }
+    let delta = output_bytes.abs_diff(input_bytes);
+    let pct = delta as f64 / input_bytes.max(1) as f64 * 100.0;
+    // Don't round a real change down to the misleading "0%".
+    let pct = if pct < 0.5 {
+        "<1%".to_string()
+    } else {
+        format!("{pct:.0}%")
+    };
+    if output_bytes > input_bytes {
+        format!("{} larger (+{pct})", crate::media::human_bytes(delta))
+    } else {
+        format!("{} smaller (−{pct})", crate::media::human_bytes(delta))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -444,7 +544,13 @@ pub fn estimate_file(m: &MediaFile, p: &EstParams) -> FileEstimate {
     let sf = scale_factor(m, p.scale);
     let video_factor = base * cf * pf * sf;
     let scaled_to = effective_scale_target(m, p.scale);
-    let plan = plan_streams(m, true, p.opus_bps, p.all_audio);
+    let plan = plan_streams_with(
+        m,
+        true,
+        p.opus_bps,
+        p.all_audio,
+        forces_audio_reencode(p.backend, p.opus_bps),
+    );
     let dur = m.duration_s;
     let (audio_mode, new_audio_bytes): (String, u64) = if !plan.has_audio || dur <= 0.0 {
         ("none".into(), 0)
@@ -455,31 +561,34 @@ pub fn estimate_file(m: &MediaFile, p: &EstParams) -> FileEstimate {
             items.iter().map(|&(_, b)| b).sum(),
         )
     };
+    // Source bytes held by audio. `audio_src_bytes` guesses when ffprobe
+    // reports no stream rate, which is the norm in MKV — including every
+    // file Shrinkr itself wrote.
+    let audio_src_total: u64 = if dur > 0.0 {
+        m.audio.iter().map(|t| audio_src_bytes(t, dur)).sum()
+    } else {
+        0
+    };
     let new_bytes = if p.backend == VideoBackend::CopyVideo {
         // Video passes through byte-identical: source video bytes plus the
         // planned audio. Source video = stream rate when known, else total
         // minus ALL source audio (kept or dropped — dropped tracks vanish
         // from the output too).
-        let audio_src_total: u64 = m
-            .audio
-            .iter()
-            .map(|t| {
-                if dur > 0.0 {
-                    audio_src_bytes(t, dur)
-                } else {
-                    0
-                }
-            })
-            .sum();
         let vbytes = match m.vbitrate {
             Some(vbr) if dur > 0.0 => (vbr as f64 * dur / 8.0) as u64,
             _ => m.bytes.saturating_sub(audio_src_total),
         };
         vbytes.saturating_add(new_audio_bytes)
     } else if dur > 0.0 {
+        // Video is the source minus its own audio — not a flat 90% of the
+        // file — because the audio term is added back below. A flat share
+        // double-counted audio, so any file whose video stream rate
+        // ffprobe omits (i.e. every file Shrinkr wrote) estimated a bigger
+        // output than its own source and warned "re-encoding would grow
+        // it" no matter what the audio target was.
         let vbytes = match m.vbitrate {
             Some(vbr) => vbr as f64 * dur / 8.0,
-            None => m.bytes as f64 * 0.9, // ≈90% video when stream rate unknown
+            None => m.bytes.saturating_sub(audio_src_total) as f64,
         };
         (vbytes * video_factor + new_audio_bytes as f64) as u64
     } else {
@@ -567,12 +676,60 @@ fn source_density(m: &MediaFile) -> f64 {
 /// * `min_saving_pct` is the configurable threshold (e.g. 10 → skip when
 ///   the estimated saving is below 10%).
 pub fn preflight(m: &MediaFile, p: &EstParams, min_saving_pct: f64) -> Preflight {
+    preflight_with(m, p, min_saving_pct, ThresholdPolicy::Skip)
+}
+
+/// Turn a below-threshold verdict into a skip or a warning. The warning
+/// appends what actually happened so the plan row explains itself.
+pub(crate) fn below_threshold(reason: String, policy: ThresholdPolicy) -> Preflight {
+    match policy {
+        ThresholdPolicy::Skip => Preflight::Skip { reason },
+        ThresholdPolicy::Warn => Preflight::Warn {
+            // The placement guard drops any output that isn't actually
+            // smaller, so say that up front: a growth estimate still runs,
+            // its result is just discarded unless the encode beats the
+            // source.
+            reason: format!("{reason} — warned, running anyway (kept only if it shrinks)"),
+        },
+    }
+}
+
+/// [`preflight`] with an explicit below-threshold policy: [`ThresholdPolicy::Warn`]
+/// keeps low-gain files in the run with a warning instead of skipping them.
+pub fn preflight_with(
+    m: &MediaFile,
+    p: &EstParams,
+    min_saving_pct: f64,
+    policy: ThresholdPolicy,
+) -> Preflight {
     use crate::media::human_bytes;
     // Corrupt / undecodable inputs are rejected by probe already; a missing
     // video stream here means skip, not crash.
     if m.vcodec == "unknown" || m.width == 0 {
         return Preflight::Skip {
             reason: "no video stream found".into(),
+        };
+    }
+    // Audio-only pass: video is copied byte-for-byte and the audio is
+    // re-encoded at the chosen bitrate, so the file may legitimately grow.
+    // Size thresholds describe shrinking, which is not what was asked for —
+    // skipping here would silently ignore "re-encode the audio to 192k".
+    if forces_audio_reencode(p.backend, p.opus_bps) {
+        let est = estimate_file(m, p);
+        let plan = plan_streams_with(m, true, p.opus_bps, p.all_audio, true);
+        if !plan.has_audio {
+            return Preflight::Skip {
+                reason: "audio-only pass, but this file has no audio track".into(),
+            };
+        }
+        return Preflight::Shrink {
+            reason: format!(
+                "audio-only: video copied, audio {} (est. {} → {}, {})",
+                audio_mode_label(m, &plan),
+                human_bytes(m.bytes),
+                human_bytes(est.new_bytes),
+                size_change_label(m.bytes, est.new_bytes),
+            ),
         };
     }
     // Already-efficient fast path: only proceed when the bitrate suggests
@@ -588,22 +745,30 @@ pub fn preflight(m: &MediaFile, p: &EstParams, min_saving_pct: f64) -> Preflight
             // huge (e.g. remuxed Blu-ray HEVC at high bitrate).
             let est = estimate_file(m, p);
             let saving = (1.0 - est.ratio) * 100.0;
-            if saving < min_saving_pct {
-                return Preflight::Skip {
-                    reason: format!(
-                        "already {}{} — negligible gain expected (est. {} → {}, {:.0}%)",
+            if est.new_bytes >= m.bytes || saving < min_saving_pct {
+                let outcome = if est.new_bytes > m.bytes {
+                    "re-encoding would grow it"
+                } else {
+                    "negligible gain expected"
+                };
+                return below_threshold(
+                    format!(
+                        "already {}{} — {} (est. {} → {}, {})",
                         m.vcodec,
                         bitrate_suffix(m),
+                        outcome,
                         human_bytes(m.bytes),
                         human_bytes(est.new_bytes),
-                        saving,
+                        size_change_label(m.bytes, est.new_bytes),
                     ),
-                };
+                    policy,
+                );
             }
         }
     }
     let est = estimate_file(m, p);
     let saving = (1.0 - est.ratio) * 100.0;
+    let change = size_change_label(m.bytes, est.new_bytes);
     // Copy-video keeps resolution no matter the policy — say so instead of
     // implying a resize that will never happen.
     let res_note = if p.backend == VideoBackend::CopyVideo && p.scale != ScalePolicy::Preserve {
@@ -622,25 +787,31 @@ pub fn preflight(m: &MediaFile, p: &EstParams, min_saving_pct: f64) -> Preflight
     } else {
         ""
     };
-    if saving < min_saving_pct {
-        Preflight::Skip {
-            reason: format!(
-                "est. {} → {} ({:.0}% < {:.0}% threshold; {} {}, {}, audio {}{})",
+    if est.new_bytes >= m.bytes || saving < min_saving_pct {
+        // Wording follows the direction: a growing estimate is a growth,
+        // not a negative saving, and it says why it fell below the bar.
+        let shortfall = if est.new_bytes >= m.bytes {
+            format!("below {:.0}% saving threshold", min_saving_pct)
+        } else {
+            format!("{:.0}% < {:.0}% threshold", saving, min_saving_pct)
+        };
+        below_threshold(
+            format!(
+                "est. {} → {} ({change}; {shortfall}; {} {}, {}, audio {}{})",
                 human_bytes(m.bytes),
                 human_bytes(est.new_bytes),
-                saving,
-                min_saving_pct,
                 m.vcodec,
                 res_note,
                 quality_label(p),
                 est.audio_mode,
                 dense_note
             ),
-        }
+            policy,
+        )
     } else {
         Preflight::Shrink {
             reason: format!(
-                "est. {} → {} ({:.0}% off; {} {}, {}, audio {}{})",
+                "est. {} → {} ({change}; {:.0}% off; {} {}, {}, audio {}{})",
                 human_bytes(m.bytes),
                 human_bytes(est.new_bytes),
                 saving,
@@ -660,16 +831,28 @@ pub fn preflight(m: &MediaFile, p: &EstParams, min_saving_pct: f64) -> Preflight
 /// pipeline above. The GUI/CLI layers call this instead of [`preflight`]
 /// so mixed video+image batches plan correctly.
 pub fn preflight_auto(m: &MediaFile, p: &EstParams, min_saving_pct: f64) -> Preflight {
+    preflight_auto_with(m, p, min_saving_pct, ThresholdPolicy::Skip)
+}
+
+/// [`preflight_auto`] with an explicit below-threshold policy, so still
+/// images and videos agree on whether low-gain files warn or skip.
+pub fn preflight_auto_with(
+    m: &MediaFile,
+    p: &EstParams,
+    min_saving_pct: f64,
+    policy: ThresholdPolicy,
+) -> Preflight {
     if crate::images::is_shrinkable_image(&m.path) {
-        crate::images::preflight_image(
+        crate::images::preflight_image_with(
             m,
             p.image_cq,
             p.image_scale,
             p.image_preserve_format,
             min_saving_pct,
+            policy,
         )
     } else {
-        preflight(m, p, min_saving_pct)
+        preflight_with(m, p, min_saving_pct, policy)
     }
 }
 
@@ -841,6 +1024,12 @@ pub struct StreamPlan {
     pub all_audio: bool,
     /// Set by the AAC retry: every re-encoded track goes AAC from here.
     pub force_aac: bool,
+    /// Audio-only pass: re-encode at the chosen target even when the source
+    /// is already at/below it. Copying would be the "smart" default, but in
+    /// a copy-video run the user explicitly asked for that bitrate —
+    /// copying silently ignores the setting (and produced "192k" files whose
+    /// audio was untouched 64k).
+    pub force_audio: bool,
     /// Set when the plan had to dodge an Opus-hostile layout; surfaced in
     /// logs so "audio aac128k" never surprises.
     pub audio_layout_note: &'static str,
@@ -851,18 +1040,19 @@ pub fn audio_track_codec(
     t: &crate::media::AudioTrack,
     opus_bps: Option<u32>,
     force_aac: bool,
+    force_audio: bool,
 ) -> AudioCodec {
     // Off (None) keeps everything as-is however big.
     let Some(target) = opus_bps else {
         return AudioCodec::Copy;
     };
-    if audio_copy_eligible_for_track(t, target) {
+    if !force_audio && audio_copy_eligible_for_track(t, target) {
         return AudioCodec::Copy;
     }
     if force_aac || !opus_layout_ok(t) {
         return AudioCodec::Aac(aac_bps_for(target));
     }
-    AudioCodec::Opus(target)
+    AudioCodec::Opus(opus_bps_for_track(t, target))
 }
 
 pub fn plan_streams(
@@ -870,6 +1060,18 @@ pub fn plan_streams(
     keep_subs: bool,
     opus_bps: Option<u32>,
     all_audio: bool,
+) -> StreamPlan {
+    plan_streams_with(m, keep_subs, opus_bps, all_audio, false)
+}
+
+/// [`plan_streams`] with the audio policy spelled out: `force_audio` makes
+/// the target an order rather than a ceiling.
+pub fn plan_streams_with(
+    m: &MediaFile,
+    keep_subs: bool,
+    opus_bps: Option<u32>,
+    all_audio: bool,
+    force_audio: bool,
 ) -> StreamPlan {
     let has_audio = !m.audio.is_empty() && m.acodec != "none";
     // Off (None) keeps every audio track as-is: always copy, no bitrate
@@ -885,15 +1087,17 @@ pub fn plan_streams(
             opus_bps,
             all_audio,
             force_aac: false,
+            force_audio: false,
             audio_layout_note: "",
         };
     }
     let primary = m.primary_audio();
-    let eligible = primary
-        .map(|a| audio_copy_eligible_for_track(a, opus_bps.unwrap_or(DEFAULT_OPUS_BPS)))
-        .unwrap_or(false);
+    let eligible = !force_audio
+        && primary
+            .map(|a| audio_copy_eligible_for_track(a, opus_bps.unwrap_or(DEFAULT_OPUS_BPS)))
+            .unwrap_or(false);
     let codec = primary
-        .map(|a| audio_track_codec(a, opus_bps, false))
+        .map(|a| audio_track_codec(a, opus_bps, false, force_audio))
         .unwrap_or(AudioCodec::Copy);
     let mut note = "";
     if !eligible {
@@ -911,6 +1115,7 @@ pub fn plan_streams(
         opus_bps,
         all_audio,
         force_aac: false,
+        force_audio,
         audio_layout_note: note,
     }
 }
@@ -961,7 +1166,7 @@ pub fn planned_audio(m: &MediaFile, plan: &StreamPlan, dur: f64) -> Vec<(AudioCo
     selected_audio_tracks(m, plan)
         .into_iter()
         .map(|t| {
-            let c = audio_track_codec(t, plan.opus_bps, plan.force_aac);
+            let c = audio_track_codec(t, plan.opus_bps, plan.force_aac, plan.force_audio);
             let b = match c {
                 AudioCodec::Copy => audio_src_bytes(t, dur),
                 AudioCodec::Opus(b) | AudioCodec::Aac(b) => (b as f64 * dur / 8.0) as u64,
@@ -979,7 +1184,7 @@ pub fn audio_mode_label(m: &MediaFile, plan: &StreamPlan) -> String {
     }
     let mut modes: Vec<String> = vec![];
     for t in selected_audio_tracks(m, plan) {
-        let l = audio_track_codec(t, plan.opus_bps, plan.force_aac).label();
+        let l = audio_track_codec(t, plan.opus_bps, plan.force_aac, plan.force_audio).label();
         if !modes.iter().any(|x| x == &l) {
             modes.push(l);
         }
@@ -1188,22 +1393,28 @@ mod tests {
             select_levels(VideoBackend::CopyVideo, &caps_with(&[])),
             vec![Level::CopyVideo]
         );
-        // Below a 10% threshold it skips — but says copy video, and the
-        // AV1/HEVC early-skip must not hijack efficient codecs here.
+        // An audio-only pass with a bitrate target is always queued: the
+        // size thresholds describe shrinking, but the user asked for the
+        // audio work, not for a smaller file.
         match preflight(&m, &p, 10.0) {
-            Preflight::Skip { reason } => {
-                assert!(reason.contains("copy video"), "reason: {reason}")
+            Preflight::Shrink { reason } => {
+                assert!(reason.contains("audio-only"), "reason: {reason}");
+                assert!(reason.contains("opus64k"), "reason: {reason}");
             }
-            Preflight::Shrink { reason } => panic!("6% should skip at 10%: {reason}"),
+            Preflight::Skip { reason } | Preflight::Warn { reason } => {
+                panic!("audio-only pass must not skip: {reason}")
+            }
         }
         let mut av1 = m.clone();
         av1.vcodec = "av1".into();
         match preflight(&av1, &p, 10.0) {
-            Preflight::Skip { reason } => assert!(
+            Preflight::Shrink { reason } => assert!(
                 !reason.contains("negligible gain expected"),
                 "copy mode must not codec-gate: {reason}"
             ),
-            Preflight::Shrink { reason } => panic!("6% should skip at 10%: {reason}"),
+            Preflight::Skip { reason } | Preflight::Warn { reason } => {
+                panic!("audio-only pass must not skip: {reason}")
+            }
         }
     }
 
@@ -1316,10 +1527,7 @@ mod tests {
             Some((500, 500))
         );
         // Degenerate boxes are sanitized to something encodable.
-        assert_eq!(
-            scale_target(&land, ScalePolicy::Custom(0, 0)),
-            Some((2, 2))
-        );
+        assert_eq!(scale_target(&land, ScalePolicy::Custom(0, 0)), Some((2, 2)));
     }
 
     #[test]
@@ -1410,6 +1618,106 @@ mod tests {
     }
 
     #[test]
+    fn high_opus_targets_reach_the_codec_ceiling() {
+        // A fixed target above 512k would fail for stereo (libopus allows
+        // only 256k/ch), so the shared preset list stops at MAX_OPUS_BPS.
+        assert_eq!(MAX_OPUS_BPS, OPUS_BPS_PER_CHANNEL * 2);
+        assert_eq!(MAX_OPUS_BPS, *OPUS_TARGETS_KBPS.last().unwrap() * 1000);
+        assert!(OPUS_TARGETS_KBPS.windows(2).all(|w| w[0] < w[1]));
+
+        // A fat 5.1 DTS track is the case the top presets exist for.
+        let mut m = file("h264", 1920, 1080, 1_000_000_000, Some(12_000_000));
+        m.audio[0].codec = "dts".into();
+        m.audio[0].bitrate = Some(768_000);
+        m.audio[0].channels = 6;
+        m.audio[0].layout = "5.1".into();
+        let plan = plan_streams(&m, true, Some(MAX_OPUS_BPS), false);
+        assert_eq!(plan.audio_codec, AudioCodec::Opus(512_000));
+
+        let mut e = params();
+        e.opus_bps = Some(MAX_OPUS_BPS);
+        let est = estimate_file(&m, &e);
+        assert_eq!(est.audio_mode, "opus512k");
+        // 600 s × 64 kB/s.
+        assert_eq!(est.new_audio_bytes, 38_400_000);
+
+        // The same 512k preset on mono is clamped to libopus's 256k
+        // per-channel ceiling instead of failing the encode.
+        let mut mono = m.clone();
+        mono.audio[0].channels = 1;
+        mono.audio[0].layout = "mono".into();
+        assert_eq!(
+            plan_streams(&mono, true, Some(MAX_OPUS_BPS), false).audio_codec,
+            AudioCodec::Opus(OPUS_BPS_PER_CHANNEL)
+        );
+        assert_eq!(estimate_file(&mono, &e).audio_mode, "opus256k");
+
+        // A 448k lossy source is already below the ceiling: copy, since
+        // transcoding upward cannot add quality.
+        m.audio[0].bitrate = Some(448_000);
+        assert_eq!(
+            plan_streams(&m, true, Some(MAX_OPUS_BPS), false).audio_codec,
+            AudioCodec::Copy
+        );
+    }
+
+    #[test]
+    fn audio_only_pass_honours_the_chosen_bitrate() {
+        // An already-Shrinkr library: HEVC + Opus 5.1 with no reported
+        // audio bitrate. A normal shrink copies that audio (it may already
+        // be at/below the target), but an audio-only pass with an explicit
+        // bitrate is an instruction — copying there is what made "192k"
+        // silently produce untouched 64k tracks.
+        let mut m = file("hevc", 1280, 720, 123_253_623, None);
+        m.format_bitrate = Some(743_406);
+        m.duration_s = 1326.365;
+        m.audio[0] = AudioTrack {
+            codec: "opus".into(),
+            bitrate: None,
+            channels: 6,
+            layout: "5.1".into(),
+            sample_rate: Some(48_000),
+        };
+        m.acodec = "opus".into();
+        let mut p = params();
+        p.opus_bps = Some(192_000);
+
+        // Shrink mode: still copies (re-encoding upward cannot add quality).
+        assert_eq!(
+            plan_streams(&m, true, p.opus_bps, false).audio_codec,
+            AudioCodec::Copy
+        );
+        assert!(!forces_audio_reencode(VideoBackend::Auto, p.opus_bps));
+
+        // Audio-only mode: encodes the requested rate.
+        p.backend = VideoBackend::CopyVideo;
+        assert!(forces_audio_reencode(p.backend, p.opus_bps));
+        let plan = plan_streams_with(&m, true, p.opus_bps, false, true);
+        assert_eq!(plan.audio_codec, AudioCodec::Opus(192_000));
+        assert_eq!(audio_mode_label(&m, &plan), "opus192k");
+
+        // The estimate prices the re-encoded audio, not a copy.
+        let est = estimate_file(&m, &p);
+        assert_eq!(est.new_audio_bytes, (192_000.0 * m.duration_s / 8.0) as u64);
+        assert_eq!(est.audio_mode, "opus192k");
+
+        // And preflight queues it: size thresholds describe shrinking, and
+        // this pass may legitimately grow the file.
+        match preflight_with(&m, &p, 10.0, ThresholdPolicy::Skip) {
+            Preflight::Shrink { reason } => {
+                assert!(reason.contains("audio-only"), "{reason}");
+                assert!(reason.contains("opus192k"), "{reason}");
+            }
+            Preflight::Skip { reason } => panic!("audio-only must not skip: {reason}"),
+            Preflight::Warn { reason } => panic!("audio-only is not a warning: {reason}"),
+        }
+        // Off means nothing to do: still a plain copy.
+        let mut off = p;
+        off.opus_bps = None;
+        assert!(!forces_audio_reencode(off.backend, off.opus_bps));
+    }
+
+    #[test]
     fn audio_off_copies_everything() {
         // Regression: Off used to fall through to Opus(64k) for
         // unknown-bitrate non-Opus tracks (the common MKV case).
@@ -1473,7 +1781,9 @@ mod tests {
                 assert!(reason.contains("1280x720"), "reason: {reason}");
                 assert!(reason.contains("cq32"), "reason: {reason}");
             }
-            Preflight::Skip { reason } => panic!("should shrink: {reason}"),
+            Preflight::Skip { reason } | Preflight::Warn { reason } => {
+                panic!("should shrink: {reason}")
+            }
         }
     }
 
@@ -1492,12 +1802,166 @@ mod tests {
                 reason.contains("54%") || reason.contains("53%") || reason.contains("off"),
                 "reason: {reason}"
             ),
-            Preflight::Skip { reason } => panic!("should shrink: {reason}"),
+            Preflight::Skip { reason } | Preflight::Warn { reason } => {
+                panic!("should shrink: {reason}")
+            }
         }
         // Same file at defaults (NVENC, preserve): genuinely negligible.
         match preflight(&m, &params(), 10.0) {
             Preflight::Skip { .. } => {}
-            Preflight::Shrink { reason } => panic!("should skip: {reason}"),
+            Preflight::Shrink { reason } | Preflight::Warn { reason } => {
+                panic!("should skip: {reason}")
+            }
+        }
+        // Unchecking "skip already-efficient" turns that verdict into a
+        // warning: the file stays in the run instead of being skipped.
+        match preflight_with(&m, &params(), 10.0, ThresholdPolicy::Warn) {
+            Preflight::Warn { reason } => {
+                assert!(reason.contains("negligible gain"), "reason: {reason}");
+                assert!(reason.contains("warned"), "reason: {reason}");
+            }
+            Preflight::Shrink { reason } => panic!("6% should warn at 10%: {reason}"),
+            Preflight::Skip { reason } => panic!("warn mode must not skip: {reason}"),
+        }
+    }
+
+    #[test]
+    fn warn_mode_keeps_low_gain_files_in_the_run() {
+        // A saving between 1% and the 10% threshold: a lean-ish HEVC file
+        // (bytes match the bitrate × duration, as on disk).
+        let m = file("hevc", 1920, 1080, 300_000_000, Some(4_000_000));
+        let mut p = params();
+
+        match preflight_with(&m, &p, 10.0, ThresholdPolicy::Warn) {
+            Preflight::Warn { reason } => {
+                // Either wording is a below-threshold verdict: the early
+                // "already efficient" path or the generic estimate.
+                assert!(
+                    reason.contains("< 10% threshold") || reason.contains("negligible gain"),
+                    "reason: {reason}"
+                );
+                assert!(reason.contains("warned"), "reason: {reason}");
+            }
+            Preflight::Shrink { reason } => panic!("below threshold should warn: {reason}"),
+            Preflight::Skip { reason } => panic!("warn mode must not skip: {reason}"),
+        }
+        // A zero threshold still shrinks normally — no warning to show.
+        match preflight_with(&m, &p, 0.0, ThresholdPolicy::Warn) {
+            Preflight::Shrink { .. } => {}
+            Preflight::Warn { reason } => panic!("0% threshold should not warn: {reason}"),
+            Preflight::Skip { reason } => panic!("0% threshold must not skip: {reason}"),
+        }
+        // Above the threshold the warning policy is inert.
+        match preflight_with(&m, &p, 1.0, ThresholdPolicy::Warn) {
+            Preflight::Shrink { .. } => {}
+            Preflight::Warn { reason } => panic!("saving is above 1%: {reason}"),
+            Preflight::Skip { reason } => panic!("saving is above 1%: {reason}"),
+        }
+    }
+
+    #[test]
+    fn size_change_label_matches_direction() {
+        assert_eq!(size_change_label(0, 0), "no size change");
+        let shrink = size_change_label(1_000_000_000, 750_000_000);
+        assert!(shrink.contains("smaller"), "{shrink}");
+        assert!(shrink.contains("−25%"), "{shrink}");
+        let grow = size_change_label(1_000_000_000, 1_250_000_000);
+        assert!(grow.contains("larger"), "{grow}");
+        assert!(grow.contains("+25%"), "{grow}");
+        // A real but tiny change must not collapse to the misleading 0%.
+        let tiny = size_change_label(1_000_000, 1_000_001);
+        assert!(tiny.contains("<1%"), "{tiny}");
+    }
+
+    #[test]
+    fn growing_estimate_is_described_as_growth() {
+        // AV1 in, low CQ out: re-encoding genuinely predicts a bigger file.
+        let m = file("av1", 1920, 1080, 1_000_000_000, Some(12_000_000));
+        let mut p = params();
+        p.cq = 18;
+        p.preset = NvencPreset::P3;
+        let est = estimate_file(&m, &p);
+        assert!(
+            est.new_bytes > m.bytes,
+            "fixture must grow: {} → {}",
+            m.bytes,
+            est.new_bytes
+        );
+        match preflight_with(&m, &p, 10.0, ThresholdPolicy::Warn) {
+            Preflight::Warn { reason } => {
+                assert!(reason.contains("larger"), "reason: {reason}");
+                assert!(
+                    !reason.contains("-%"),
+                    "growth must not read as a negative percentage: {reason}"
+                );
+                assert!(
+                    reason.contains("below 10% saving threshold"),
+                    "reason: {reason}"
+                );
+            }
+            Preflight::Shrink { reason } => panic!("growth must not pass as a shrink: {reason}"),
+            Preflight::Skip { reason } => panic!("warn mode must not skip: {reason}"),
+        }
+        // The skip policy rejects the same growth with the same wording.
+        match preflight_with(&m, &p, 10.0, ThresholdPolicy::Skip) {
+            Preflight::Skip { reason } => {
+                assert!(reason.contains("larger"), "reason: {reason}");
+                assert!(!reason.contains("-%"), "reason: {reason}");
+            }
+            Preflight::Warn { reason } | Preflight::Shrink { reason } => {
+                panic!("growth must skip: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_stream_rates_do_not_double_count_audio() {
+        // The shape of every MKV Shrinkr itself writes: container rate
+        // known, per-stream rates not (ffprobe reports N/A in MKV). This is
+        // a 22-minute 720p HEVC file with a 5.1 Opus track. The estimate
+        // used to take 90% of the file as "video" AND add the audio back,
+        // predicting 117.5 MB → 160.4 MB (+36%) — a bogus "re-encoding
+        // would grow it" on the whole library, whatever the audio target.
+        let mut m = file("hevc", 1280, 720, 123_253_623, None);
+        m.format_bitrate = Some(743_406);
+        m.duration_s = 1326.365;
+        m.fps = 23.976;
+        m.audio[0] = AudioTrack {
+            codec: "opus".into(),
+            bitrate: None,
+            channels: 6,
+            layout: "5.1".into(),
+            sample_rate: Some(48_000),
+        };
+        m.acodec = "opus".into();
+        let p = params();
+        let est = estimate_file(&m, &p);
+        assert!(
+            est.new_bytes <= m.bytes,
+            "a copied track cannot invent growth: {} → {}",
+            m.bytes,
+            est.new_bytes
+        );
+        assert_eq!(est.audio_mode, "copy");
+        // Unknown-rate Opus is assumed efficient and stream-copied, so the
+        // chosen target must not move the estimate at all.
+        for target in [64_000, 96_000, 192_000, 512_000] {
+            let mut t = params();
+            t.opus_bps = Some(target);
+            assert_eq!(
+                estimate_file(&m, &t).new_bytes,
+                est.new_bytes,
+                "{target} bps must not change a copied track"
+            );
+        }
+        // Verdict: a small honest loss, never a growth.
+        match preflight_with(&m, &p, 10.0, ThresholdPolicy::Warn) {
+            Preflight::Warn { reason } => {
+                assert!(!reason.contains("grow"), "reason: {reason}");
+                assert!(!reason.contains("larger"), "reason: {reason}");
+            }
+            Preflight::Shrink { reason } => panic!("3% gain should warn: {reason}"),
+            Preflight::Skip { reason } => panic!("warn mode must not skip: {reason}"),
         }
     }
 

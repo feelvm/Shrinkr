@@ -251,7 +251,12 @@ pub fn solve_crf_for_file(
             human_bytes(m.bytes)
         ));
     }
-    let _ = std::fs::create_dir_all(work_dir);
+    std::fs::create_dir_all(work_dir).map_err(|e| {
+        format!(
+            "cannot create target work folder {}: {e} — check that it exists and is writable",
+            work_dir.display()
+        )
+    })?;
     let stem = m
         .path
         .file_stem()

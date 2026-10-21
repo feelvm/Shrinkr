@@ -9,8 +9,8 @@
 - **Auto backend with fallback ladder** — picks the best encoder your machine can actually run: HEVC NVENC (GPU decode + encode) → H.264 NVENC → CPU-decode + NVENC → CPU x264. x265, SVT-AV1 and AV1 NVENC (auto-detected via a trial encode) are also selectable.
 - **Quality control** — one CQ/CRF slider (18–40, default 28), NVENC presets P3–P6, scale policy (preserve / 1080p / 720p / 480p).
 - **Target-size mode** — instead of guessing a quality value, Shrinkr measures the file's own size curve (short sample encodes + a log-linear fit) and solves for the quality that hits your target: `400MB`, `2x` smaller, `50%`, …
-- **Audio-only mode** — stream-copies the video untouched and re-encodes just the audio to Opus (default 64 kbps) for remux-speed savings.
-- **Smart preflight** — probes every file first and skips files that wouldn't save enough (configurable minimum-saving threshold, default 10%).
+- **Audio-only mode** — stream-copies the video untouched and re-encodes just the audio to Opus (default 64 kbps, selectable up to 512 kbps, Opus's stereo ceiling) for remux-speed savings.
+- **Smart preflight** — probes every file first and skips files that wouldn't save enough (configurable minimum-saving threshold, default 10%). Uncheck **Skip already-efficient files** to keep low-gain files in the run: the minimum becomes advisory and the plan warns (`⚠`) instead of skipping them.
 - **Images** — still images shrink in the same batch with the same quality slider and preflight threshold: JPEG and WebP are re-encoded at the slider's quality; PNG, BMP and TIFF convert to JPEG when that's smaller (60–90% off near-uncompressed sources); PNGs with transparency convert to WebP instead, keeping the alpha channel; ICO containers keep every resolution entry and their alpha but re-encode them as PNG entries (legacy BMP-entry icons shrink ~90%, already-PNG icons are left alone). JPEGs that can't win a same-format re-encode (already-crushed files) get one measured WebP fallback at the same slider quality, kept only if it's actually smaller; animated GIFs/WebPs are skipped, files under 16 KB are left alone, and an output that isn't at least ~2% smaller than its source is never placed (no wasted JPEG generations). EXIF orientation is detected and baked into the pixels — rotated phone photos come out upright regardless of the ffmpeg build. With format preservation enabled (GUI checkbox or `--image-preserve-format`), outputs keep their source format instead: a PNG with a constant fully-opaque alpha plane drops that plane, images with at most 256 distinct colors re-encode as palette PNGs with dithering off (visually identical, measured PSNR above 60 dB), and TIFFs re-encode with deflate (lossless, often 80–95% off raw scans) — while BMP, which stores pixels raw with no compression hook, honestly skips instead of converting.
 - **Safe by default** — encodes to a temp file, re-probes the result to verify it, then places it next to the original (`movie.mkv`, `photo.jpg`). Originals are kept unless you explicitly choose *replace*, and replacement only happens after a verified encode.
 - **Subtitles & audio tracks** — subtitles are kept by default; keep every audio track or just the primary one. Extra ffmpeg flags can be passed through (e.g. `-tune grain`).
@@ -77,6 +77,10 @@ cargo build --release -p shrinkr-cli
 
 Binaries end up in `target/release/` (`shrinkr.exe`, `shrinkr-cli.exe`).
 
+### Troubleshooting
+
+- **Windows: `shrinkr.exe` shows up in Task Manager but no window appears** — WebView2 could not open its profile (usually a stale or locked `%LOCALAPPDATA%\shrinkr` left by an older runtime, an elevated run, or a sandboxed run). Shrinkr now creates a fresh, runtime-versioned profile per launch under `%LOCALAPPDATA%\shrinkr-webview-*` and falls back to `%TEMP%` or the app's folder if that location isn't writable. If it still hangs, delete the old `%LOCALAPPDATA%\shrinkr\EBWebView` and any `%LOCALAPPDATA%\shrinkr-webview-*` folders, then relaunch.
+
 ## Usage
 
 ### GUI
@@ -131,7 +135,7 @@ Key flags (run `shrinkr-cli` with no arguments for the full list):
 | `--backend <auto\|hevc\|h264\|x264\|x265\|av1\|copy>` | Encoder selection (default `auto`) |
 | `--cq <18-40>` | Quality: NVENC CQ / CRF (default 28) |
 | `--scale <preserve\|1080p\|720p\|480p>` | Resolution policy (default preserve) |
-| `--audio <off\|8-512>` | Opus bitrate in kbps (default 64) |
+| `--audio <off\|8-512>` | Opus bitrate in kbps (default 64; 512 is the stereo max) |
 | `--replace` | Delete originals after a verified encode (default: keep both) |
 | `--min-saving <pct>` | Skip files that wouldn't save this much (default 10) |
 | `--benchmark <file\|dir>` | Run the x264 + NVENC P3–P6 matrix |

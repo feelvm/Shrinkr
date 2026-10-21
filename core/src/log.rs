@@ -60,6 +60,11 @@ pub struct LogEntry {
 impl LogEntry {
     pub fn new(text: String) -> Self {
         let level = classify(&text);
+        // Mirror to disk so a crash or a closed window can't erase the
+        // evidence ("it failed with no logs"). Not from tests: they would
+        // scribble on the user's real log.
+        #[cfg(not(test))]
+        to_file(&text);
         Self {
             level,
             text,
@@ -82,6 +87,78 @@ impl LogEntry {
             secs % 60
         )
     }
+}
+
+/// Where the on-disk diagnostic log lives.
+///
+/// The GUI's log panel is memory-only: a crash, a force-close or a panic
+/// takes every line with it, which turns "it failed with no logs" into a
+/// guessing game. `%LOCALAPPDATA%\shrinkr\shrinkr.log` (and the platform
+/// equivalents) keeps the record across runs. Best-effort: an unwritable
+/// location just disables file logging.
+pub fn log_file() -> Option<std::path::PathBuf> {
+    let dir = if cfg!(windows) {
+        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("shrinkr")
+    } else if cfg!(target_os = "macos") {
+        std::path::PathBuf::from(std::env::var_os("HOME")?)
+            .join("Library")
+            .join("Logs")
+            .join("shrinkr")
+    } else {
+        match std::env::var_os("XDG_STATE_HOME") {
+            Some(x) => std::path::PathBuf::from(x).join("shrinkr"),
+            None => std::path::PathBuf::from(std::env::var_os("HOME")?)
+                .join(".local")
+                .join("state")
+                .join("shrinkr"),
+        }
+    };
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("shrinkr.log"))
+}
+
+fn sink() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    static SINK: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    SINK.get_or_init(|| {
+        let path = log_file()?;
+        // One rotation is enough to keep the last run and the one before it.
+        const CAP: u64 = 4 * 1024 * 1024;
+        if std::fs::metadata(&path)
+            .map(|m| m.len() > CAP)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::rename(&path, path.with_extension("log.1"));
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()
+            .map(std::sync::Mutex::new)
+    })
+    .as_ref()
+}
+
+/// Append one timestamped line to the diagnostic log (no-op when the
+/// location isn't writable). Used by [`LogEntry::new`] and the panic hook.
+pub fn to_file(line: &str) {
+    use std::io::Write;
+    let Some(sink) = sink() else { return };
+    let Ok(mut f) = sink.lock() else { return };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        % 86_400;
+    let _ = writeln!(
+        f,
+        "[{:02}:{:02}:{:02}Z] {}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+        line
+    );
 }
 
 /// Toggle state for the six severity lanes, indexed by `Level as usize`.
@@ -231,7 +308,7 @@ mod tests {
         );
         assert_eq!(classify("Scanning 2 selected item(s) …"), Level::Info);
         assert_eq!(
-            classify("Shrink pressed but 0 files eligible — reasons:"),
+            classify("Process pressed but 0 files eligible — reasons:"),
             Level::Info
         );
         assert_eq!(
@@ -260,5 +337,25 @@ mod tests {
         assert!(f.visible(Level::Info));
         assert!(f.any_hidden());
         assert_eq!(Level::all().len(), 6);
+    }
+
+    #[test]
+    fn log_lines_reach_the_disk_log() {
+        // "It failed with no logs" must be impossible to hit again: every
+        // log line is mirrored to a file the window can't take down.
+        let Some(path) = log_file() else {
+            // No writable app-data dir (bare CI container): file logging is
+            // best-effort by design, and to_file must not panic there.
+            to_file("shrinkr-log-test (no file)");
+            return;
+        };
+        let marker = format!("shrinkr-log-test-{}", std::process::id());
+        to_file(&marker);
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            body.contains(&marker),
+            "{} missing {marker}",
+            path.display()
+        );
     }
 }
