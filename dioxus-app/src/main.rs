@@ -63,6 +63,10 @@ fn main() {
             path.display()
         ));
     }
+    // Recover gigabytes a crashed run can leave behind (staged outputs are
+    // full-size and Windows never cleans them up); background so startup
+    // never waits on disk deletes.
+    std::thread::spawn(shrinkr_core::ffmpeg::sweep_stale_work_roots);
     // NOTE: dioxus-desktop forces always-on-top in DEBUG builds unless told
     // otherwise ("so we can see it while we work"). A shrink tool that pins
     // itself above file dialogs is unusable, so spell out a normal window.
@@ -103,31 +107,45 @@ fn webview_data_dir() -> Option<std::path::PathBuf> {
         .unwrap_or(0);
     let unique = format!("shrinkr-webview-{version}-{}-{stamp}", std::process::id());
 
-    let mut candidates = Vec::new();
+    let mut bases = Vec::new();
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        candidates.push(std::path::PathBuf::from(local).join(&unique));
+        bases.push(std::path::PathBuf::from(local));
     }
-    candidates.push(std::env::temp_dir().join(&unique));
-    if let Some(exe) = std::env::current_exe()
+    bases.push(std::env::temp_dir());
+    let exe_base = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-    {
-        candidates.push(exe.join(&unique));
-    }
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
 
-    for dir in candidates {
+    let mut chosen = None;
+    for base in &bases {
+        let dir = base.join(&unique);
         if writable_dir(&dir) {
-            if let Some(base) = dir.parent() {
-                cleanup_old_webview_profiles(base, &dir);
-            }
-            return Some(dir);
+            chosen = Some(dir);
+            break;
         }
     }
-    None
+    let dir = chosen?;
+    if let Some(exe_base) = exe_base {
+        bases.push(exe_base);
+    }
+    // Every launch leaves a profile behind and each is tens of megabytes,
+    // so the sweep runs against every candidate base (a previous launch
+    // may have fallen back to a different one), in the background so
+    // startup never waits on a multi-hundred-MB delete.
+    let sweep_dir = dir.clone();
+    std::thread::spawn(move || {
+        for base in &bases {
+            cleanup_old_webview_profiles(base, &sweep_dir);
+        }
+    });
+    Some(dir)
 }
 
-/// Best-effort cleanup: stale per-launch profiles older than a week are
-/// removed. Locked or in-use dirs simply stay behind.
+/// Best-effort cleanup: every earlier launch leaves a WebView2 profile
+/// behind and each is tens of megabytes, so anything older than an hour
+/// is removed. The age floor spares a concurrently running instance's
+/// profile; files still locked by a live webview simply fail the delete
+/// and stay for the next sweep.
 #[cfg(target_os = "windows")]
 fn cleanup_old_webview_profiles(base: &std::path::Path, current: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(base) else {
@@ -139,14 +157,14 @@ fn cleanup_old_webview_profiles(base: &std::path::Path, current: &std::path::Pat
         if path == current || !name.starts_with("shrinkr-webview-") {
             continue;
         }
-        let old = entry
+        let stale = entry
             .metadata()
             .ok()
             .and_then(|meta| meta.modified().ok())
             .and_then(|modified| modified.elapsed().ok())
-            .map(|age| age.as_secs() > 7 * 24 * 60 * 60)
+            .map(|age| age.as_secs() > 60 * 60)
             .unwrap_or(false);
-        if old {
+        if stale {
             let _ = std::fs::remove_dir_all(path);
         }
     }

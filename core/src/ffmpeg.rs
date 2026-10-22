@@ -616,6 +616,38 @@ pub fn work_root() -> Result<PathBuf, String> {
     ))
 }
 
+/// Startup sweep for stale staging files. Encode and convert runs stage
+/// full-size outputs under these roots; a crash, killed process or power
+/// loss leaves them behind, and Windows never cleans them up on its own.
+/// Top-level files older than a day go — a live run only ever writes
+/// minutes-old files, and subdirectories (bench/target artifacts) stay.
+pub fn sweep_stale_work_roots() {
+    let mut roots = vec![std::env::temp_dir().join("shrinkr-convert")];
+    roots.extend(work_candidates());
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let stale = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .map(|age| age.as_secs() > 24 * 60 * 60)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_fallback(
     media: &MediaFile,
