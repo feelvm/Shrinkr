@@ -28,9 +28,11 @@ pub enum VideoBackend {
     /// Software encode on the CPU (Ryzen path); needs libsvtav1 in ffmpeg.
     CpuAv1,
     /// Audio-only pass: video stream-copied untouched (any codec), audio
-    /// converted per the audio setting, subs copied, everything else
+    /// converted per the audio setting (the target is an instruction, so
+    /// this is the audio-upscale mode), subs copied, everything else
     /// dropped. No quality slider, preset, or resolution applies — speed
-    /// of a remux, savings purely from audio (+ dropped streams).
+    /// of a remux; the output may legitimately grow when the target is
+    /// above the source bitrate, and size thresholds don't apply.
     CopyVideo,
 }
 
@@ -43,7 +45,7 @@ impl VideoBackend {
             VideoBackend::CpuX264 => "CPU x264 (CRF = quality slider)",
             VideoBackend::CpuX265 => "CPU x265 slow (CRF = quality slider)",
             VideoBackend::CpuAv1 => "CPU AV1 SVT (max shrink, slow)",
-            VideoBackend::CopyVideo => "Copy video (audio/subs only, fastest)",
+            VideoBackend::CopyVideo => "Copy video (audio-only — upscale audio)",
         }
     }
 

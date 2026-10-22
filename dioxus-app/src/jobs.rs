@@ -47,6 +47,12 @@ pub enum JobMsg {
     ExecWarn {
         msg: String,
     },
+    /// The planner refused the file before encoding (explained skip, e.g.
+    /// an audio-only pass on a file with no audio track). Not a failure.
+    ExecSkipped {
+        job: usize,
+        detail: String,
+    },
     ExecFileDone {
         job: usize,
         detail: String,
@@ -218,8 +224,19 @@ pub fn start_scan(tx: UnboundedSender<JobMsg>, targets: Vec<PathBuf>) {
 /// thrown away because it didn't beat the source. Both are "expected"
 /// outcomes — only `Err` is a failure.
 enum JobOutcome {
-    Placed { saved: i64, detail: String },
-    NoGain { detail: String },
+    Placed {
+        saved: i64,
+        detail: String,
+    },
+    NoGain {
+        detail: String,
+    },
+    /// The planner refused the file up front (e.g. an audio-only pass on a
+    /// file with no audio track). Intentional and explained — the row must
+    /// not read as a failed encode.
+    Skipped {
+        detail: String,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -238,7 +255,9 @@ fn run_one_job(
 ) -> Result<JobOutcome, String> {
     match preflight_auto_with(&f, &params, threshold, threshold_policy) {
         Preflight::Skip { reason } => {
-            return Err(format!("skip {}: {}", f.path.display(), reason));
+            return Ok(JobOutcome::Skipped {
+                detail: format!("skip {}: {}", f.path.display(), reason),
+            });
         }
         Preflight::Warn { reason } => send(
             tx,
@@ -357,8 +376,14 @@ fn run_one_image_job(
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string();
-    let mut plan = plan_image(&f, params.image_preserve_format)
-        .map_err(|reason| format!("skip {fname}: {reason}"))?;
+    let mut plan = match plan_image(&f, params.image_preserve_format) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            return Ok(JobOutcome::Skipped {
+                detail: format!("skip {fname}: {reason}"),
+            });
+        }
+    };
     let stem = f.path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
     let tmp_out = tmp_root.join(format!("{}-{}.{}", stem, job_idx, plan.target_ext));
     let _ = std::fs::remove_file(&tmp_out);
@@ -506,6 +531,9 @@ pub fn start_exec(
                             stopped_no_gain.store(true, Ordering::Relaxed);
                             cancel.store(true, Ordering::Relaxed);
                         }
+                    }
+                    Ok(JobOutcome::Skipped { detail }) => {
+                        send(&tx, JobMsg::ExecSkipped { job: i, detail });
                     }
                     Err(e) if e.contains("cancelled") => {
                         // The run ended under this file (user cancel or the
@@ -1139,6 +1167,15 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             s.exec_discarded += 1;
             s.push_log(detail);
         }
+        JobMsg::ExecSkipped { job, detail } => {
+            // Refused by the planner before any encode (reason in the log
+            // line). A deliberate outcome — the row is done, not failed.
+            if let Some(item) = s.exec_items.get_mut(job) {
+                item.done = true;
+                item.frac = 1.0;
+            }
+            s.push_log(detail);
+        }
         JobMsg::ExecAborted { job } => {
             // Still running when the batch ended: no result to report and
             // nothing to explain per file (the summary does).
@@ -1168,8 +1205,22 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                     } else {
                         format!(" {n} queued file(s) kept in the library for later.")
                     };
+                    // An explicit audio target often means the user wanted
+                    // audio work, not a video shrink — route them to the
+                    // mode where the target is an instruction and nothing
+                    // is ever discarded for being larger.
+                    let audio_hint = if s
+                        .exec_cfg
+                        .as_ref()
+                        .map(|c| c.params.opus_bps.is_some())
+                        .unwrap_or(s.opus_bps.is_some())
+                    {
+                        " To re-encode the audio to that Opus target without touching the video, run with the 'Copy video (audio-only)' backend — audio-only passes always run and are never discarded for being larger."
+                    } else {
+                        ""
+                    };
                     s.push_log(format!(
-                        "Stopped after {:.0}s: {} file(s) in a row were encoded and then discarded because each result was larger than its source. This library is already efficiently encoded — nothing here can shrink at these settings. Leave 'Skip already-efficient files' checked (or lower the quality target) before running it again.{queued}",
+                        "Stopped after {:.0}s: {} file(s) in a row were encoded and then discarded because each result was larger than its source. This library is already efficiently encoded — nothing here can shrink at these settings. Leave 'Skip already-efficient files' checked (or lower the quality target) before running it again.{queued}{audio_hint}",
                         elapsed_s, discarded
                     ));
                 } else {

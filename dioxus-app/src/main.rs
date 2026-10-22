@@ -753,6 +753,9 @@ fn PipelineCard() -> Element {
     let parallel = s.parallel;
     let extra_args = s.extra_args.clone();
     let opus_bps = s.opus_bps;
+    // Audio-only pass (copy video + an explicit Opus target): size
+    // thresholds don't apply, so the threshold controls disable themselves.
+    let audio_only = backend == VideoBackend::CopyVideo && opus_bps.is_some();
     // Sections follow the library: video knobs only when a video is
     // loaded, image knobs only when an image is — no NVENC/audio rows
     // for a folder of photos.
@@ -809,6 +812,19 @@ fn PipelineCard() -> Element {
                             },
                             "Max CPU shrink"
                         }
+                        Button {
+                            variant: ButtonVariant::Outline,
+                            onclick: move |_| {
+                                let mut w = state.write();
+                                w.backend = VideoBackend::CopyVideo;
+                                // An upscale needs a target; the 64k default
+                                // would just re-copy most sources.
+                                if w.opus_bps.is_none() {
+                                    w.opus_bps = Some(192_000);
+                                }
+                            },
+                            "Upscale audio"
+                        }
                     }
                     div { class: "grid grid-cols-1 gap-3 md:grid-cols-3",
                         div { class: "flex flex-col gap-1",
@@ -832,7 +848,7 @@ fn PipelineCard() -> Element {
                                 option { value: "x264", selected: backend == VideoBackend::CpuX264, "CPU x264 (CRF = slider)" }
                                 option { value: "x265", selected: backend == VideoBackend::CpuX265, "CPU x265 slow (CRF = slider)" }
                                 option { value: "av1", selected: backend == VideoBackend::CpuAv1, "CPU AV1 SVT (slow)" }
-                                option { value: "copy", selected: backend == VideoBackend::CopyVideo, "Copy video (audio/subs only)" }
+                                option { value: "copy", selected: backend == VideoBackend::CopyVideo, "Copy video (audio-only — upscale audio)" }
                             }
                         }
                         div { class: "flex flex-col gap-1",
@@ -893,7 +909,7 @@ fn PipelineCard() -> Element {
                             }
                         }
                         p { class: "text-xs text-muted-foreground",
-                            "Tracks at/below target are copied. In 'Copy video (audio/subs only)' mode the target is always encoded, so the file grows. Opus caps at 256k/channel; exotic layouts → AAC."
+                            "Re-encode modes copy tracks at/below the target — transcoding upward adds nothing. 'Copy video (audio-only)' is the upscale mode: the target is always encoded, the video passes through untouched, and size thresholds / no-gain discards never apply. Opus caps at 256k/channel; exotic layouts → AAC."
                         }
                     }
                     div { class: "flex items-center gap-3",
@@ -1020,6 +1036,7 @@ fn PipelineCard() -> Element {
                             label { class: "flex items-center gap-2 text-sm",
                                 Checkbox {
                                     checked: skip_efficient,
+                                    disabled: audio_only,
                                     on_checked_change: move |v| state.write().skip_efficient = v,
                                 }
                                 "Skip already-efficient files"
@@ -1032,7 +1049,9 @@ fn PipelineCard() -> Element {
                                 "Replace originals after verified encode"
                             }
                             p { class: "text-xs text-muted-foreground",
-                                if skip_efficient {
+                                if audio_only {
+                                    "Audio-only passes always run — no size thresholds apply, and larger results are kept."
+                                } else if skip_efficient {
                                     "Files estimated to save less than the minimum are skipped."
                                 } else {
                                     "Files estimated to save less than the minimum are still queued — the plan warns instead of skipping."
@@ -1049,6 +1068,7 @@ fn PipelineCard() -> Element {
                                     max: 30.0,
                                     step: 1.0,
                                     value: min_saving,
+                                    disabled: audio_only,
                                     oninput: move |e: FormEvent| {
                                         if let Ok(v) = e.value().parse::<f64>() {
                                             state.write().min_saving_pct = v.clamp(0.0, 30.0);
@@ -1325,7 +1345,13 @@ fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
                 w.push_log(format!("  ✗ {}: {}", name, reason));
             }
         }
-        if skip_efficient {
+        let audio_only = p.backend == VideoBackend::CopyVideo && p.opus_bps.is_some();
+        if audio_only {
+            w.push_log(
+                "  hint: audio-only passes skip only files without an audio track — everything else runs."
+                    .into(),
+            );
+        } else if skip_efficient {
             w.push_log(
                 "  hint: uncheck 'Skip already-efficient files' to queue low-gain files with a warning, or lower 'Min. saving %'."
                     .into(),
