@@ -260,7 +260,6 @@ fn Header() -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let s = state.read();
     let tools_ok = s.ffmpeg_ok && s.ffprobe_ok;
-    let hw = s.hw_summary.clone();
     let checking = s.update_checking;
     let installing = s.update_installing;
     let available = s.update_available.clone();
@@ -270,6 +269,25 @@ fn Header() -> Element {
     let fetch_pct = s.ffmpeg_fetch_pct;
     let fetch_supported = shrinkr_core::ffmpeg_fetch::supported();
     drop(s);
+    // Say only what this machine can't do, and only for features the UI
+    // exposes — everything supported is selectable (and greyed out when
+    // missing) in the Pipeline dropdown, so no capability dump is needed.
+    let caps = shrinkr_core::hw::caps();
+    let mut missing: Vec<&str> = vec![];
+    if !caps.hevc_nvenc {
+        missing.push("NVENC HEVC");
+    }
+    if !caps.h264_nvenc {
+        missing.push("NVENC H.264");
+    }
+    if !caps.svt_av1 {
+        missing.push("CPU AV1");
+    }
+    let missing_note = if missing.is_empty() {
+        String::new()
+    } else {
+        format!("unavailable: {}", missing.join(", "))
+    };
     rsx! {
         header { class: "relative flex shrink-0 items-center justify-between border-b border-border bg-card px-5 py-3",
             div {
@@ -302,7 +320,12 @@ fn Header() -> Element {
                         }
                     }
                 }
-                Badge { variant: BadgeVariant::Secondary, "{hw}" }
+                if !matches!(caps.gpu_label.as_str(), "" | "none" | "unknown") {
+                    Badge { variant: BadgeVariant::Secondary, "{caps.gpu_label}" }
+                }
+                if !missing_note.is_empty() {
+                    Badge { variant: BadgeVariant::Destructive, "{missing_note}" }
+                }
                 if let Some(v) = ready {
                     Badge { variant: BadgeVariant::Success, "v{v} installed" }
                     Button {
@@ -771,17 +794,20 @@ fn PipelineCard() -> Element {
     );
     let saving_label = format!("{min_saving:.0}");
     let parallel_label = format!("{parallel}");
+    // Feature greying: options a re-encode backend needs but this machine
+    // lacks are disabled in place rather than hidden, so the plan and the
+    // dropdown always agree on what exists.
+    let caps = shrinkr_core::hw::caps();
     rsx! {
         Card {
             CardHeader {
                 CardTitle { "Pipeline" }
-                CardDescription { "Quality, resolution and I/O — video and images have separate knobs" }
             }
             CardContent {
                 div { class: "flex flex-col gap-4",
                     if has_video {
                         div { class: "flex flex-col gap-3",
-                            p { class: "text-xs font-semibold text-muted-foreground", "Video" }
+                            p { class: "text-xs font-semibold text-muted-foreground", "Presets" }
                             div { class: "flex flex-wrap gap-2",
                         Button {
                             variant: ButtonVariant::Outline,
@@ -795,6 +821,7 @@ fn PipelineCard() -> Element {
                         }
                         Button {
                             variant: ButtonVariant::Outline,
+                            disabled: !caps.hevc_nvenc,
                             onclick: move |_| {
                                 let mut w = state.write();
                                 w.backend = VideoBackend::HevcNvenc;
@@ -843,11 +870,11 @@ fn PipelineCard() -> Element {
                                     };
                                 },
                                 option { value: "auto", selected: backend == VideoBackend::Auto, "Auto (NVDEC→NVENC→CPU)" }
-                                option { value: "hevc", selected: backend == VideoBackend::HevcNvenc, "NVENC HEVC" }
-                                option { value: "h264", selected: backend == VideoBackend::H264Nvenc, "NVENC H.264" }
+                                option { value: "hevc", selected: backend == VideoBackend::HevcNvenc, disabled: !caps.hevc_nvenc, "NVENC HEVC" }
+                                option { value: "h264", selected: backend == VideoBackend::H264Nvenc, disabled: !caps.h264_nvenc, "NVENC H.264" }
                                 option { value: "x264", selected: backend == VideoBackend::CpuX264, "CPU x264 (CRF = slider)" }
                                 option { value: "x265", selected: backend == VideoBackend::CpuX265, "CPU x265 slow (CRF = slider)" }
-                                option { value: "av1", selected: backend == VideoBackend::CpuAv1, "CPU AV1 SVT (slow)" }
+                                option { value: "av1", selected: backend == VideoBackend::CpuAv1, disabled: !caps.svt_av1, "CPU AV1 SVT (slow)" }
                                 option { value: "copy", selected: backend == VideoBackend::CopyVideo, "Copy video (audio-only — upscale audio)" }
                             }
                         }
@@ -907,9 +934,6 @@ fn PipelineCard() -> Element {
                                     }
                                 }
                             }
-                        }
-                        p { class: "text-xs text-muted-foreground",
-                            "Re-encode modes copy tracks at/below the target — transcoding upward adds nothing. 'Copy video (audio-only)' is the upscale mode: the target is always encoded, the video passes through untouched, and size thresholds / no-gain discards never apply. Opus caps at 256k/channel; exotic layouts → AAC."
                         }
                     }
                     div { class: "flex items-center gap-3",
@@ -1048,13 +1072,13 @@ fn PipelineCard() -> Element {
                                 }
                                 "Replace originals after verified encode"
                             }
-                            p { class: "text-xs text-muted-foreground",
-                                if audio_only {
-                                    "Audio-only passes always run — no size thresholds apply, and larger results are kept."
-                                } else if skip_efficient {
-                                    "Files estimated to save less than the minimum are skipped."
-                                } else {
-                                    "Files estimated to save less than the minimum are still queued — the plan warns instead of skipping."
+                            if !audio_only {
+                                p { class: "text-xs text-muted-foreground",
+                                    if skip_efficient {
+                                        "Files estimated to save less than the minimum are skipped."
+                                    } else {
+                                        "Files estimated to save less than the minimum are still queued — the plan warns instead of skipping."
+                                    }
                                 }
                             }
                         }
@@ -1101,9 +1125,6 @@ fn PipelineCard() -> Element {
                                 Badge { "{parallel_label}" }
                             }
                         }
-                    }
-                    Collapsible { title: "How estimates work",
-                        "Size, time and plan update live as you change settings. Videos: codec × CQ × preset × resolution × audio. Images: their own quality and resolution knobs above (JPEG/WebP re-encode, PNG/BMP/TIFF → JPEG when smaller, transparency → WebP with alpha kept, measured WebP fallback for dead-end JPEGs; with format preservation on, png/tiff re-encode as themselves losslessly and conversions are off; animated files skip). NVENC CQ ≠ x264 CRF — verify in Benchmark. Extra ffmpeg flags apply to video only."
                     }
                 }
             }
@@ -1312,6 +1333,11 @@ fn EstimateCard() -> Element {
                     }
                     p { class: "text-xs text-muted-foreground",
                         "Solves the quality value for the first eligible file and sets the slider. Batch runs reuse it."
+                    }
+                }
+                div { class: "mt-2",
+                    Collapsible { title: "How estimates work",
+                        "Size, time and plan update live as you change settings. Videos: codec × CQ × preset × resolution × audio. Images: their own quality and resolution knobs above (JPEG/WebP re-encode, PNG/BMP/TIFF → JPEG when smaller, transparency → WebP with alpha kept, measured WebP fallback for dead-end JPEGs; with format preservation on, png/tiff re-encode as themselves losslessly and conversions are off; animated files skip). NVENC CQ ≠ x264 CRF — verify in Benchmark. Extra ffmpeg flags apply to video only."
                     }
                 }
             }

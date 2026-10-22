@@ -125,7 +125,6 @@ pub struct AppState {
     pub bench_running: bool,
     pub bench_rows: Vec<BenchRow>,
     pub bench_note: String,
-    pub hw_summary: String,
     pub ffmpeg_ok: bool,
     pub ffprobe_ok: bool,
     // ── One-click ffmpeg fetch (header, when ffmpeg is missing) ──
@@ -299,7 +298,6 @@ impl Default for AppState {
             bench_running: false,
             bench_rows: vec![],
             bench_note: String::new(),
-            hw_summary: shrinkr_core::hw::caps().summary(),
             ffmpeg_ok: tool_ok("ffmpeg"),
             ffprobe_ok: tool_ok("ffprobe"),
             ffmpeg_fetching: false,
