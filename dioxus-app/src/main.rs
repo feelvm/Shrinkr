@@ -489,7 +489,6 @@ fn Sidebar() -> Element {
             Card {
                 CardHeader {
                     CardTitle { "Sources" }
-                    CardDescription { "Folders or files, then Scan — or drag & drop them here" }
                 }
                 CardContent {
                     div { class: "flex flex-col gap-2",
@@ -1197,11 +1196,17 @@ fn GoalPicker() -> Element {
             let est = s.goal_estimate(goal);
             let line = est.saving_frac().map(|frac| {
                 let pct = -frac * 100.0;
-                if pct >= 0.0 {
-                    format!("{pct:.0}% · ~{}", fmt_secs(est.secs))
+                let size = if pct >= 0.0 {
+                    format!("{pct:.0}%")
                 } else {
-                    format!("+{:.0}% · ~{}", -pct, fmt_secs(est.secs))
-                }
+                    format!("+{:.0}%", -pct)
+                };
+                format!(
+                    "{size} · ~{} · {} file{}",
+                    fmt_secs(est.secs),
+                    est.files,
+                    if est.files == 1 { "" } else { "s" }
+                )
             });
             (goal, active, line)
         })
@@ -1243,10 +1248,6 @@ fn GoalPicker() -> Element {
                         }
                     }
                 }
-            }
-            div { class: "flex w-fit min-w-full justify-between text-xs text-muted-foreground",
-                span { "← faster · bigger files" }
-                span { "smaller · slower →" }
             }
         }
     }

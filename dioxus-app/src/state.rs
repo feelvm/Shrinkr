@@ -124,6 +124,10 @@ pub struct GoalEstimate {
     pub total_b: u64,
     pub new_b: u64,
     pub secs: f64,
+    /// Videos this goal would actually re-encode. Goals pass the
+    /// threshold gate differently, so segment times differ even at
+    /// equal savings — the count makes that visible.
+    pub files: usize,
 }
 
 impl GoalEstimate {
@@ -651,6 +655,7 @@ impl AppState {
             est.total_b += f.bytes;
             est.new_b += estimate_file(f, &p).new_bytes;
             est.secs += f.total_frames() / backend_fps(backend);
+            est.files += 1;
         }
         est.secs /= self.parallel.max(1) as f64;
         est
