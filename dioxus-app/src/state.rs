@@ -48,18 +48,19 @@ impl Goal {
     /// Fastest keeps Balanced's CQ so quality stays constant across the
     /// fast half of the axis — the trade-off there is purely speed vs
     /// size (P4 encodes quicker than P5 at the same CQ, files come out
-    /// bigger). Smallest is capability-driven: HEVC NVENC P6 when the GPU
-    /// can, SVT-AV1 (the max-shrink CPU path) when it can't, Auto
-    /// otherwise; its higher CQ is the extra squeeze the name promises.
+    /// bigger). Smallest means smallest output, period: SVT-AV1 is the
+    /// most compression-efficient encoder in the toolbox (software, so
+    /// slow — that's the cost the name admits), falling back to HEVC
+    /// NVENC P6 only when the ffmpeg build lacks SVT-AV1, then Auto.
     pub fn resolve(&self, caps: &HwCaps) -> (VideoBackend, NvencPreset, u32) {
         match self {
             Goal::Fastest => (VideoBackend::Auto, NvencPreset::P4, 28),
             Goal::Balanced => (VideoBackend::Auto, NvencPreset::P5, 28),
             Goal::Smallest => {
-                if caps.hevc_nvenc {
-                    (VideoBackend::HevcNvenc, NvencPreset::P6, 32)
-                } else if caps.svt_av1 {
+                if caps.svt_av1 {
                     (VideoBackend::CpuAv1, NvencPreset::P5, 32)
+                } else if caps.hevc_nvenc {
+                    (VideoBackend::HevcNvenc, NvencPreset::P6, 32)
                 } else {
                     (VideoBackend::Auto, NvencPreset::P6, 32)
                 }
