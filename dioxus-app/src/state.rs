@@ -82,7 +82,27 @@ impl Goal {
         let av1_no_preset = b == VideoBackend::CpuAv1;
         backend == b && cq == c && (av1_no_preset || preset == p)
     }
+
+    /// [`Goal::matches`] for a Lossless batch: the quality value is pinned
+    /// by the checkbox, so segments match on encoder + preset alone and the
+    /// axis keeps working as the speed↔size control it is there.
+    pub fn matches_lossless(
+        &self,
+        backend: VideoBackend,
+        preset: NvencPreset,
+        caps: &HwCaps,
+    ) -> bool {
+        let (b, p, _) = self.resolve(caps);
+        let av1_no_preset = b == VideoBackend::CpuAv1;
+        backend == b && (av1_no_preset || preset == p)
+    }
 }
+
+/// Quality value the video encodes at while the Lossless box is checked:
+/// the visually-lossless end of the shared slider. CRF/CQ 18 is the range
+/// where the encode is indistinguishable from the source; below it, files
+/// mostly grow with nothing visible to show for it.
+pub const LOSSLESS_CQ: u32 = 18;
 
 /// Measured-fps table for wall-time estimates. Shared by the batch
 /// estimate and the per-goal segment estimates.
@@ -187,6 +207,13 @@ pub struct AppState {
     pub probing: bool,
     pub probe_done: usize,
     pub probe_total: usize,
+    /// Checked by default: keeps perceived audio/video quality intact by
+    /// pinning quality to the visually-lossless end of the slider
+    /// ([`LOSSLESS_CQ`]), resolution to Preserve, and audio to Off (stream
+    /// copy, never re-encoded). Backend and preset stay user-controlled —
+    /// they trade speed for size, not quality. The raw knobs keep their
+    /// values, so unchecking restores the user's settings exactly.
+    pub lossless: bool,
     pub backend: VideoBackend,
     /// Backend to restore when Audio-only is switched off (checked state
     /// is derived from `backend == CopyVideo`).
@@ -378,6 +405,7 @@ impl Default for AppState {
             probing: false,
             probe_done: 0,
             probe_total: 0,
+            lossless: true,
             backend: VideoBackend::Auto,
             last_video_backend: VideoBackend::Auto,
             nvenc_preset: NvencPreset::P5,
@@ -471,8 +499,49 @@ impl AppState {
         counts
     }
 
+    /// Settings that keep perceived quality intact, applied on top of the
+    /// raw knobs while Lossless is checked. Only the three knobs that can
+    /// visibly degrade the result are pinned: quality value, resolution
+    /// and audio (re-encoding audio to Opus is the loudest quality loss a
+    /// default batch could inflict).
+    fn apply_lossless(&self, p: &mut EstParams) {
+        if !self.lossless {
+            return;
+        }
+        p.cq = LOSSLESS_CQ;
+        p.scale = ScalePolicy::Preserve;
+        p.opus_bps = None;
+    }
+
+    /// The CQ/CRF the video actually encodes at (Lossless pins it).
+    pub fn effective_cq(&self) -> u32 {
+        if self.lossless {
+            LOSSLESS_CQ
+        } else {
+            self.cq
+        }
+    }
+
+    /// The resolution policy the video actually runs with.
+    pub fn effective_scale(&self) -> ScalePolicy {
+        if self.lossless {
+            ScalePolicy::Preserve
+        } else {
+            self.scale
+        }
+    }
+
+    /// The audio target the video actually runs with (`None` = Off).
+    pub fn effective_opus(&self) -> Option<u32> {
+        if self.lossless {
+            None
+        } else {
+            self.opus_bps
+        }
+    }
+
     pub fn est_params(&self) -> EstParams {
-        EstParams {
+        let mut p = EstParams {
             backend: self.backend,
             preset: self.nvenc_preset,
             cq: self.cq,
@@ -482,7 +551,9 @@ impl AppState {
             image_cq: self.image_cq,
             image_scale: self.image_scale,
             image_preserve_format: self.image_preserve_format,
-        }
+        };
+        self.apply_lossless(&mut p);
+        p
     }
 
     /// Any still image in the library — drives which Pipeline settings
@@ -553,7 +624,9 @@ impl AppState {
     /// quality substituted into the current settings, everything else
     /// (resolution, audio, images) as configured. These numbers are what
     /// the Goal segments display, so the speed↔size trade-off is stated
-    /// in the batch's own bytes and minutes.
+    /// in the batch's own bytes and minutes. Under Lossless the goal's CQ
+    /// is overridden right back — all three segments share the pinned
+    /// quality and differ only in encoder speed and efficiency.
     pub fn goal_estimate(&self, goal: Goal) -> GoalEstimate {
         let caps = shrinkr_core::hw::caps();
         let (backend, preset, cq) = goal.resolve(caps);
@@ -561,6 +634,7 @@ impl AppState {
         p.backend = backend;
         p.preset = preset;
         p.cq = cq;
+        self.apply_lossless(&mut p);
         let t = self.threshold();
         let policy = self.threshold_policy();
         let mut est = GoalEstimate::default();
@@ -642,5 +716,140 @@ impl AppState {
             .filter(|e| self.log_filter.visible(e.level))
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shrinkr_core::media::AudioTrack;
+
+    fn app() -> AppState {
+        // Defaults are lossless; give the raw knobs non-pinned values so
+        // the tests prove the override (and that the knobs survive it).
+        AppState {
+            cq: 32,
+            scale: ScalePolicy::Force720p,
+            opus_bps: Some(96_000),
+            ..Default::default()
+        }
+    }
+
+    fn video() -> MediaFile {
+        MediaFile {
+            path: std::path::PathBuf::from("t.mp4"),
+            bytes: 1_000_000_000,
+            vcodec: "h264".into(),
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            pix_fmt: "yuv420p".into(),
+            bit_depth: 8,
+            color_space: String::new(),
+            color_primaries: String::new(),
+            color_transfer: String::new(),
+            color_range: String::new(),
+            vbitrate: Some(12_000_000),
+            format_bitrate: None,
+            duration_s: 600.0,
+            audio: vec![AudioTrack {
+                codec: "aac".into(),
+                bitrate: Some(384_000),
+                channels: 2,
+                layout: "stereo".into(),
+                sample_rate: Some(48000),
+            }],
+            acodec: "aac".into(),
+            video_stream_count: 1,
+            audio_stream_count: 1,
+            sub_count: 0,
+            attach_count: 0,
+            has_chapters: false,
+        }
+    }
+
+    #[test]
+    fn lossless_is_on_by_default_and_pins_the_quality_knobs() {
+        let s = app();
+        let p = s.est_params();
+        assert_eq!(p.cq, LOSSLESS_CQ);
+        assert_eq!(p.scale, ScalePolicy::Preserve);
+        assert_eq!(p.opus_bps, None);
+        // The raw knobs survive, so unchecking restores them exactly.
+        assert_eq!(s.cq, 32);
+        assert_eq!(s.scale, ScalePolicy::Force720p);
+        assert_eq!(s.opus_bps, Some(96_000));
+    }
+
+    #[test]
+    fn unchecking_lossless_releases_the_pins() {
+        let mut s = app();
+        s.lossless = false;
+        let p = s.est_params();
+        assert_eq!(p.cq, 32);
+        assert_eq!(p.scale, ScalePolicy::Force720p);
+        assert_eq!(p.opus_bps, Some(96_000));
+    }
+
+    #[test]
+    fn lossless_goal_estimates_share_the_pinned_quality() {
+        // goal_estimate substitutes the goal's own CQ after est_params —
+        // it must re-apply the pin, or the segments would silently
+        // estimate (and the axis promise) quality the run won't deliver.
+        // Thresholds off: a cq18 estimate on a dense source may grow, and
+        // the default skip policy would drop the file from the estimate
+        // before the two plans could be compared.
+        let mut s = app();
+        s.min_saving_pct = 0.0;
+        s.skip_efficient = false;
+        s.files.push(video());
+        let pinned = s.goal_estimate(Goal::Fastest).new_b;
+        let released = {
+            s.lossless = false;
+            s.goal_estimate(Goal::Fastest).new_b
+        };
+        assert!(
+            pinned > released,
+            "cq{} estimate {} should exceed the cq28 plan {}",
+            LOSSLESS_CQ,
+            pinned,
+            released
+        );
+    }
+
+    #[test]
+    fn lossless_goal_matching_ignores_the_pinned_cq() {
+        let caps = shrinkr_core::hw::HwCaps {
+            cuda_hwaccel: true,
+            hevc_nvenc: true,
+            h264_nvenc: true,
+            av1_nvenc_listed: false,
+            av1_nvenc_usable: false,
+            svt_av1: true,
+            cuvid_decoders: vec![],
+            gpu_label: "test".into(),
+        };
+        // Full matches() demands the goal's CQ (28), which Lossless pins
+        // away — the segment would never highlight. matches_lossless
+        // compares encoder + preset only.
+        assert!(!Goal::Fastest.matches(VideoBackend::Auto, NvencPreset::P4, LOSSLESS_CQ, &caps));
+        assert!(Goal::Fastest.matches_lossless(VideoBackend::Auto, NvencPreset::P4, &caps));
+        assert!(!Goal::Balanced.matches_lossless(VideoBackend::Auto, NvencPreset::P4, &caps));
+        assert!(!Goal::Fastest.matches_lossless(VideoBackend::CpuAv1, NvencPreset::P4, &caps));
+    }
+
+    #[test]
+    fn lossless_batch_cannot_become_audio_only() {
+        // Audio-only re-encodes the soundtrack — exactly what Lossless
+        // forbids — so the effective audio target stays Off even with the
+        // Copy-video backend picked.
+        let mut s = app();
+        s.backend = VideoBackend::CopyVideo;
+        s.opus_bps = Some(192_000);
+        assert_eq!(s.effective_opus(), None);
+        assert!(!shrinkr_core::pipeline::forces_audio_reencode(
+            s.backend,
+            s.effective_opus()
+        ));
     }
 }

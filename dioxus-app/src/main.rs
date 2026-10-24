@@ -777,10 +777,13 @@ fn ShrinkEmpty() -> Element {
 fn PipelineCard() -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let s = state.read();
+    let lossless = s.lossless;
     let backend = s.backend;
     let preset = s.nvenc_preset;
-    let scale = s.scale;
-    let cq = s.cq;
+    // Effective values: Lossless pins quality/resolution/audio, so the
+    // controls display what a run will actually use, not the raw knobs.
+    let scale = s.effective_scale();
+    let cq = s.effective_cq();
     let image_cq = s.image_cq;
     let image_scale = s.image_scale;
     let image_preserve_format = s.image_preserve_format;
@@ -791,7 +794,7 @@ fn PipelineCard() -> Element {
     let min_saving = s.min_saving_pct;
     let parallel = s.parallel;
     let extra_args = s.extra_args.clone();
-    let opus_bps = s.opus_bps;
+    let opus_bps = s.effective_opus();
     // Audio-only pass (copy video + an explicit Opus target): size
     // thresholds don't apply, so the threshold controls disable themselves.
     let audio_only = backend == VideoBackend::CopyVideo && opus_bps.is_some();
@@ -823,6 +826,20 @@ fn PipelineCard() -> Element {
                 div { class: "flex flex-col gap-4",
                     if has_video {
                         GoalPicker {}
+                    }
+                    div { class: "flex flex-col gap-1",
+                        label { class: "flex items-center gap-2 text-sm",
+                            Checkbox {
+                                checked: lossless,
+                                on_checked_change: move |v| state.write().lossless = v,
+                            }
+                            "Lossless (no perceptible quality loss)"
+                        }
+                        if lossless {
+                            p { class: "text-xs text-muted-foreground",
+                                "Quality pinned to CQ 18 (visually lossless), resolution preserved, audio kept as-is instead of re-encoded. Backend, preset and Goal still trade speed for file size."
+                            }
+                        }
                     }
                     div { class: "grid grid-cols-1 gap-3 md:grid-cols-3",
                         div { class: "flex flex-col gap-1",
@@ -871,6 +888,7 @@ fn PipelineCard() -> Element {
                             Label { "Resolution" }
                             ScalePicker {
                                 value: scale,
+                                disabled: lossless,
                                 on_change: move |v| state.write().scale = v,
                             }
                         }
@@ -880,7 +898,8 @@ fn PipelineCard() -> Element {
                             Label { "Audio" }
                         }
                         select {
-                            class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
+                            class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm disabled:opacity-50 disabled:cursor-not-allowed",
+                            disabled: lossless,
                             onchange: move |e: FormEvent| {
                                 state.write().opus_bps = match e.value().as_str() {
                                     "off" => None,
@@ -914,6 +933,7 @@ fn PipelineCard() -> Element {
                         label { class: "flex items-center gap-2 text-sm",
                             Checkbox {
                                 checked: backend == VideoBackend::CopyVideo,
+                                disabled: lossless,
                                 on_checked_change: move |v| {
                                     let mut w = state.write();
                                     if v {
@@ -961,6 +981,7 @@ fn PipelineCard() -> Element {
                                 max: 40.0,
                                 step: 1.0,
                                 value: cq as f64,
+                                disabled: lossless,
                                 oninput: move |e: FormEvent| {
                                     if let Ok(v) = e.value().parse::<f64>() {
                                         state.write().cq = v.clamp(18.0, 40.0) as u32;
@@ -1161,10 +1182,18 @@ fn GoalPicker() -> Element {
     let backend = s.backend;
     let preset = s.nvenc_preset;
     let cq = s.cq;
+    // Under Lossless the quality value is pinned, so segments match on
+    // encoder + preset alone — the axis stays a working speed↔size
+    // control instead of never highlighting.
+    let lossless = s.lossless;
     let segs: Vec<(Goal, bool, Option<String>)> = Goal::ALL
         .iter()
         .map(|&goal| {
-            let active = goal.matches(backend, preset, cq, caps);
+            let active = if lossless {
+                goal.matches_lossless(backend, preset, caps)
+            } else {
+                goal.matches(backend, preset, cq, caps)
+            };
             let est = s.goal_estimate(goal);
             let line = est.saving_frac().map(|frac| {
                 let pct = -frac * 100.0;
@@ -1230,7 +1259,11 @@ fn GoalPicker() -> Element {
 /// the way to "1600") never clamp the field under the user's cursor —
 /// they commit to the policy only once they parse.
 #[component]
-fn ScalePicker(value: ScalePolicy, on_change: EventHandler<ScalePolicy>) -> Element {
+fn ScalePicker(
+    value: ScalePolicy,
+    on_change: EventHandler<ScalePolicy>,
+    #[props(optional)] disabled: bool,
+) -> Element {
     let is_custom = matches!(value, ScalePolicy::Custom(_, _));
     let mut wtext = use_signal(move || match value {
         ScalePolicy::Custom(w, _) => w.to_string(),
@@ -1254,7 +1287,8 @@ fn ScalePicker(value: ScalePolicy, on_change: EventHandler<ScalePolicy>) -> Elem
     rsx! {
         div { class: "flex flex-col gap-1",
             select {
-                class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
+                class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm disabled:opacity-50 disabled:cursor-not-allowed",
+                disabled,
                 onchange: move |e: FormEvent| {
                     match e.value().as_str() {
                         "1080p" => on_change.call(ScalePolicy::Force1080p),
@@ -1280,10 +1314,11 @@ fn ScalePicker(value: ScalePolicy, on_change: EventHandler<ScalePolicy>) -> Elem
             if is_custom {
                 div { class: "flex items-center gap-2",
                     input {
-                        class: "w-20 rounded-md border border-input bg-background px-2 py-1 text-sm",
+                        class: "w-20 rounded-md border border-input bg-background px-2 py-1 text-sm disabled:opacity-50 disabled:cursor-not-allowed",
                         r#type: "number",
                         min: "16",
                         max: "8192",
+                        disabled,
                         placeholder: "width",
                         value: "{wtext}",
                         oninput: move |e: FormEvent| {
@@ -1297,10 +1332,11 @@ fn ScalePicker(value: ScalePolicy, on_change: EventHandler<ScalePolicy>) -> Elem
                     }
                     span { class: "text-xs text-muted-foreground", "×" }
                     input {
-                        class: "w-20 rounded-md border border-input bg-background px-2 py-1 text-sm",
+                        class: "w-20 rounded-md border border-input bg-background px-2 py-1 text-sm disabled:opacity-50 disabled:cursor-not-allowed",
                         r#type: "number",
                         min: "16",
                         max: "8192",
+                        disabled,
                         placeholder: "height",
                         value: "{htext}",
                         oninput: move |e: FormEvent| {
