@@ -277,7 +277,7 @@ impl Default for AppState {
             image_preserve_format: true,
             keep_subs: true,
             all_audio: false,
-            opus_bps: Some(shrinkr_core::pipeline::DEFAULT_OPUS_BPS),
+            opus_bps: None,
             min_saving_pct: 10.0,
             skip_efficient: true,
             parallel: 2,

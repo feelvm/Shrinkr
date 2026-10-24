@@ -312,9 +312,7 @@ fn Header() -> Element {
                 h1 { class: "text-lg font-bold tracking-tight", "Shrinkr" }
             }
             div { class: "pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2",
-                if tools_ok {
-                    Badge { variant: BadgeVariant::Success, "ffmpeg ready" }
-                } else {
+                if !tools_ok {
                     Badge { variant: BadgeVariant::Destructive, "ffmpeg missing" }
                 }
             }
@@ -893,7 +891,7 @@ fn PipelineCard() -> Element {
                                 option { value: "x264", selected: backend == VideoBackend::CpuX264, "CPU x264 (CRF = slider)" }
                                 option { value: "x265", selected: backend == VideoBackend::CpuX265, "CPU x265 slow (CRF = slider)" }
                                 option { value: "av1", selected: backend == VideoBackend::CpuAv1, disabled: !caps.svt_av1, "CPU AV1 SVT (slow)" }
-                                option { value: "copy", selected: backend == VideoBackend::CopyVideo, "Copy video (audio-only — upscale audio)" }
+                                option { value: "copy", selected: backend == VideoBackend::CopyVideo, "Audio only" }
                             }
                         }
                         div { class: "flex flex-col gap-1",
@@ -1110,7 +1108,7 @@ fn PipelineCard() -> Element {
                                     max: 30.0,
                                     step: 1.0,
                                     value: min_saving,
-                                    disabled: audio_only,
+                                    disabled: audio_only || !skip_efficient,
                                     oninput: move |e: FormEvent| {
                                         if let Ok(v) = e.value().parse::<f64>() {
                                             state.write().min_saving_pct = v.clamp(0.0, 30.0);
