@@ -3,6 +3,7 @@
 
 use shrinkr_core::bench::BenchRow;
 use shrinkr_core::convert::MediaKind;
+use shrinkr_core::hw::HwCaps;
 use shrinkr_core::log::{LevelFilter, LogEntry};
 use shrinkr_core::media::MediaFile;
 use shrinkr_core::pipeline::{
@@ -10,6 +11,112 @@ use shrinkr_core::pipeline::{
     ThresholdPolicy, VideoBackend,
 };
 use std::path::PathBuf;
+
+/// The three video goals on the single speed↔size axis. The names state
+/// the trade-off; position on the axis (Fastest → Balanced → Smallest)
+/// is the explanation. Resolution is capability-driven: each goal maps
+/// to the best encoder this machine can actually run, like Auto does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Goal {
+    Fastest,
+    Balanced,
+    Smallest,
+}
+
+impl Goal {
+    pub const ALL: [Goal; 3] = [Goal::Fastest, Goal::Balanced, Goal::Smallest];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Goal::Fastest => "Fastest",
+            Goal::Balanced => "Balanced",
+            Goal::Smallest => "Smallest",
+        }
+    }
+
+    /// Second line shown on the segment before files are loaded, once
+    /// per-goal estimates take over. Says the axis position in words.
+    pub fn subtitle(&self) -> &'static str {
+        match self {
+            Goal::Fastest => "least shrink",
+            Goal::Balanced => "default",
+            Goal::Smallest => "most shrink",
+        }
+    }
+
+    /// `(backend, nvenc preset, cq)` this goal runs as on this machine.
+    /// Fastest keeps Balanced's CQ so quality stays constant across the
+    /// fast half of the axis — the trade-off there is purely speed vs
+    /// size (P4 encodes quicker than P5 at the same CQ, files come out
+    /// bigger). Smallest is capability-driven: HEVC NVENC P6 when the GPU
+    /// can, SVT-AV1 (the max-shrink CPU path) when it can't, Auto
+    /// otherwise; its higher CQ is the extra squeeze the name promises.
+    pub fn resolve(&self, caps: &HwCaps) -> (VideoBackend, NvencPreset, u32) {
+        match self {
+            Goal::Fastest => (VideoBackend::Auto, NvencPreset::P4, 28),
+            Goal::Balanced => (VideoBackend::Auto, NvencPreset::P5, 28),
+            Goal::Smallest => {
+                if caps.hevc_nvenc {
+                    (VideoBackend::HevcNvenc, NvencPreset::P6, 32)
+                } else if caps.svt_av1 {
+                    (VideoBackend::CpuAv1, NvencPreset::P5, 32)
+                } else {
+                    (VideoBackend::Auto, NvencPreset::P6, 32)
+                }
+            }
+        }
+    }
+
+    /// Whether the current settings triple sits on this goal's spot.
+    /// The NVENC preset is ignored for SVT-AV1 (it has none of its own);
+    /// everything else must match exactly, so manual knob edits read as
+    /// custom settings with no segment highlighted.
+    pub fn matches(
+        &self,
+        backend: VideoBackend,
+        preset: NvencPreset,
+        cq: u32,
+        caps: &HwCaps,
+    ) -> bool {
+        let (b, p, c) = self.resolve(caps);
+        let av1_no_preset = b == VideoBackend::CpuAv1;
+        backend == b && cq == c && (av1_no_preset || preset == p)
+    }
+}
+
+/// Measured-fps table for wall-time estimates. Shared by the batch
+/// estimate and the per-goal segment estimates.
+fn backend_fps(backend: VideoBackend) -> f64 {
+    match backend {
+        VideoBackend::CpuX264 => 90.0,
+        VideoBackend::CpuX265 => 45.0,
+        VideoBackend::CpuAv1 => 120.0, // SVT-AV1 preset 8, measured 145+ fps
+        _ => 600.0,
+    }
+}
+
+/// Per-goal estimate over the video library: `estimate_file` is
+/// analytical, so three of these cost about as much as the one batch
+/// estimate and can run inline on every render.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GoalEstimate {
+    pub total_b: u64,
+    pub new_b: u64,
+    pub secs: f64,
+}
+
+impl GoalEstimate {
+    /// Shrink as a fraction of input (negative = the plan grows; only
+    /// possible in exotic settings since below-threshold files are
+    /// excluded). `None` when there are no eligible videos.
+    pub fn saving_frac(&self) -> Option<f64> {
+        if self.total_b == 0 {
+            None
+        } else {
+            Some((self.new_b as f64 - self.total_b as f64) / self.total_b as f64)
+        }
+    }
+}
 use std::sync::{atomic::AtomicBool, Arc};
 
 /// Encode settings snapshot for chained batches: files queued mid-run
@@ -81,6 +188,9 @@ pub struct AppState {
     pub probe_done: usize,
     pub probe_total: usize,
     pub backend: VideoBackend,
+    /// Backend to restore when Audio-only is switched off (checked state
+    /// is derived from `backend == CopyVideo`).
+    pub last_video_backend: VideoBackend,
     pub nvenc_preset: NvencPreset,
     pub cq: u32,
     pub scale: ScalePolicy,
@@ -269,6 +379,7 @@ impl Default for AppState {
             probe_done: 0,
             probe_total: 0,
             backend: VideoBackend::Auto,
+            last_video_backend: VideoBackend::Auto,
             nvenc_preset: NvencPreset::P5,
             cq: 28,
             scale: ScalePolicy::Preserve,
@@ -432,15 +543,42 @@ impl AppState {
         }
         let total_b: u64 = idx.iter().map(|&i| self.files[i].bytes).sum();
         let saved = new_b as i64 - total_b as i64;
-        let fps = match self.backend {
-            VideoBackend::CpuX264 => 90.0,
-            VideoBackend::CpuX265 => 45.0,
-            VideoBackend::CpuAv1 => 120.0, // SVT-AV1 preset 8, measured 145+ fps
-            _ => 600.0,
-        };
+        let fps = backend_fps(self.backend);
         let video_secs = total_frames / fps / (self.parallel.max(1) as f64);
         let image_secs = image_count as f64 * 0.35 / (self.parallel.max(1) as f64);
         (total_b, new_b, saved, video_secs + image_secs)
+    }
+
+    /// Per-goal estimate over the video library: the goal's encoder and
+    /// quality substituted into the current settings, everything else
+    /// (resolution, audio, images) as configured. These numbers are what
+    /// the Goal segments display, so the speed↔size trade-off is stated
+    /// in the batch's own bytes and minutes.
+    pub fn goal_estimate(&self, goal: Goal) -> GoalEstimate {
+        let caps = shrinkr_core::hw::caps();
+        let (backend, preset, cq) = goal.resolve(caps);
+        let mut p = self.est_params();
+        p.backend = backend;
+        p.preset = preset;
+        p.cq = cq;
+        let t = self.threshold();
+        let policy = self.threshold_policy();
+        let mut est = GoalEstimate::default();
+        for f in &self.files {
+            if shrinkr_core::images::is_shrinkable_image(&f.path) {
+                // Images don't differ across goals — they'd dilute the
+                // segment contrast with three identical numbers.
+                continue;
+            }
+            if !preflight_auto_with(f, &p, t, policy).will_shrink() {
+                continue;
+            }
+            est.total_b += f.bytes;
+            est.new_b += estimate_file(f, &p).new_bytes;
+            est.secs += f.total_frames() / backend_fps(backend);
+        }
+        est.secs /= self.parallel.max(1) as f64;
+        est
     }
 
     /// (filename, resolution, verdict) rows for the plan list. Resolution

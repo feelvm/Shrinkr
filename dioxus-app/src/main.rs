@@ -33,7 +33,7 @@ use shrinkr_core::media::human_bytes;
 use shrinkr_core::pipeline::{
     preflight_auto_with, size_change_label, NvencPreset, Preflight, ScalePolicy, VideoBackend,
 };
-use state::AppState;
+use state::{AppState, Goal};
 use std::sync::{atomic::AtomicBool, Arc};
 
 /// 64x64 RGBA dump of assets/icons/icon.png; decoded at compile time to
@@ -822,52 +822,7 @@ fn PipelineCard() -> Element {
             CardContent {
                 div { class: "flex flex-col gap-4",
                     if has_video {
-                        div { class: "flex flex-col gap-3",
-                            p { class: "text-xs font-semibold text-muted-foreground", "Presets" }
-                            div { class: "flex flex-wrap gap-2",
-                        Button {
-                            variant: ButtonVariant::Outline,
-                            onclick: move |_| {
-                                let mut w = state.write();
-                                w.backend = VideoBackend::Auto;
-                                w.nvenc_preset = NvencPreset::P5;
-                                w.cq = 28;
-                            },
-                            "Fast GPU"
-                        }
-                        Button {
-                            variant: ButtonVariant::Outline,
-                            disabled: !caps.hevc_nvenc,
-                            onclick: move |_| {
-                                let mut w = state.write();
-                                w.backend = VideoBackend::HevcNvenc;
-                                w.nvenc_preset = NvencPreset::P6;
-                                w.cq = 32;
-                            },
-                            "Smaller GPU"
-                        }
-                        Button {
-                            variant: ButtonVariant::Outline,
-                            onclick: move |_| {
-                                let mut w = state.write();
-                                w.backend = VideoBackend::CpuX265;
-                                w.parallel = 1;
-                            },
-                            "Max CPU shrink"
-                        }
-                        Button {
-                            variant: ButtonVariant::Outline,
-                            onclick: move |_| {
-                                let mut w = state.write();
-                                w.backend = VideoBackend::CopyVideo;
-                                // An upscale needs a target; the 64k default
-                                // would just re-copy most sources.
-                                if w.opus_bps.is_none() {
-                                    w.opus_bps = Some(192_000);
-                                }
-                            },
-                            "Upscale audio"
-                        }
+                        GoalPicker {}
                     }
                     div { class: "grid grid-cols-1 gap-3 md:grid-cols-3",
                         div { class: "flex flex-col gap-1",
@@ -951,6 +906,38 @@ fn PipelineCard() -> Element {
                                 }
                             }
                         }
+                        // Lives beside the audio settings it drives, not in
+                        // the Goal ladder: it's a remux-speed mode where the
+                        // speed↔size trade-off doesn't apply. Checked state
+                        // derives from the backend, so picking Copy video in
+                        // the backend dropdown checks it too.
+                        label { class: "flex items-center gap-2 text-sm",
+                            Checkbox {
+                                checked: backend == VideoBackend::CopyVideo,
+                                on_checked_change: move |v| {
+                                    let mut w = state.write();
+                                    if v {
+                                        if w.backend != VideoBackend::CopyVideo {
+                                            w.last_video_backend = w.backend;
+                                        }
+                                        w.backend = VideoBackend::CopyVideo;
+                                        // An upscale needs a target; the 64k
+                                        // default would just re-copy most sources.
+                                        if w.opus_bps.is_none() {
+                                            w.opus_bps = Some(192_000);
+                                        }
+                                    } else {
+                                        w.backend =
+                                            if w.last_video_backend == VideoBackend::CopyVideo {
+                                                VideoBackend::Auto
+                                            } else {
+                                                w.last_video_backend
+                                            };
+                                    }
+                                },
+                            }
+                            "Audio only (video copied)"
+                        }
                     }
                     div { class: "flex items-center gap-3",
                         div { class: "w-28 shrink-0",
@@ -1014,8 +1001,6 @@ fn PipelineCard() -> Element {
                         }
                         p { class: "text-xs text-muted-foreground",
                             "Appended as output options (can override quality flags). Estimates ignore them. Blocked: -i -map -ss -t -f -y -c:s and other structural flags."
-                        }
-                    }
                         }
                     }
                     if has_image {
@@ -1143,6 +1128,96 @@ fn PipelineCard() -> Element {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Wall-time estimate formatted for a segment line: seconds under 90 s,
+/// minutes under 90 min, hours beyond.
+fn fmt_secs(secs: f64) -> String {
+    if secs < 90.0 {
+        format!("{secs:.0}s")
+    } else if secs < 5400.0 {
+        format!("{:.0} min", secs / 60.0)
+    } else {
+        format!("{:.1} h", secs / 3600.0)
+    }
+}
+
+/// The Goal control: one speed↔size axis rendered as a segmented control —
+/// position on the axis *is* the trade-off, and the caption labels the two
+/// ends. With videos loaded, each segment carries the batch's own numbers
+/// (shrink % and estimated wall time) instead of adjectives, so the
+/// trade-off is read off real files rather than an explainer. Selection is
+/// derived by matching the current settings against each goal's resolved
+/// triple, so hand-tuning any knob drops the highlight instead of fighting
+/// the user.
+#[component]
+fn GoalPicker() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let s = state.read();
+    let caps = shrinkr_core::hw::caps();
+    let backend = s.backend;
+    let preset = s.nvenc_preset;
+    let cq = s.cq;
+    let segs: Vec<(Goal, bool, Option<String>)> = Goal::ALL
+        .iter()
+        .map(|&goal| {
+            let active = goal.matches(backend, preset, cq, caps);
+            let est = s.goal_estimate(goal);
+            let line = est.saving_frac().map(|frac| {
+                let pct = -frac * 100.0;
+                if pct >= 0.0 {
+                    format!("{pct:.0}% · ~{}", fmt_secs(est.secs))
+                } else {
+                    format!("+{:.0}% · ~{}", -pct, fmt_secs(est.secs))
+                }
+            });
+            (goal, active, line)
+        })
+        .collect();
+    drop(s);
+    rsx! {
+        div { class: "flex flex-col gap-1",
+            p { class: "text-xs font-semibold text-muted-foreground", "Goal" }
+            div { class: "inline-flex w-fit divide-x divide-border overflow-hidden rounded-md border border-input",
+                for (goal, active, line) in segs {
+                    {
+                        let base = "flex min-w-32 flex-col items-center gap-0.5 px-4 py-2 text-sm transition-colors";
+                        let seg_cls = if active {
+                            format!("{base} bg-primary text-primary-foreground")
+                        } else {
+                            format!("{base} text-muted-foreground hover:bg-accent hover:text-accent-foreground")
+                        };
+                        let sub_cls = if active {
+                            "text-xs text-primary-foreground/75"
+                        } else {
+                            "text-xs text-muted-foreground/75"
+                        };
+                        let sub = line.unwrap_or_else(|| goal.subtitle().to_string());
+                        rsx! {
+                            button {
+                                key: "{goal:?}",
+                                class: "{seg_cls}",
+                                onclick: move |_| {
+                                    let caps = shrinkr_core::hw::caps();
+                                    let (b, p, c) = goal.resolve(caps);
+                                    let mut w = state.write();
+                                    w.backend = b;
+                                    w.nvenc_preset = p;
+                                    w.cq = c;
+                                },
+                                span { class: "font-medium", "{goal.label()}" }
+                                span { class: "{sub_cls}", "{sub}" }
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "flex w-fit min-w-full justify-between text-xs text-muted-foreground",
+                span { "← faster · bigger files" }
+                span { "smaller · slower →" }
             }
         }
     }
