@@ -214,8 +214,8 @@ pub struct SolveOutcome {
 }
 
 /// Solve the CRF hitting `spec` for one file with the exact pipeline
-/// settings (backend/preset/scale/audio/subs/extras). Encodes small
-/// samples, so NVENC solves take seconds; CPU backends take minutes.
+/// settings (backend/preset/scale/audio/subs/extras/film-grain). Encodes
+/// small samples, so NVENC solves take seconds; CPU backends take minutes.
 /// `cq0` is the current slider value (one probe point); the other is
 /// `cq0+4` (or below when the slider is already maxed).
 #[allow(clippy::too_many_arguments)]
@@ -229,6 +229,7 @@ pub fn solve_crf_for_file(
     extra_args: &[String],
     opus_bps: Option<u32>,
     all_audio: bool,
+    film_grain: bool,
     spec: &TargetSpec,
     work_dir: &Path,
     on_step: &dyn Fn(&str),
@@ -318,6 +319,7 @@ pub fn solve_crf_for_file(
                     extra_args,
                     opus_bps,
                     all_audio,
+                    film_grain,
                     &|_| {},
                     &cancel,
                 )

@@ -1,11 +1,23 @@
 //! Pipeline selection: preflight, resolution policy and fallback hierarchy.
 //!
-//! Fallback hierarchy (runtime capability driven):
+//! Fallback hierarchy (runtime capability driven), NVIDIA box:
 //!
 //! 1. NVDEC/CUDA hardware decode + HEVC NVENC (zero-copy GPU path)
 //! 2. Hardware decode + H.264 NVENC (HEVC unavailable)
 //! 3. CPU decode + NVENC (HW decode failed, encoder works)
 //! 4. CPU x264 (final fallback; x265 kept as legacy option)
+//!
+//! On machines without NVENC the ladder continues through the other vendor
+//! families before reaching the CPU: VideoToolbox (Apple) → Quick Sync
+//! (Intel) → AMF (AMD) → x264. Auto stays HEVC-first for playback
+//! compatibility; the AV1 hardware encoders are reached through the
+//! Balanced/Smallest goals or explicit backend selection.
+//!
+//! Encode levels that consume system-memory frames (CPU encoders and the
+//! VT/QSV/AMF families, which upload internally) get a `-hwaccel auto`
+//! decode assist, so NVDEC/QSV/VideoToolbox decode feeds them when
+//! available — the encoder sees identical frames, only the wall clock
+//! improves.
 //!
 //! The [`VideoBackend`] / [`NvencPreset`] / [`ScalePolicy`] types are the
 //! knobs the UI and benchmark matrix drive. [`select_levels`] turns a mode
@@ -16,16 +28,32 @@ use crate::media::MediaFile;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VideoBackend {
-    /// Ordered fallback L1 → L4 driven by [`HwCaps`].
+    /// Ordered fallback ladder driven by [`HwCaps`] across all families.
     Auto,
+    /// AV1 NVENC (RTX 40/50): ~20–30% smaller than HEVC NVENC at the same
+    /// speed — the free-savings engine on Ada+. Hidden unless the trial
+    /// encode passed.
+    Av1Nvenc,
     HevcNvenc,
     H264Nvenc,
+    /// Apple VideoToolbox HEVC (macOS release builds; the encoder exists
+    /// only there and its `-q:v` quality mode is Apple-Silicon-only, which
+    /// matches the shipped target).
+    VtHevc,
+    /// Intel Quick Sync HEVC.
+    QsvHevc,
+    /// Intel Quick Sync AV1 (Arc): hidden unless the ICQ trial passed.
+    QsvAv1,
+    /// AMD AMF HEVC.
+    AmfHevc,
+    /// AMD AMF AV1 (RX 7000+): hidden unless the CQP trial passed.
+    AmfAv1,
     /// Baseline for benchmarks: libx264 CRF 28.
     CpuX264,
     /// Legacy CPU path (kept working, not the default).
     CpuX265,
-    /// Max-shrink CPU path: SVT-AV1 preset 8, CRF = the CQ slider value.
-    /// Software encode on the CPU (Ryzen path); needs libsvtav1 in ffmpeg.
+    /// Max-shrink CPU path: SVT-AV1 (preset from the shared P-knob, CRF =
+    /// the CQ slider value). Software encode on the CPU; needs libsvtav1.
     CpuAv1,
     /// Audio-only pass: video stream-copied untouched (any codec), audio
     /// converted per the audio setting (the target is an instruction, so
@@ -39,9 +67,15 @@ pub enum VideoBackend {
 impl VideoBackend {
     pub fn label(&self) -> &'static str {
         match self {
-            VideoBackend::Auto => "Auto (NVDEC+HEVC NVENC → H.264 → CPU)",
+            VideoBackend::Auto => "Auto (best HW encoder → CPU)",
+            VideoBackend::Av1Nvenc => "NVENC AV1 (RTX 40+, GPU decode)",
             VideoBackend::HevcNvenc => "NVENC HEVC (prefer GPU decode)",
             VideoBackend::H264Nvenc => "NVENC H.264 (compat/fallback)",
+            VideoBackend::VtHevc => "VideoToolbox HEVC (Apple GPU)",
+            VideoBackend::QsvHevc => "Quick Sync HEVC (Intel GPU)",
+            VideoBackend::QsvAv1 => "Quick Sync AV1 (Intel Arc)",
+            VideoBackend::AmfHevc => "AMF HEVC (AMD GPU)",
+            VideoBackend::AmfAv1 => "AMF AV1 (AMD RX 7000+)",
             VideoBackend::CpuX264 => "CPU x264 (CRF = quality slider)",
             VideoBackend::CpuX265 => "CPU x265 slow (CRF = quality slider)",
             VideoBackend::CpuAv1 => "CPU AV1 SVT (max shrink, slow)",
@@ -52,6 +86,16 @@ impl VideoBackend {
     /// True when the CQ slider means SVT-AV1 CRF rather than NVENC CQ.
     pub fn cq_is_av1_crf(&self) -> bool {
         matches!(self, VideoBackend::CpuAv1)
+    }
+
+    /// True when this mode encodes HEVC/AV1 through one of the hardware
+    /// families that consume system-memory frames (upload inside the
+    /// encoder). Used by the estimator to pick the family's size table.
+    pub fn is_hw_upload_family(&self) -> bool {
+        matches!(
+            self,
+            VideoBackend::VtHevc | VideoBackend::QsvHevc | VideoBackend::AmfHevc
+        )
     }
 }
 
@@ -88,6 +132,38 @@ impl NvencPreset {
             NvencPreset::P4 => "P4 (medium, NVENC default)",
             NvencPreset::P5 => "P5 (slow, good quality)",
             NvencPreset::P6 => "P6 (slower, better quality)",
+        }
+    }
+
+    /// The same knob mapped onto SVT-AV1's preset scale (1–13, lower =
+    /// slower & smaller). P5 — the app default — is SVT preset 8, the
+    /// established sweet spot; each P step moves SVT by one preset, so
+    /// the shared control is a speed↔size lever on the CPU path too.
+    pub fn svt(&self) -> u8 {
+        match self {
+            NvencPreset::P3 => 6,
+            NvencPreset::P4 => 7,
+            NvencPreset::P5 => 8,
+            NvencPreset::P6 => 9,
+        }
+    }
+
+    /// Mapped onto Quick Sync's named presets.
+    pub fn qsv(&self) -> &'static str {
+        match self {
+            NvencPreset::P3 => "veryfast",
+            NvencPreset::P4 => "faster",
+            NvencPreset::P5 => "medium",
+            NvencPreset::P6 => "slow",
+        }
+    }
+
+    /// Mapped onto AMF's quality-speed modes.
+    pub fn amf(&self) -> &'static str {
+        match self {
+            NvencPreset::P3 => "speed",
+            NvencPreset::P4 => "balanced",
+            NvencPreset::P5 | NvencPreset::P6 => "quality",
         }
     }
 }
@@ -145,15 +221,35 @@ pub enum Level {
     HwHevc,
     /// Same decode path + h264_nvenc.
     HwH264,
+    /// Zero-copy CUDA path + av1_nvenc (RTX 40/50).
+    HwAv1,
     /// CPU decode + hevc_nvenc upload.
     CpuDecodeHevcNvenc,
     /// CPU decode + h264_nvenc upload.
     CpuDecodeH264Nvenc,
+    /// CPU decode + av1_nvenc upload.
+    CpuDecodeAv1Nvenc,
+    /// Apple VideoToolbox HEVC (`-q:v` quality, uploads internally).
+    VtHevc,
+    /// Apple VideoToolbox H.264.
+    VtH264,
+    /// Intel Quick Sync HEVC (ICQ via `-global_quality`).
+    QsvHevc,
+    /// Intel Quick Sync H.264.
+    QsvH264,
+    /// Intel Quick Sync AV1 (Arc).
+    QsvAv1,
+    /// AMD AMF HEVC (CQP).
+    AmfHevc,
+    /// AMD AMF H.264.
+    AmfH264,
+    /// AMD AMF AV1 (RX 7000+).
+    AmfAv1,
     /// libx264 fallback.
     CpuX264,
     /// libx265 legacy.
     CpuX265,
-    /// SVT-AV1 software encode (preset 8, CRF = CQ slider).
+    /// SVT-AV1 software encode (preset from the P-knob, CRF = CQ slider).
     CpuAv1,
     /// Stream-copy video untouched (any input codec).
     CopyVideo,
@@ -164,61 +260,182 @@ impl Level {
         match self {
             Level::HwHevc | Level::CpuDecodeHevcNvenc => "hevc_nvenc",
             Level::HwH264 | Level::CpuDecodeH264Nvenc => "h264_nvenc",
+            Level::HwAv1 | Level::CpuDecodeAv1Nvenc => "av1_nvenc",
+            Level::VtHevc => "hevc_videotoolbox",
+            Level::VtH264 => "h264_videotoolbox",
+            Level::QsvHevc => "hevc_qsv",
+            Level::QsvH264 => "h264_qsv",
+            Level::QsvAv1 => "av1_qsv",
+            Level::AmfHevc => "hevc_amf",
+            Level::AmfH264 => "h264_amf",
+            Level::AmfAv1 => "av1_amf",
             Level::CpuX264 => "libx264",
             Level::CpuX265 => "libx265",
             Level::CpuAv1 => "libsvtav1",
             Level::CopyVideo => "copy",
         }
     }
+    /// True for the explicit zero-copy CUDA levels (decode stays on the GPU).
     pub fn uses_hw_decode(&self) -> bool {
-        matches!(self, Level::HwHevc | Level::HwH264)
+        matches!(self, Level::HwHevc | Level::HwH264 | Level::HwAv1)
     }
     pub fn uses_nvenc(&self) -> bool {
         matches!(
             self,
-            Level::HwHevc | Level::HwH264 | Level::CpuDecodeHevcNvenc | Level::CpuDecodeH264Nvenc
+            Level::HwHevc
+                | Level::HwH264
+                | Level::HwAv1
+                | Level::CpuDecodeHevcNvenc
+                | Level::CpuDecodeH264Nvenc
+                | Level::CpuDecodeAv1Nvenc
         )
     }
+}
+
+/// The NVENC-family ladder (shared by Auto and the explicit NVENC modes):
+/// zero-copy first when CUDA decode exists, then CPU-decode NVENC uploads.
+fn nvenc_hevc_ladder(caps: &HwCaps) -> Vec<Level> {
+    let mut v = vec![];
+    if caps.cuda_hwaccel && caps.hevc_nvenc {
+        v.push(Level::HwHevc);
+    }
+    if caps.hevc_nvenc {
+        v.push(Level::CpuDecodeHevcNvenc);
+    }
+    v
+}
+
+fn nvenc_h264_ladder(caps: &HwCaps) -> Vec<Level> {
+    let mut v = vec![];
+    if caps.cuda_hwaccel && caps.h264_nvenc {
+        v.push(Level::HwH264);
+    }
+    if caps.h264_nvenc {
+        v.push(Level::CpuDecodeH264Nvenc);
+    }
+    v
+}
+
+/// The non-NVIDIA hardware families in Auto's preference order. Mutually
+/// exclusive on real machines in practice; when more than one exists
+/// (Intel iGPU + NVIDIA dGPU), NVENC's own ladder already ran first.
+fn other_families_hevc_ladder(caps: &HwCaps) -> Vec<Level> {
+    let mut v = vec![];
+    if caps.vt_hevc {
+        v.push(Level::VtHevc);
+    }
+    if caps.vt_h264 {
+        v.push(Level::VtH264);
+    }
+    if caps.qsv_hevc {
+        v.push(Level::QsvHevc);
+    }
+    if caps.qsv_h264 {
+        v.push(Level::QsvH264);
+    }
+    if caps.amf_hevc {
+        v.push(Level::AmfHevc);
+    }
+    if caps.amf_h264 {
+        v.push(Level::AmfH264);
+    }
+    v
 }
 
 /// Ordered attempt list for a mode + detected caps.
 pub fn select_levels(mode: VideoBackend, caps: &HwCaps) -> Vec<Level> {
     match mode {
         VideoBackend::Auto => {
+            // HEVC-first for playback compatibility: every TV/phone decodes
+            // HEVC, AV1 support is still spottier. AV1 hardware is reached
+            // through the Balanced/Smallest goals or explicit selection.
+            let mut v = nvenc_hevc_ladder(caps);
+            v.extend(nvenc_h264_ladder(caps));
+            v.extend(other_families_hevc_ladder(caps));
+            v.push(Level::CpuX264);
+            v
+        }
+        VideoBackend::Av1Nvenc => {
             let mut v = vec![];
-            if caps.cuda_hwaccel && caps.hevc_nvenc {
-                v.push(Level::HwHevc);
+            if caps.av1_nvenc_usable {
+                if caps.cuda_hwaccel {
+                    v.push(Level::HwAv1);
+                }
+                v.push(Level::CpuDecodeAv1Nvenc);
             }
-            if caps.cuda_hwaccel && caps.h264_nvenc {
-                v.push(Level::HwH264);
-            }
-            if caps.hevc_nvenc {
-                v.push(Level::CpuDecodeHevcNvenc);
-            }
-            if caps.h264_nvenc {
-                v.push(Level::CpuDecodeH264Nvenc);
-            }
+            // Encoder unusable (or its HW decode failed): keep the GPU busy
+            // with NVENC HEVC rather than dropping straight to the CPU.
+            v.extend(nvenc_hevc_ladder(caps));
             v.push(Level::CpuX264);
             v
         }
         VideoBackend::HevcNvenc => {
-            let mut v = vec![];
-            if caps.cuda_hwaccel && caps.hevc_nvenc {
-                v.push(Level::HwHevc);
-            }
-            if caps.hevc_nvenc {
-                v.push(Level::CpuDecodeHevcNvenc);
-            }
+            let mut v = nvenc_hevc_ladder(caps);
             v.push(Level::CpuX264);
             v
         }
         VideoBackend::H264Nvenc => {
+            let mut v = nvenc_h264_ladder(caps);
+            v.push(Level::CpuX264);
+            v
+        }
+        VideoBackend::VtHevc => {
             let mut v = vec![];
-            if caps.cuda_hwaccel && caps.h264_nvenc {
-                v.push(Level::HwH264);
+            if caps.vt_hevc {
+                v.push(Level::VtHevc);
             }
-            if caps.h264_nvenc {
-                v.push(Level::CpuDecodeH264Nvenc);
+            if caps.vt_h264 {
+                v.push(Level::VtH264);
+            }
+            v.push(Level::CpuX264);
+            v
+        }
+        VideoBackend::QsvHevc => {
+            let mut v = vec![];
+            if caps.qsv_hevc {
+                v.push(Level::QsvHevc);
+            }
+            if caps.qsv_h264 {
+                v.push(Level::QsvH264);
+            }
+            v.push(Level::CpuX264);
+            v
+        }
+        VideoBackend::QsvAv1 => {
+            let mut v = vec![];
+            if caps.qsv_av1_usable {
+                v.push(Level::QsvAv1);
+            }
+            if caps.qsv_hevc {
+                v.push(Level::QsvHevc);
+            }
+            if caps.qsv_h264 {
+                v.push(Level::QsvH264);
+            }
+            v.push(Level::CpuX264);
+            v
+        }
+        VideoBackend::AmfHevc => {
+            let mut v = vec![];
+            if caps.amf_hevc {
+                v.push(Level::AmfHevc);
+            }
+            if caps.amf_h264 {
+                v.push(Level::AmfH264);
+            }
+            v.push(Level::CpuX264);
+            v
+        }
+        VideoBackend::AmfAv1 => {
+            let mut v = vec![];
+            if caps.amf_av1_usable {
+                v.push(Level::AmfAv1);
+            }
+            if caps.amf_hevc {
+                v.push(Level::AmfHevc);
+            }
+            if caps.amf_h264 {
+                v.push(Level::AmfH264);
             }
             v.push(Level::CpuX264);
             v
@@ -393,6 +610,12 @@ pub struct EstParams {
     /// format conversions (png→jpeg, alpha→webp) are suppressed — a file
     /// that can't win as its own format skips instead of converting.
     pub image_preserve_format: bool,
+    /// SVT-AV1 film-grain synthesis: on dense/grainy sources (the density
+    /// model's flag) the encoder denoises, encodes the clean picture, and
+    /// the decoder regenerates statistically-similar grain — 30–50% smaller
+    /// on exactly the files the plain model predicts poorly. The grain is
+    /// synthetic, which is why this stays a visible switch.
+    pub film_grain: bool,
 }
 
 /// Default Opus target: transparent-ish stereo, lean 5.1.
@@ -488,13 +711,18 @@ pub fn cq_factor(cq: u32) -> f64 {
 }
 
 /// Preset multiplier relative to P5 (the default). Fast presets spend
-/// more bits for the same CQ; P6 squeezes a little more.
+/// more bits for the same CQ; P6 squeezes a little more. Applies to the
+/// NVENC P-series and (via the mapped named presets) Quick Sync; the
+/// VideoToolbox and AMF families have no preset axis of their own.
 pub fn preset_factor(backend: VideoBackend, preset: NvencPreset) -> f64 {
     match backend {
         VideoBackend::CpuX264
         | VideoBackend::CpuX265
         | VideoBackend::CpuAv1
-        | VideoBackend::CopyVideo => 1.0,
+        | VideoBackend::CopyVideo
+        | VideoBackend::VtHevc
+        | VideoBackend::AmfHevc
+        | VideoBackend::AmfAv1 => 1.0,
         _ => match preset {
             NvencPreset::P3 => 1.12,
             NvencPreset::P4 => 1.04,
@@ -521,8 +749,13 @@ fn quality_label(p: &EstParams) -> String {
     match p.backend {
         VideoBackend::CpuX264 => format!("x264 crf{}", p.cq),
         VideoBackend::CpuX265 => format!("x265 slow crf{}", p.cq),
-        VideoBackend::CpuAv1 => format!("svt-av1 p8 crf{}", p.cq),
+        VideoBackend::CpuAv1 => format!("svt-av1 p{} crf{}", p.preset.svt(), p.cq),
         VideoBackend::CopyVideo => "copy video".into(),
+        VideoBackend::VtHevc => format!("vt-hevc cq{}", p.cq),
+        VideoBackend::QsvHevc => format!("qsv-hevc icq{} {}", p.cq, p.preset.qsv()),
+        VideoBackend::QsvAv1 => format!("qsv-av1 icq{}", p.cq),
+        VideoBackend::AmfHevc => format!("amf-hevc qp{} {}", p.cq, p.preset.amf()),
+        VideoBackend::AmfAv1 => format!("amf-av1 qp{}", p.cq),
         _ => format!("cq{} {}", p.cq, p.preset.as_str()),
     }
 }
@@ -531,12 +764,22 @@ fn quality_label(p: &EstParams) -> String {
 /// Opus), split via stream bitrate when known.
 pub fn estimate_file(m: &MediaFile, p: &EstParams) -> FileEstimate {
     let density = source_density(m);
+    // Film-grain synthesis denoises before encoding, so a dense/grainy
+    // source stops behaving like one: the density penalty (which exists
+    // because grain is brutally expensive to encode) no longer applies in
+    // full. Floor the modeled density at 0.8 — optimistic beyond that,
+    // since the denoiser still leaves real structure to encode.
+    let eff_density = if fgs_applies(m, p.backend, p.film_grain) {
+        density.max(0.8)
+    } else {
+        density
+    };
     // CQ-mode output size is content-driven: grainy/dense sources cost
     // nearly as many bits in HEVC as they did in H.264, while clean
     // sources collapse. The base table assumes typical density, so scale
     // the *saving* by observed density (measured: 8 Mbps noisy 1080p saved
     // ~1% at CQ28 where the raw table predicted 25%).
-    let base = 1.0 - (1.0 - est_ratio(&m.vcodec, p.backend)) * density;
+    let base = 1.0 - (1.0 - est_ratio(&m.vcodec, p.backend)) * eff_density;
     // CQ/CRF curve around the 28 reference. Tables above are calibrated at
     // 28 for every backend (NVENC CQ, x264/x265 CRF, SVT CRF), so the same
     // ≈7%-per-point factor applies to all — the shared quality slider is
@@ -673,6 +916,21 @@ fn source_density(m: &MediaFile) -> f64 {
     (typical / bpp).clamp(0.35, 1.15)
 }
 
+/// True when the source models as dense/grainy — the files the density
+/// correction punishes and the ones film-grain synthesis exists for.
+/// Shared by the estimator and the command builder so both agree.
+pub(crate) fn is_dense_source(m: &MediaFile) -> bool {
+    source_density(m) < 0.7
+}
+
+/// Film-grain synthesis engages on SVT-AV1 encodes when enabled and the
+/// source models as dense/grainy. Clean sources gain nothing from it
+/// (there is no grain to synthesise) and pay the denoise pass, so it
+/// stays off there.
+pub(crate) fn fgs_applies(m: &MediaFile, backend: VideoBackend, film_grain: bool) -> bool {
+    film_grain && backend == VideoBackend::CpuAv1 && is_dense_source(m)
+}
+
 /// Decide shrink vs skip.
 ///
 /// * `min_saving_pct` is the configurable threshold (e.g. 10 → skip when
@@ -784,7 +1042,9 @@ pub fn preflight_with(
             None => m.res_label(),
         }
     };
-    let dense_note = if est.density < 0.7 {
+    let dense_note = if fgs_applies(m, p.backend, p.film_grain) {
+        "; grainy source — AV1 film-grain synthesis on"
+    } else if est.density < 0.7 {
         "; dense/grainy source"
     } else {
         ""
@@ -859,7 +1119,10 @@ pub fn preflight_auto_with(
 }
 
 fn est_ratio(vcodec: &str, backend: VideoBackend) -> f64 {
-    match backend {
+    // Bench calibration (when a benchmark has run on this machine) scales
+    // the table ratio by measured/modeled for that encoder family.
+    let calib = crate::calib::factor_for(backend);
+    let raw = match backend {
         VideoBackend::CpuX264 => x264_ratio_for(vcodec),
         VideoBackend::CpuX265 => match vcodec {
             "mpeg4" | "msmpeg4" | "xvid" => 0.23,
@@ -882,11 +1145,44 @@ fn est_ratio(vcodec: &str, backend: VideoBackend) -> f64 {
             "vp9" => 0.68,
             _ => 0.47,
         },
+        // AV1 NVENC (Ada+): ~25% below HEVC NVENC at the same CQ — AV1's
+        // compression edge at equal speed.
+        VideoBackend::Av1Nvenc => av1_nvenc_ratio_for(vcodec),
+        // Arc's AV1 encoder: strong, a step behind NVENC's.
+        VideoBackend::QsvAv1 | VideoBackend::AmfAv1 => av1_nvenc_ratio_for(vcodec) * 1.10,
+        // VideoToolbox / QSV / AMF HEVC: slightly behind NVENC per bit at
+        // the same nominal quality.
+        VideoBackend::VtHevc | VideoBackend::QsvHevc | VideoBackend::AmfHevc => {
+            hw_upload_hevc_ratio_for(vcodec)
+        }
         // Copy-video never re-encodes: video ratio is exactly 1.0
         // (estimate_file shortcuts before using this, belt and braces).
         VideoBackend::CopyVideo => 1.0,
+        // Auto and the explicit NVENC HEVC/H.264 modes.
         _ => nvenc_hevc_ratio_for(vcodec),
+    };
+    (raw * calib).max(0.02)
+}
+
+/// Expected output/input byte ratio for AV1 NVENC at CQ28: the HEVC NVENC
+/// table minus AV1's compression edge. Initial estimate — benchmark
+/// calibration replaces it with measured values per machine.
+fn av1_nvenc_ratio_for(vcodec: &str) -> f64 {
+    match vcodec {
+        "mpeg4" | "msmpeg4" | "xvid" => 0.40,
+        "h264" => 0.56,
+        "hevc" => 0.72,
+        "av1" => 0.95,
+        "mpeg2video" => 0.46,
+        "vp9" => 0.72,
+        _ => 0.60,
     }
+}
+
+/// HEVC via the upload families (VideoToolbox/QSV/AMF): NVENC's table with
+/// a small penalty for their per-bit deficit at the same nominal quality.
+fn hw_upload_hevc_ratio_for(vcodec: &str) -> f64 {
+    (nvenc_hevc_ratio_for(vcodec) * 1.08).min(1.0)
 }
 
 fn bitrate_suffix(m: &MediaFile) -> String {
@@ -1247,6 +1543,7 @@ mod tests {
             image_cq: 28,
             image_scale: ScalePolicy::Preserve,
             image_preserve_format: false,
+            film_grain: false,
         }
     }
 
@@ -1257,9 +1554,21 @@ mod tests {
             h264_nvenc: true,
             av1_nvenc_listed: false,
             av1_nvenc_usable: false,
+            nvenc_b_ref_mode: false,
+            vt_h264: false,
+            vt_hevc: false,
+            qsv_h264: false,
+            qsv_hevc: false,
+            qsv_av1_listed: false,
+            qsv_av1_usable: false,
+            amf_h264: false,
+            amf_hevc: false,
+            amf_av1_listed: false,
+            amf_av1_usable: false,
             svt_av1: true,
             cuvid_decoders: cuvid.iter().map(|s| s.to_string()).collect(),
             gpu_label: "test".into(),
+            hwaccels: vec!["cuda".into()],
         }
     }
 
@@ -1308,6 +1617,7 @@ mod tests {
             image_cq: 28,
             image_scale: ScalePolicy::Preserve,
             image_preserve_format: false,
+            film_grain: false,
         };
         let x265_params = EstParams {
             backend: VideoBackend::CpuX265,
@@ -1832,7 +2142,7 @@ mod tests {
         // A saving between 1% and the 10% threshold: a lean-ish HEVC file
         // (bytes match the bitrate × duration, as on disk).
         let m = file("hevc", 1920, 1080, 300_000_000, Some(4_000_000));
-        let mut p = params();
+        let p = params();
 
         match preflight_with(&m, &p, 10.0, ThresholdPolicy::Warn) {
             Preflight::Warn { reason } => {
@@ -2012,6 +2322,151 @@ mod tests {
         // Fully unknown bitrate stays permissive.
         let unknown = file("h264", 1920, 1080, 1_000_000_000, None);
         assert_eq!(effective_vbitrate(&unknown), None);
+    }
+
+    fn mac_caps() -> HwCaps {
+        HwCaps {
+            cuda_hwaccel: false,
+            hevc_nvenc: false,
+            h264_nvenc: false,
+            av1_nvenc_listed: false,
+            av1_nvenc_usable: false,
+            nvenc_b_ref_mode: false,
+            vt_h264: true,
+            vt_hevc: true,
+            qsv_h264: false,
+            qsv_hevc: false,
+            qsv_av1_listed: false,
+            qsv_av1_usable: false,
+            amf_h264: false,
+            amf_hevc: false,
+            amf_av1_listed: false,
+            amf_av1_usable: false,
+            svt_av1: true,
+            cuvid_decoders: vec![],
+            gpu_label: "Apple M-series".into(),
+            hwaccels: vec!["videotoolbox".into()],
+        }
+    }
+
+    #[test]
+    fn auto_ladder_covers_non_nvidia_machines() {
+        // A Mac: no NVENC anywhere — Auto must start at VideoToolbox HEVC,
+        // not fall straight through to CPU x264.
+        let caps = mac_caps();
+        let levels = select_levels(VideoBackend::Auto, &caps);
+        assert_eq!(levels[0], Level::VtHevc, "{levels:?}");
+        assert!(levels.contains(&Level::VtH264));
+        assert_eq!(*levels.last().unwrap(), Level::CpuX264);
+        // The family's explicit mode starts the same place and keeps an
+        // H.264 sibling before the CPU floor.
+        assert_eq!(
+            select_levels(VideoBackend::VtHevc, &caps),
+            vec![Level::VtHevc, Level::VtH264, Level::CpuX264]
+        );
+        // Intel Arc: QSV AV1 usable, HEVC behind it, CPU floor last.
+        let arc = HwCaps {
+            qsv_h264: true,
+            qsv_hevc: true,
+            qsv_av1_listed: true,
+            qsv_av1_usable: true,
+            vt_h264: false,
+            vt_hevc: false,
+            ..mac_caps()
+        };
+        assert_eq!(
+            select_levels(VideoBackend::QsvAv1, &arc),
+            vec![
+                Level::QsvAv1,
+                Level::QsvHevc,
+                Level::QsvH264,
+                Level::CpuX264
+            ]
+        );
+        // Auto stays HEVC-first (compat) even with AV1 hardware present.
+        let auto = select_levels(VideoBackend::Auto, &arc);
+        assert_eq!(auto[0], Level::QsvHevc, "{auto:?}");
+    }
+
+    #[test]
+    fn av1_nvenc_ladder_needs_the_trial() {
+        let mut caps = caps_with(&["h264_cuvid", "hevc_cuvid", "av1_cuvid"]);
+        // Trial passed: zero-copy AV1 first, CPU-decode upload behind it,
+        // HEVC NVENC as the in-family fallback, CPU last.
+        caps.av1_nvenc_usable = true;
+        assert_eq!(
+            select_levels(VideoBackend::Av1Nvenc, &caps),
+            vec![
+                Level::HwAv1,
+                Level::CpuDecodeAv1Nvenc,
+                Level::HwHevc,
+                Level::CpuDecodeHevcNvenc,
+                Level::CpuX264,
+            ]
+        );
+        // Trial failed (RTX 30): the mode silently degrades to the HEVC
+        // ladder — the UI never shows it in this state anyway.
+        caps.av1_nvenc_usable = false;
+        assert_eq!(
+            select_levels(VideoBackend::Av1Nvenc, &caps),
+            vec![Level::HwHevc, Level::CpuDecodeHevcNvenc, Level::CpuX264,]
+        );
+    }
+
+    #[test]
+    fn svt_preset_follows_the_shared_knob() {
+        assert_eq!(NvencPreset::P5.svt(), 8);
+        assert_eq!(NvencPreset::P3.svt(), 6);
+        assert_eq!(NvencPreset::P6.svt(), 9);
+        assert_eq!(NvencPreset::P5.qsv(), "medium");
+        assert_eq!(NvencPreset::P3.qsv(), "veryfast");
+        assert_eq!(NvencPreset::P4.amf(), "balanced");
+        assert_eq!(NvencPreset::P6.amf(), "quality");
+    }
+
+    #[test]
+    fn film_grain_relaxes_the_density_penalty_on_dense_sources() {
+        // 20 Mbps noisy 1080p models as dense; AV1 with film-grain on must
+        // estimate smaller than the same encode with it off, and the clean
+        // 3 Mbps file must not care.
+        let dense = file("h264", 1920, 1080, 2_500_000_000, Some(20_000_000));
+        let clean = file("h264", 1920, 1080, 400_000_000, Some(3_000_000));
+        let mut on = params();
+        on.backend = VideoBackend::CpuAv1;
+        on.film_grain = true;
+        let mut off = on;
+        off.film_grain = false;
+        let d_on = estimate_file(&dense, &on);
+        let d_off = estimate_file(&dense, &off);
+        assert!(
+            d_on.new_bytes < d_off.new_bytes,
+            "fgs should shrink the dense estimate: {} vs {}",
+            d_on.new_bytes,
+            d_off.new_bytes
+        );
+        // Clean source: the switch changes nothing.
+        assert_eq!(
+            estimate_file(&clean, &on).new_bytes,
+            estimate_file(&clean, &off).new_bytes
+        );
+        // And the predicate is SVT-only: NVENC modes ignore it.
+        let mut nv = params();
+        nv.backend = VideoBackend::HevcNvenc;
+        nv.film_grain = true;
+        assert!(!fgs_applies(&dense, nv.backend, nv.film_grain));
+        assert!(fgs_applies(&dense, on.backend, on.film_grain));
+    }
+
+    #[test]
+    fn av1_nvenc_estimates_below_hevc_nvenc() {
+        // The whole point of the backend: at the same CQ the AV1 hardware
+        // table must promise a smaller file than HEVC NVENC's.
+        let m = file("h264", 1920, 1080, 1_000_000_000, Some(12_000_000));
+        let mut av1 = params();
+        av1.backend = VideoBackend::Av1Nvenc;
+        let mut hevc = params();
+        hevc.backend = VideoBackend::HevcNvenc;
+        assert!(estimate_file(&m, &av1).new_bytes < estimate_file(&m, &hevc).new_bytes);
     }
 }
 

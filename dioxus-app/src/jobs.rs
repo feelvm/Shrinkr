@@ -292,6 +292,7 @@ fn run_one_job(
         &extra_args,
         params.opus_bps,
         params.all_audio,
+        params.film_grain,
         &|p| {
             // frac>=0 carries position; fps-only lines (frac<0) refresh
             // the rate while keeping the last position.
@@ -635,6 +636,7 @@ pub fn start_target_solve(
     extra_args: Vec<String>,
     opus_bps: Option<u32>,
     all_audio: bool,
+    film_grain: bool,
     spec: shrinkr_core::target::TargetSpec,
 ) {
     use shrinkr_core::target::solve_crf_for_file;
@@ -658,6 +660,7 @@ pub fn start_target_solve(
             &extra_args,
             opus_bps,
             all_audio,
+            film_grain,
             &spec,
             &work,
             &|line| {

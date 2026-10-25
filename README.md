@@ -1,14 +1,14 @@
 # Shrinkr
 
-**Shrink video. Shrink images. Convert anything.** Shrinkr is a fast, batch-friendly media compressor and converter for Windows, macOS and Linux with a clean desktop GUI *and* a headless CLI. It re-encodes video to dramatically smaller files using your NVIDIA GPU when available (NVENC, zero-copy NVDEC → CUDA → NVENC path) and falls back to CPU encoders automatically. Still images ride the same pipeline: JPEG/WebP re-encode or PNG/BMP/TIFF → JPEG conversion. Built in Rust on top of FFmpeg.
+**Shrink video. Shrink images. Convert anything.** Shrinkr is a fast, batch-friendly media compressor and converter for Windows, macOS and Linux with a clean desktop GUI *and* a headless CLI. It re-encodes video to dramatically smaller files using your GPU when available — NVIDIA NVENC (zero-copy NVDEC → CUDA → NVENC path), Apple VideoToolbox, Intel Quick Sync or AMD AMF, with AV1 hardware encoders on RTX 40+, Intel Arc and RX 7000+ — and falls back to CPU encoders (x264 / x265 / SVT-AV1) automatically. Still images ride the same pipeline: JPEG/WebP re-encode or PNG/BMP/TIFF → JPEG conversion. Built in Rust on top of FFmpeg.
 
 ## Features
 
 ### Shrink (batch video & image compression)
 
-- **Auto backend with fallback ladder** — picks the best encoder your machine can actually run: HEVC NVENC (GPU decode + encode) → H.264 NVENC → CPU-decode + NVENC → CPU x264. x265, SVT-AV1 and AV1 NVENC (auto-detected via a trial encode) are also selectable.
-- **Goal presets on one speed↔size axis** — a segmented control — **Fastest** · **Balanced** (default) · **Smallest** — where position on the axis *is* the trade-off, with the ends labeled (faster·bigger ← → smaller·slower). Once videos are loaded, each segment shows the measured trade-off for *your* batch: shrink % and estimated wall time from the size model. Fastest = Auto, NVENC P4, CQ 28 (Balanced's quality, encoded quicker); Balanced = Auto, P5, CQ 28; Smallest = SVT-AV1 CRF 32 — the most compression-efficient encoder available, CPU-slow by design; HEVC NVENC P6 CQ 32 only when the ffmpeg build lacks SVT-AV1. Hand-tuning any knob clears the segment highlight — the presets never fight manual settings.
-- **Quality control** — one CQ/CRF slider (18–40, default 28), NVENC presets P3–P6, scale policy (preserve / 1080p / 720p / 480p).
+- **Auto backend with fallback ladder** — picks the best encoder your machine can actually run, across every vendor: HEVC NVENC (NVIDIA, zero-copy NVDEC → CUDA → NVENC) → H.264 NVENC → VideoToolbox HEVC/H.264 (Apple) → Quick Sync HEVC/H.264 (Intel) → AMF HEVC/H.264 (AMD) → CPU x264. AV1 NVENC (RTX 40+, auto-detected via a trial encode that uses the real flag set), SVT-AV1, x264 and x265 are also selectable; every hardware backend that this machine can't run is hidden from the options instead of shown-and-disabled. CPU encodes (and the VideoToolbox/QSV/AMF families) get a `-hwaccel auto` decode assist, so NVDEC/QSV/VideoToolbox feed the encoder when available — identical pixels, faster wall clock.
+- **Goal presets on one speed↔size axis** — a segmented control — **Fastest** · **Balanced** (default) · **Smallest** — where position on the axis *is* the trade-off, with the ends labeled (faster·bigger ← → smaller·slower). Each goal resolves to the best encoder *this machine* has. Once videos are loaded, each segment shows the measured trade-off for *your* batch: shrink % and estimated wall time from the size model. Fastest = Auto, NVENC P4, CQ 28 (Balanced's quality, encoded quicker); Balanced = AV1 NVENC CQ 28 on RTX 40/50 (the same speed class as HEVC NVENC with ~20–30% better compression — free savings), Auto/P5 anywhere else; Smallest = SVT-AV1 CRF 32 — the most compression-efficient encoder available, CPU-slow by design — falling back to AV1 NVENC, then the machine's best hardware HEVC, only when the ffmpeg build lacks SVT-AV1. Hand-tuning any knob clears the segment highlight — the presets never fight manual settings.
+- **Quality control** — one CQ/CRF slider (18–40, default 28), an encoder preset knob (NVENC P3–P6; Quick Sync and SVT-AV1 presets follow the same control), scale policy (preserve / 1080p / 720p / 480p / fit-in-box), and **AV1 film-grain synthesis** (default on): grainy sources — the ones the size model flags as dense — are denoised before encoding and the decoder regenerates statistically-similar grain, typically 30–50% smaller on exactly the files nothing else helps. The grain is synthetic, which is why it stays a visible switch.
 - **Target-size mode** — instead of guessing a quality value, Shrinkr measures the file's own size curve (short sample encodes + a log-linear fit) and solves for the quality that hits your target: `400MB`, `2x` smaller, `50%`, …
 - **Audio-only mode (upscale audio)** — the **Audio only** checkbox (beside the audio selector, or the *Audio only* backend) stream-copies the video untouched and re-encodes just the audio to the chosen Opus target (default 64 kbps, selectable up to 512 kbps, Opus's stereo ceiling). There the target is an instruction, not a ceiling: tracks **below** the target are re-encoded up (upscale), and the result is kept even when the file grows — size thresholds, no-gain discards and the repeated-no-gain batch stop never apply. Files without an audio track skip.
 - **Smart preflight** — probes every file first and skips files that wouldn't save enough (configurable minimum-saving threshold, default 10%). Uncheck **Skip already-efficient files** to keep low-gain files in the run: the minimum becomes advisory and the plan warns (`⚠`) instead of skipping them. (Doesn't apply to audio-only passes — those always run.)
@@ -29,11 +29,11 @@ Copy-first strategy: remuxes (`-c copy`) when the source codecs are legal in the
 
 ### Benchmark
 
-Runs the same source through a matrix — x264 CRF 28 baseline plus HEVC NVENC CQ 28 at presets P3–P6 — recording output size, encode time, fps, realtime factor and GPU load, then recommends a preset and can export the table as CSV. Great for finding your GPU's sweet spot before a big batch.
+Runs the same source through a capability-gated matrix — x264 CRF 28 baseline, HEVC NVENC CQ 28 at presets P3–P6, plus AV1 NVENC P5 and SVT-AV1 preset 8 when this machine can run them — recording output size, encode time, fps, realtime factor and GPU load, then recommends a preset and can export the table as CSV. Every successful row also **calibrates the size model**: measured output vs the model's prediction becomes a per-encoder correction factor, persisted in the app-data folder and applied to every future estimate, so the Goal-segment and batch numbers become *measured on your GPU* instead of from a generic table. Great for finding your GPU's sweet spot before a big batch.
 
 ### Everything else
 
-- **Hardware capability detection** — Shrinkr asks FFmpeg what actually works on your GPU instead of hard-coding model lists (e.g. it correctly avoids AV1 NVENC on GPUs that list it but can't run it).
+- **Hardware capability detection** — Shrinkr asks FFmpeg what actually works on your GPU instead of hard-coding model lists (e.g. it correctly avoids AV1 NVENC on GPUs that list it but can't run it). The AV1 variants of every vendor family and NVENC's B-frames-as-reference mode are verified with a short trial encode using the real flag set; anything that fails is hidden from the options rather than offered and broken.
 - **Desktop GUI** — dark, shadcn-style interface (Dioxus + Tailwind) with drag & drop, per-file progress, and a full in-app log panel.
 - **Self-update** — the GUI can check GitHub Releases and update itself (and the bundled FFmpeg) in place.
 
@@ -43,7 +43,7 @@ Runs the same source through a matrix — x264 CRF 28 baseline plus HEVC NVENC C
 
 Nothing, for core functionality: the release archives bundle `ffmpeg` and `ffprobe` next to the binary, so Shrinkr runs with zero system dependencies. Optional extras:
 
-- **NVIDIA GPU driver** (optional) — enables the NVENC hardware path. Without it, Shrinkr uses CPU encoders (x264 / x265 / SVT-AV1).
+- **GPU vendor driver** (optional) — enables the hardware encoder path for your GPU: NVIDIA (NVENC), Apple (VideoToolbox), Intel (Quick Sync) or AMD (AMF). Without one, Shrinkr uses CPU encoders (x264 / x265 / SVT-AV1).
 - **LibreOffice** (optional) — only needed for document conversion.
 
 ### Prebuilt binaries
@@ -133,8 +133,9 @@ Key flags (run `shrinkr-cli` with no arguments for the full list):
 | `--images / --no-images` | Include still images in `--shrink` (default on) |
 | `--image-preserve-format` | Keep image formats: png→png (constant opaque alpha planes dropped, near-lossless 256-color palettes, lossless re-encode), tiff→tiff (deflate); conversions and the WebP fallback are off (default off) |
 | `--target <400MB\|2x\|50%>` | Solve per-file quality for a size target (video only) |
-| `--backend <auto\|hevc\|h264\|x264\|x265\|av1\|copy>` | Encoder selection (default `auto`) |
-| `--cq <18-40>` | Quality: NVENC CQ / CRF (default 28) |
+| `--backend <auto\|av1-nvenc\|hevc\|h264\|vt-hevc\|qsv-hevc\|qsv-av1\|amf-hevc\|amf-av1\|x264\|x265\|av1\|copy>` | Encoder selection (default `auto`; hardware backends this machine can't run fall back gracefully) |
+| `--cq <18-40>` | Quality: NVENC CQ / x264/x265 CRF / AV1 CRF (default 28) |
+| `--film-grain / --no-film-grain` | AV1 film-grain synthesis on grainy sources (default on; SVT-AV1 backend only) |
 | `--scale <preserve\|1080p\|720p\|480p>` | Resolution policy (default preserve) |
 | `--audio <off\|8-512>` | Opus bitrate in kbps (default 64; 512 is the stereo max) |
 | `--replace` | Delete originals after a verified encode (default: keep both) |

@@ -37,10 +37,12 @@ fn cli_help() -> String {
      \u{20}                      (default: keep both, <stem>.mkv alongside)\n\
      --images / --no-images   shrink still images too — jpg/webp re-encode,\n\
      \u{20}                      png/bmp/tiff → jpeg (default: on)\n\
-     --backend <auto|hevc|h264|x264|x265|av1|copy>  (default auto)\n\
+     --backend <auto|av1-nvenc|hevc|h264|vt-hevc|qsv-hevc|qsv-av1|amf-hevc|amf-av1|x264|x265|av1|copy>\n\
+     \u{20}                      (default auto; hardware backends fall back\n\
+     \u{20}                      gracefully when this machine can't run them)\n\
      --min-saving <pct>        preflight skip threshold (default 10)\n\
      --target <400MB|2x|50%>  solve per-file quality for a size target\n\
-     --benchmark <file|dir>   run A:x264 + B-E:NVENC P3-P6 matrix on each input\n\
+     --benchmark <file|dir>   run the capability-gated encoder matrix per input\n\
      --bench-out <dir>        CSV + notes dir (default ./bench-out)\n\
      --cq <18-40>             quality: NVENC CQ / x264/x265 CRF / AV1 CRF (default 28)\n\
      --scale <preserve|1080p|720p|480p|WxH>  video resolution; WxH caps\n\
@@ -54,6 +56,9 @@ fn cli_help() -> String {
      --keep-subs / --no-subs  subtitle copy (default keep)\n\
      --all-audio              keep every audio track (default: primary only)\n\
      --audio <off|8-512>       Opus kbps, off keeps as-is (default 64, max 512)\n\
+     --film-grain / --no-film-grain\n\
+     \u{20}                      AV1 film-grain synthesis on grainy sources\n\
+     \u{20}                      (default: on; SVT-AV1 backend only)\n\
      --extra-args \"...\"      extra ffmpeg output flags, e.g. \"-tune grain\"\n\
      --dry-run                print ffmpeg commands without encoding\n\
      --probe <file>           dump media inspection\n\
@@ -83,6 +88,7 @@ fn parse_cli() -> i32 {
     let mut keep_subs = true;
     let mut all_audio = false;
     let mut opus_bps: Option<u32> = Some(pipeline::DEFAULT_OPUS_BPS);
+    let mut film_grain = true;
     let mut extra_args_raw = String::new();
     let mut target_raw: Option<String> = None;
     let mut dry_run = false;
@@ -110,8 +116,14 @@ fn parse_cli() -> i32 {
                 i += 1;
                 if i < args.len() {
                     backend_cli = match args[i].as_str() {
+                        "av1-nvenc" | "av1nvenc" | "av1_nvenc" => VideoBackend::Av1Nvenc,
                         "hevc" => VideoBackend::HevcNvenc,
                         "h264" => VideoBackend::H264Nvenc,
+                        "vt-hevc" | "videotoolbox" | "vt" => VideoBackend::VtHevc,
+                        "qsv-hevc" | "qsv" => VideoBackend::QsvHevc,
+                        "qsv-av1" => VideoBackend::QsvAv1,
+                        "amf-hevc" | "amf" => VideoBackend::AmfHevc,
+                        "amf-av1" => VideoBackend::AmfAv1,
                         "x264" => VideoBackend::CpuX264,
                         "x265" => VideoBackend::CpuX265,
                         "av1" => VideoBackend::CpuAv1,
@@ -178,6 +190,8 @@ fn parse_cli() -> i32 {
             "--keep-subs" => keep_subs = true,
             "--no-subs" => keep_subs = false,
             "--all-audio" => all_audio = true,
+            "--film-grain" => film_grain = true,
+            "--no-film-grain" => film_grain = false,
             "--audio" => {
                 i += 1;
                 if i < args.len() {
@@ -284,6 +298,7 @@ fn parse_cli() -> i32 {
             image_preserve,
             keep_subs,
             all_audio,
+            film_grain,
             min_saving_cli,
             extra_args,
             opus_bps,
@@ -311,6 +326,7 @@ fn cli_shrink(
     image_preserve: bool,
     keep_subs: bool,
     all_audio: bool,
+    film_grain: bool,
     min_saving: f64,
     extra_args: Vec<String>,
     opus_bps: Option<u32>,
@@ -387,6 +403,7 @@ fn cli_shrink(
         image_cq,
         image_scale,
         image_preserve_format: image_preserve,
+        film_grain,
     };
     for (n, p) in inputs.iter().enumerate() {
         let m = match probe_file(p) {
@@ -494,6 +511,7 @@ fn cli_shrink(
                 &extra_args,
                 opus_bps,
                 all_audio,
+                film_grain,
                 &spec,
                 &work,
                 &|s| println!("  {s}"),
@@ -539,6 +557,8 @@ fn cli_shrink(
                     &tmp_out,
                     &plan,
                     &extra_args,
+                    caps,
+                    film_grain,
                 );
                 println!("  cmd: {}", ffmpeg::command_line(&args));
             }
@@ -558,6 +578,7 @@ fn cli_shrink(
             &extra_args,
             opus_bps,
             all_audio,
+            film_grain,
             &|_| {},
             &cancel,
         );

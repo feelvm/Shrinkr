@@ -48,19 +48,36 @@ impl Goal {
     /// Fastest keeps Balanced's CQ so quality stays constant across the
     /// fast half of the axis — the trade-off there is purely speed vs
     /// size (P4 encodes quicker than P5 at the same CQ, files come out
-    /// bigger). Smallest means smallest output, period: SVT-AV1 is the
-    /// most compression-efficient encoder in the toolbox (software, so
-    /// slow — that's the cost the name admits), falling back to HEVC
-    /// NVENC P6 only when the ffmpeg build lacks SVT-AV1, then Auto.
+    /// bigger). Balanced rides AV1 NVENC where the trial encode passed
+    /// (RTX 40/50): same speed class as HEVC NVENC, meaningfully smaller —
+    /// free savings for the default goal, HEVC anywhere else for playback
+    /// compatibility. Smallest means smallest output, period: SVT-AV1 is
+    /// the most compression-efficient encoder in the toolbox (software,
+    /// so slow — that's the cost the name admits), falling back through
+    /// the hardware AV1/HEVC encoders to whatever this machine has.
     pub fn resolve(&self, caps: &HwCaps) -> (VideoBackend, NvencPreset, u32) {
         match self {
             Goal::Fastest => (VideoBackend::Auto, NvencPreset::P4, 28),
-            Goal::Balanced => (VideoBackend::Auto, NvencPreset::P5, 28),
+            Goal::Balanced => {
+                if caps.av1_nvenc_usable {
+                    (VideoBackend::Av1Nvenc, NvencPreset::P5, 28)
+                } else {
+                    (VideoBackend::Auto, NvencPreset::P5, 28)
+                }
+            }
             Goal::Smallest => {
                 if caps.svt_av1 {
                     (VideoBackend::CpuAv1, NvencPreset::P5, 32)
+                } else if caps.av1_nvenc_usable {
+                    (VideoBackend::Av1Nvenc, NvencPreset::P6, 32)
                 } else if caps.hevc_nvenc {
                     (VideoBackend::HevcNvenc, NvencPreset::P6, 32)
+                } else if caps.vt_hevc {
+                    (VideoBackend::VtHevc, NvencPreset::P5, 32)
+                } else if caps.qsv_hevc {
+                    (VideoBackend::QsvHevc, NvencPreset::P5, 32)
+                } else if caps.amf_hevc {
+                    (VideoBackend::AmfHevc, NvencPreset::P5, 32)
                 } else {
                     (VideoBackend::Auto, NvencPreset::P6, 32)
                 }
@@ -69,8 +86,9 @@ impl Goal {
     }
 
     /// Whether the current settings triple sits on this goal's spot.
-    /// The NVENC preset is ignored for SVT-AV1 (it has none of its own);
-    /// everything else must match exactly, so manual knob edits read as
+    /// The preset knob now maps onto every encoder family (NVENC P-series,
+    /// Quick Sync named presets, SVT presets), so it is always part of the
+    /// match; everything must match exactly, so manual knob edits read as
     /// custom settings with no segment highlighted.
     pub fn matches(
         &self,
@@ -80,8 +98,7 @@ impl Goal {
         caps: &HwCaps,
     ) -> bool {
         let (b, p, c) = self.resolve(caps);
-        let av1_no_preset = b == VideoBackend::CpuAv1;
-        backend == b && cq == c && (av1_no_preset || preset == p)
+        backend == b && preset == p && cq == c
     }
 
     /// [`Goal::matches`] for a Lossless batch: the quality value is pinned
@@ -94,8 +111,7 @@ impl Goal {
         caps: &HwCaps,
     ) -> bool {
         let (b, p, _) = self.resolve(caps);
-        let av1_no_preset = b == VideoBackend::CpuAv1;
-        backend == b && (av1_no_preset || preset == p)
+        backend == b && preset == p
     }
 }
 
@@ -112,6 +128,9 @@ fn backend_fps(backend: VideoBackend) -> f64 {
         VideoBackend::CpuX264 => 90.0,
         VideoBackend::CpuX265 => 45.0,
         VideoBackend::CpuAv1 => 120.0, // SVT-AV1 preset 8, measured 145+ fps
+        // AV1 hardware sits a notch under the HEVC engines on the same die;
+        // the other families' HEVC is NVENC-class on their own machines.
+        VideoBackend::Av1Nvenc | VideoBackend::QsvAv1 | VideoBackend::AmfAv1 => 500.0,
         _ => 600.0,
     }
 }
@@ -232,6 +251,11 @@ pub struct AppState {
     pub image_cq: u32,
     pub image_scale: ScalePolicy,
     pub image_preserve_format: bool,
+    /// SVT-AV1 film-grain synthesis (grainy sources only; the control is
+    /// shown when the ffmpeg build has SVT). Default on: statistically
+    /// similar synthetic grain is the trade for much smaller files on
+    /// exactly the sources nothing else helps.
+    pub film_grain: bool,
     pub keep_subs: bool,
     pub min_saving_pct: f64,
     pub skip_efficient: bool,
@@ -419,6 +443,7 @@ impl Default for AppState {
             image_cq: 28,
             image_scale: ScalePolicy::Preserve,
             image_preserve_format: true,
+            film_grain: true,
             keep_subs: true,
             all_audio: false,
             opus_bps: None,
@@ -556,6 +581,7 @@ impl AppState {
             image_cq: self.image_cq,
             image_scale: self.image_scale,
             image_preserve_format: self.image_preserve_format,
+            film_grain: self.film_grain,
         };
         self.apply_lossless(&mut p);
         p
@@ -831,9 +857,21 @@ mod tests {
             h264_nvenc: true,
             av1_nvenc_listed: false,
             av1_nvenc_usable: false,
+            nvenc_b_ref_mode: false,
+            vt_h264: false,
+            vt_hevc: false,
+            qsv_h264: false,
+            qsv_hevc: false,
+            qsv_av1_listed: false,
+            qsv_av1_usable: false,
+            amf_h264: false,
+            amf_hevc: false,
+            amf_av1_listed: false,
+            amf_av1_usable: false,
             svt_av1: true,
             cuvid_decoders: vec![],
             gpu_label: "test".into(),
+            hwaccels: vec![],
         };
         // Full matches() demands the goal's CQ (28), which Lossless pins
         // away — the segment would never highlight. matches_lossless
@@ -842,6 +880,86 @@ mod tests {
         assert!(Goal::Fastest.matches_lossless(VideoBackend::Auto, NvencPreset::P4, &caps));
         assert!(!Goal::Balanced.matches_lossless(VideoBackend::Auto, NvencPreset::P4, &caps));
         assert!(!Goal::Fastest.matches_lossless(VideoBackend::CpuAv1, NvencPreset::P4, &caps));
+    }
+
+    #[test]
+    fn goals_resolve_per_hardware() {
+        let mut nv40 = shrinkr_core::hw::HwCaps {
+            cuda_hwaccel: true,
+            hevc_nvenc: true,
+            h264_nvenc: true,
+            av1_nvenc_listed: true,
+            av1_nvenc_usable: true,
+            nvenc_b_ref_mode: true,
+            vt_h264: false,
+            vt_hevc: false,
+            qsv_h264: false,
+            qsv_hevc: false,
+            qsv_av1_listed: false,
+            qsv_av1_usable: false,
+            amf_h264: false,
+            amf_hevc: false,
+            amf_av1_listed: false,
+            amf_av1_usable: false,
+            svt_av1: true,
+            cuvid_decoders: vec![],
+            gpu_label: "RTX test".into(),
+            hwaccels: vec!["cuda".into()],
+        };
+        // RTX 40: Balanced is the free-savings AV1 NVENC ride, Smallest
+        // stays CPU SVT (the name promises minimum bytes, not speed).
+        assert_eq!(
+            Goal::Balanced.resolve(&nv40),
+            (VideoBackend::Av1Nvenc, NvencPreset::P5, 28)
+        );
+        assert_eq!(
+            Goal::Smallest.resolve(&nv40),
+            (VideoBackend::CpuAv1, NvencPreset::P5, 32)
+        );
+        // Same box without SVT in the build: Smallest takes AV1 NVENC.
+        nv40.svt_av1 = false;
+        assert_eq!(
+            Goal::Smallest.resolve(&nv40),
+            (VideoBackend::Av1Nvenc, NvencPreset::P6, 32)
+        );
+        // A Mac: Balanced falls back to Auto (→ VideoToolbox HEVC inside
+        // the ladder), Smallest resolves VideoToolbox when SVT is missing
+        // or CPU SVT when present.
+        let mut mac = shrinkr_core::hw::HwCaps {
+            cuda_hwaccel: false,
+            hevc_nvenc: false,
+            h264_nvenc: false,
+            av1_nvenc_listed: false,
+            av1_nvenc_usable: false,
+            nvenc_b_ref_mode: false,
+            vt_h264: true,
+            vt_hevc: true,
+            qsv_h264: false,
+            qsv_hevc: false,
+            qsv_av1_listed: false,
+            qsv_av1_usable: false,
+            amf_h264: false,
+            amf_hevc: false,
+            amf_av1_listed: false,
+            amf_av1_usable: false,
+            svt_av1: false,
+            cuvid_decoders: vec![],
+            gpu_label: "Apple test".into(),
+            hwaccels: vec!["videotoolbox".into()],
+        };
+        assert_eq!(
+            Goal::Balanced.resolve(&mac),
+            (VideoBackend::Auto, NvencPreset::P5, 28)
+        );
+        assert_eq!(
+            Goal::Smallest.resolve(&mac),
+            (VideoBackend::VtHevc, NvencPreset::P5, 32)
+        );
+        mac.svt_av1 = true;
+        assert_eq!(
+            Goal::Smallest.resolve(&mac),
+            (VideoBackend::CpuAv1, NvencPreset::P5, 32)
+        );
     }
 
     #[test]

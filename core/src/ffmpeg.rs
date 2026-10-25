@@ -67,6 +67,7 @@ pub trait EncodeBackend {
         extra_args: &[String],
         opus_bps: Option<u32>,
         all_audio: bool,
+        film_grain: bool,
         progress: &dyn Fn(Progress),
         cancel: &Arc<AtomicBool>,
     ) -> Result<EncodeResult, String>;
@@ -75,6 +76,7 @@ pub trait EncodeBackend {
 pub struct FfmpegBackend;
 
 impl EncodeBackend for FfmpegBackend {
+    #[allow(clippy::too_many_arguments)]
     fn encode(
         &self,
         media: &MediaFile,
@@ -87,6 +89,7 @@ impl EncodeBackend for FfmpegBackend {
         extra_args: &[String],
         opus_bps: Option<u32>,
         all_audio: bool,
+        film_grain: bool,
         progress: &dyn Fn(Progress),
         cancel: &Arc<AtomicBool>,
     ) -> Result<EncodeResult, String> {
@@ -101,6 +104,7 @@ impl EncodeBackend for FfmpegBackend {
             extra_args,
             opus_bps,
             all_audio,
+            film_grain,
             progress,
             cancel,
             crate::hw::caps(),
@@ -214,11 +218,16 @@ pub fn parse_extra_args(s: &str) -> Result<Vec<String>, String> {
 
 /// Exact FFmpeg arguments for one attempt level.
 ///
-/// Zero-copy GPU path (Level::HwHevc / HwH264):
+/// Zero-copy GPU path (Level::HwHevc / HwH264 / HwAv1):
 /// `-hwaccel cuda -hwaccel_output_format cuda` keeps NVDEC output resident;
-/// `scale_cuda` (when resizing) and `hevc_nvenc` then consume GPU frames
-/// with no GPUâ†’CPUâ†’GPU round-trip. CPU fallback levels omit the hwaccel
-/// flags so decode happens in system RAM and NVENC uploads once.
+/// `scale_cuda` (when resizing) and the NVENC encoder then consume GPU frames
+/// with no GPU→CPU→GPU round-trip. Encode levels that consume
+/// system-memory frames (CPU encoders and the VT/QSV/AMF families, which
+/// upload internally) get `-hwaccel auto` instead: any listed hardware
+/// decoder feeds them, frames still land in RAM, and ffmpeg silently falls
+/// back to software decode for codecs/formats no hwaccel takes — identical
+/// pixels, better wall time.
+#[allow(clippy::too_many_arguments)]
 pub fn build_args(
     media: &MediaFile,
     level: Level,
@@ -229,6 +238,8 @@ pub fn build_args(
     out_path: &Path,
     plan: &StreamPlan,
     extra_args: &[String],
+    caps: &HwCaps,
+    film_grain: bool,
 ) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "-y".into(),
@@ -238,7 +249,7 @@ pub fn build_args(
         "pipe:1".into(),
     ];
 
-    // 1) HW decode flags (input options, before -i)
+    // 1) Decode flags (input options, before -i)
     if level.uses_hw_decode() {
         a.push("-hwaccel".into());
         a.push("cuda".into());
@@ -246,6 +257,11 @@ pub fn build_args(
         a.push("cuda".into());
         a.push("-extra_hw_frames".into());
         a.push("3".into());
+    } else if level != Level::CopyVideo && caps.any_hw_decode() {
+        // Decode assist for CPU-frame encoders: no output format, so frames
+        // come back to system RAM exactly as a software decode would.
+        a.push("-hwaccel".into());
+        a.push("auto".into());
     }
 
     a.push("-i".into());
@@ -318,6 +334,12 @@ pub fn build_args(
             a.push("1".into());
             a.push("-temporal-aq".into());
             a.push("1".into());
+            // B-frames as references (Turing+): a few % smaller at the same
+            // CQ. Trial-gated at startup — Pascal hard-errors on the flag.
+            if caps.nvenc_b_ref_mode {
+                a.push("-b_ref_mode".into());
+                a.push("middle".into());
+            }
             a.push("-profile:v".into());
             a.push(
                 if media.bit_depth >= 10 {
@@ -350,6 +372,101 @@ pub fn build_args(
             a.push("-profile:v".into());
             a.push("high".into());
         }
+        Level::HwAv1 | Level::CpuDecodeAv1Nvenc => {
+            // AV1 NVENC (Ada+): same speed class as HEVC NVENC, ~25% better
+            // compression. `middle` B-refs are safe here — the encoder only
+            // exists on generations that support them, and the startup trial
+            // encodes with this exact flag set.
+            a.push("-c:v".into());
+            a.push("av1_nvenc".into());
+            a.push("-preset".into());
+            a.push(preset.as_str().into());
+            a.push("-tune".into());
+            a.push("hq".into());
+            a.push("-rc".into());
+            a.push("vbr".into());
+            a.push("-cq".into());
+            a.push(format!("{cq}"));
+            a.push("-b:v".into());
+            a.push("0".into());
+            a.push("-rc-lookahead".into());
+            a.push("32".into());
+            a.push("-spatial-aq".into());
+            a.push("1".into());
+            a.push("-temporal-aq".into());
+            a.push("1".into());
+            a.push("-b_ref_mode".into());
+            a.push("middle".into());
+            a.push("-profile:v".into());
+            a.push("main".into());
+        }
+        Level::VtHevc | Level::VtH264 => {
+            // Apple VideoToolbox. Constant-quality via -q:v (QSCALE → the
+            // session's Quality property); ffmpeg enables that mode on
+            // ARM64 macOS only, which is exactly the release target.
+            // Encoder choice (HEVC vs H.264) mirrors the codec family.
+            a.push("-c:v".into());
+            a.push(
+                if level == Level::VtHevc {
+                    "hevc_videotoolbox"
+                } else {
+                    "h264_videotoolbox"
+                }
+                .into(),
+            );
+            a.push("-q:v".into());
+            a.push(format!("{}", vt_quality_for(cq)));
+            a.push("-allow_sw".into());
+            a.push("1".into());
+        }
+        Level::QsvHevc | Level::QsvH264 | Level::QsvAv1 => {
+            // Intel Quick Sync: ICQ (intelligent constant quality) via
+            // -global_quality; look-ahead is valid on the H.264/HEVC
+            // encoders. AV1 (Arc) takes the same ICQ value without LA.
+            a.push("-c:v".into());
+            a.push(
+                match level {
+                    Level::QsvAv1 => "av1_qsv",
+                    Level::QsvHevc => "hevc_qsv",
+                    _ => "h264_qsv",
+                }
+                .into(),
+            );
+            a.push("-global_quality".into());
+            a.push(format!("{cq}"));
+            a.push("-preset".into());
+            a.push(preset.qsv().into());
+            if level != Level::QsvAv1 {
+                a.push("-look_ahead".into());
+                a.push("1".into());
+            }
+        }
+        Level::AmfHevc | Level::AmfH264 | Level::AmfAv1 => {
+            // AMD AMF: constant-QP with per-frame-type QPs; -vbaq (variance
+            // based AQ) spends bits where they show. The AV1 CQP path is
+            // trial-gated at startup, so unusable combos never run.
+            a.push("-c:v".into());
+            a.push(
+                match level {
+                    Level::AmfAv1 => "av1_amf",
+                    Level::AmfHevc => "hevc_amf",
+                    _ => "h264_amf",
+                }
+                .into(),
+            );
+            a.push("-quality".into());
+            a.push(preset.amf().into());
+            a.push("-rc".into());
+            a.push("cqp".into());
+            a.push("-qp_i".into());
+            a.push(format!("{}", (cq as i32 - 2).max(0)));
+            a.push("-qp_p".into());
+            a.push(format!("{cq}"));
+            if level != Level::AmfAv1 {
+                a.push("-vbaq".into());
+                a.push("1".into());
+            }
+        }
         Level::CpuX264 => {
             a.push("-c:v".into());
             a.push("libx264".into());
@@ -360,7 +477,7 @@ pub fn build_args(
         }
         Level::CpuX265 => {
             // Max-compression path: slow preset squeezes ~15-25% smaller
-            // than medium at the same CRF. Slow on purpose â€” pair with
+            // than medium at the same CRF. Slow on purpose — pair with
             // overnight/parallel-1 runs.
             a.push("-c:v".into());
             a.push("libx265".into());
@@ -370,17 +487,24 @@ pub fn build_args(
             a.push("slow".into());
         }
         Level::CpuAv1 => {
-            // SVT-AV1 software encode (the Ryzen path on RTX 30 boxes â€”
-            // Ampere has no AV1 NVENC). Preset 8 is the sweet spot for
-            // overnight jobs (6â€“7 = slower/better, 10 = ~2x faster); CRF
-            // comes from the shared CQ slider (28 â‰ˆ high quality,
-            // 32â€“38 = shrink territory). 10-bit sources stay 10-bit.
+            // SVT-AV1 software encode (the Ryzen path on RTX 30 boxes —
+            // Ampere has no AV1 NVENC). The shared P knob maps to SVT's
+            // preset scale (P5 = 8, the sweet spot; each step trades
+            // speed for size). CRF comes from the shared CQ slider
+            // (28 ≈ high quality, 32–38 = shrink territory). 10-bit
+            // sources stay 10-bit. Dense/grainy sources get film-grain
+            // synthesis: denoise, encode the clean picture, regenerate
+            // statistically-similar grain at decode time.
             a.push("-c:v".into());
             a.push("libsvtav1".into());
             a.push("-crf".into());
             a.push(format!("{cq}"));
             a.push("-preset".into());
-            a.push("8".into());
+            a.push(format!("{}", preset.svt()));
+            if crate::pipeline::fgs_applies(media, VideoBackend::CpuAv1, film_grain) {
+                a.push("-svtav1-params".into());
+                a.push("film-grain=8:film-grain-denoise=1".into());
+            }
             if media.bit_depth >= 10 {
                 a.push("-pix_fmt".into());
                 a.push("yuv420p10le".into());
@@ -388,7 +512,7 @@ pub fn build_args(
         }
         Level::CopyVideo => {
             // Audio-only pass: video bytes untouched. No encoder flags at
-            // all â€” any of them would force (or break) an encode.
+            // all — any of them would force (or break) an encode.
             a.push("-c:v".into());
             a.push("copy".into());
         }
@@ -465,6 +589,15 @@ fn push_color_tag(args: &mut Vec<String>, flag: &str, value: &str) {
     }
     args.push(flag.into());
     args.push(v);
+}
+
+/// VideoToolbox quality for a CQ-slider position. Apple's `-q:v` scale is
+/// inverted (higher = better, 1–100): CQ 18 lands at the encoder's top
+/// end, each CQ step down drops ~2 quality points.
+fn vt_quality_for(cq: u32) -> u32 {
+    100u32
+        .saturating_sub(cq.saturating_sub(18) * 2)
+        .clamp(50, 100)
 }
 
 /// Push one audio output's codec options: `-c:a copy`, or a re-encode
@@ -660,6 +793,7 @@ pub fn run_with_fallback(
     extra_args: &[String],
     opus_bps: Option<u32>,
     all_audio: bool,
+    film_grain: bool,
     progress: &dyn Fn(Progress),
     cancel: &Arc<AtomicBool>,
     caps: &HwCaps,
@@ -690,7 +824,8 @@ pub fn run_with_fallback(
         // misleading "No such file or directory" on the output.
         ensure_output_dir(out_path)?;
         let args = build_args(
-            media, level, preset, cq, scale, keep_subs, out_path, &plan, extra_args,
+            media, level, preset, cq, scale, keep_subs, out_path, &plan, extra_args, caps,
+            film_grain,
         );
         log::debug_log(&format!(
             "[{}] {} ({})",
@@ -720,6 +855,7 @@ pub fn run_with_fallback(
                     ));
                     let args = build_args(
                         media, level, preset, cq, scale, keep_subs, out_path, &plan, extra_args,
+                        caps, film_grain,
                     );
                     match run_once(
                         media, &args, level, preset, cq, scale, &plan, progress, cancel,
@@ -753,6 +889,7 @@ pub fn run_with_fallback(
                     ));
                     let args = build_args(
                         media, level, preset, cq, scale, keep_subs, out_path, &plan, extra_args,
+                        caps, film_grain,
                     );
                     match run_once(
                         media, &args, level, preset, cq, scale, &plan, progress, cancel,
@@ -844,6 +981,15 @@ fn is_hw_error(e: &str) -> bool {
         "cannot be used with",
         "impossible to convert",
         "scale_cuda",
+        // The other vendor families: a family-level init failure must fall
+        // through to the next level, not fail the file.
+        "qsv",
+        "amf",
+        "videotoolbox",
+        "d3d11",
+        "vaapi",
+        "mfx",
+        "onevpl",
     ]
     .iter()
     .any(|k| l.contains(k))
@@ -1109,20 +1255,31 @@ fn run_once(
     // benchmark hwdec flags and logs don't claim a GPU path we didn't get.
     let hw_decode_actual = level.uses_hw_decode() && !stderr_shows_sw_fallback(&bench_tail);
     let quality = match level {
-        Level::HwHevc | Level::CpuDecodeHevcNvenc => format!("cq{cq}"),
-        Level::HwH264 | Level::CpuDecodeH264Nvenc => format!("cq{cq}"),
-        Level::CpuX264 => format!("crf{cq}"),
-        Level::CpuX265 => format!("crf{cq}"),
-        Level::CpuAv1 => format!("crf{cq}"),
+        Level::HwHevc
+        | Level::CpuDecodeHevcNvenc
+        | Level::HwH264
+        | Level::CpuDecodeH264Nvenc
+        | Level::HwAv1
+        | Level::CpuDecodeAv1Nvenc => format!("cq{cq}"),
+        Level::CpuX264 | Level::CpuX265 | Level::CpuAv1 => format!("crf{cq}"),
+        Level::VtHevc | Level::VtH264 => format!("q{}", vt_quality_for(cq)),
+        Level::QsvHevc | Level::QsvH264 | Level::QsvAv1 => format!("icq{cq}"),
+        Level::AmfHevc | Level::AmfH264 | Level::AmfAv1 => format!("qp{cq}"),
         Level::CopyVideo => "copy".into(),
     };
     let preset_label = match level {
-        Level::HwHevc | Level::CpuDecodeHevcNvenc | Level::HwH264 | Level::CpuDecodeH264Nvenc => {
-            preset.as_str().into()
-        }
+        Level::HwHevc
+        | Level::CpuDecodeHevcNvenc
+        | Level::HwH264
+        | Level::CpuDecodeH264Nvenc
+        | Level::HwAv1
+        | Level::CpuDecodeAv1Nvenc => preset.as_str().into(),
+        Level::VtHevc | Level::VtH264 => "vt".into(),
+        Level::QsvHevc | Level::QsvH264 | Level::QsvAv1 => preset.qsv().into(),
+        Level::AmfHevc | Level::AmfH264 | Level::AmfAv1 => preset.amf().into(),
         Level::CpuX264 => "medium".into(),
         Level::CpuX265 => "slow".into(),
-        Level::CpuAv1 => "svt-p8".into(),
+        Level::CpuAv1 => format!("svt-p{}", preset.svt()),
         Level::CopyVideo => "copy".into(),
     };
     Ok(EncodeResult {
@@ -1666,7 +1823,35 @@ mod tests {
             Path::new("out.mkv"),
             &plan,
             &[],
+            &caps(),
+            false,
         )
+    }
+
+    /// Full-fat caps: every trial passed, hwaccels listed.
+    fn caps() -> HwCaps {
+        HwCaps {
+            cuda_hwaccel: true,
+            hevc_nvenc: true,
+            h264_nvenc: true,
+            av1_nvenc_listed: true,
+            av1_nvenc_usable: true,
+            nvenc_b_ref_mode: true,
+            vt_h264: false,
+            vt_hevc: false,
+            qsv_h264: false,
+            qsv_hevc: false,
+            qsv_av1_listed: false,
+            qsv_av1_usable: false,
+            amf_h264: false,
+            amf_hevc: false,
+            amf_av1_listed: false,
+            amf_av1_usable: false,
+            svt_av1: true,
+            cuvid_decoders: vec![],
+            gpu_label: "test".into(),
+            hwaccels: vec!["cuda".into(), "d3d11va".into()],
+        }
     }
 
     #[test]
@@ -1771,9 +1956,227 @@ mod tests {
             Path::new("out.mkv"),
             &plan,
             &extra,
+            &caps(),
+            false,
         );
         let tail = args[args.len() - 5..].join(" ");
         assert_eq!(tail, "-tune grain -maxrate 8M out.mkv", "{args:?}");
+    }
+
+    #[test]
+    fn cpu_levels_get_decode_assist_only_when_hwaccels_exist() {
+        let m = test_media();
+        let plan = StreamPlan {
+            has_audio: false,
+            copy_subs: false,
+            audio_copy_eligible: false,
+            audio_codec: crate::pipeline::AudioCodec::Opus(crate::pipeline::DEFAULT_OPUS_BPS),
+            opus_bps: Some(crate::pipeline::DEFAULT_OPUS_BPS),
+            all_audio: false,
+            force_aac: false,
+            force_audio: false,
+            audio_layout_note: "",
+        };
+        let mk = |caps: &HwCaps| {
+            build_args(
+                &m,
+                Level::CpuAv1,
+                NvencPreset::P5,
+                32,
+                crate::pipeline::ScalePolicy::Preserve,
+                true,
+                Path::new("out.mkv"),
+                &plan,
+                &[],
+                caps,
+                false,
+            )
+            .join(" ")
+        };
+        // Hardware decode exists → the CPU level rides `-hwaccel auto`
+        // (frames still land in system RAM for the encoder).
+        let with_hw = mk(&caps());
+        assert!(with_hw.contains("-hwaccel auto"), "{with_hw}");
+        assert!(!with_hw.contains("-hwaccel_output_format"), "{with_hw}");
+        // No hwaccels at all → no decode flags, plain software pipeline.
+        let mut bare = caps();
+        bare.hwaccels = vec![];
+        let without_hw = mk(&bare);
+        assert!(!without_hw.contains("-hwaccel"), "{without_hw}");
+        // Copy-video never takes decode flags: nothing is decoded for reuse.
+        let copy = build_args(
+            &m,
+            Level::CopyVideo,
+            NvencPreset::P5,
+            28,
+            crate::pipeline::ScalePolicy::Preserve,
+            true,
+            Path::new("out.mkv"),
+            &plan,
+            &[],
+            &caps(),
+            false,
+        )
+        .join(" ");
+        assert!(!copy.contains("-hwaccel"), "{copy}");
+        // The explicit zero-copy levels keep the CUDA pair, not `auto`.
+        let zero_copy = nvenc_args(&m).join(" ");
+        assert!(zero_copy.contains("-hwaccel cuda -hwaccel_output_format cuda"));
+        assert!(!zero_copy.contains("auto"), "{zero_copy}");
+    }
+
+    #[test]
+    fn av1_nvenc_args_carry_the_full_flag_set() {
+        let m = test_media();
+        let args = nvenc_args_at(Level::HwAv1, &m, &caps());
+        let joined = args.join(" ");
+        assert!(joined.contains("-c:v av1_nvenc"), "{joined}");
+        assert!(joined.contains("-b_ref_mode middle"), "{joined}");
+        assert!(joined.contains("-spatial-aq 1"), "{joined}");
+        assert!(joined.contains("-rc vbr -cq 28 -b:v 0"), "{joined}");
+    }
+
+    #[test]
+    fn hevc_b_ref_mode_follows_the_trial() {
+        let m = test_media();
+        let on = nvenc_args(&m).join(" ");
+        assert!(on.contains("-b_ref_mode middle"), "{on}");
+        let mut off = caps();
+        off.nvenc_b_ref_mode = false;
+        let off_args = nvenc_args_at(Level::HwHevc, &m, &off).join(" ");
+        assert!(!off_args.contains("b_ref_mode"), "{off_args}");
+    }
+
+    #[test]
+    fn vt_qsv_amf_args_map_the_shared_knobs() {
+        let m = test_media();
+        let plan = StreamPlan {
+            has_audio: false,
+            copy_subs: false,
+            audio_copy_eligible: false,
+            audio_codec: crate::pipeline::AudioCodec::Opus(crate::pipeline::DEFAULT_OPUS_BPS),
+            opus_bps: Some(crate::pipeline::DEFAULT_OPUS_BPS),
+            all_audio: false,
+            force_aac: false,
+            force_audio: false,
+            audio_layout_note: "",
+        };
+        let mk = |level: Level| {
+            build_args(
+                &m,
+                level,
+                NvencPreset::P5,
+                28,
+                crate::pipeline::ScalePolicy::Preserve,
+                true,
+                Path::new("out.mkv"),
+                &plan,
+                &[],
+                &caps(),
+                false,
+            )
+            .join(" ")
+        };
+        // VideoToolbox: -q:v quality, CQ 28 → q80, software fallback allowed.
+        let vt = mk(Level::VtHevc);
+        assert!(vt.contains("-c:v hevc_videotoolbox -q:v 80"), "{vt}");
+        assert!(vt.contains("-allow_sw 1"), "{vt}");
+        // Quick Sync: ICQ + named preset; look-ahead on HEVC, not on AV1.
+        let qsv = mk(Level::QsvHevc);
+        assert!(qsv.contains("-hwaccel auto"), "{qsv}");
+        assert!(qsv.contains("-c:v hevc_qsv -global_quality 28"), "{qsv}");
+        assert!(qsv.contains("-look_ahead 1"), "{qsv}");
+        let qsv_av1 = mk(Level::QsvAv1);
+        assert!(
+            qsv_av1.contains("-c:v av1_qsv -global_quality 28"),
+            "{qsv_av1}"
+        );
+        assert!(!qsv_av1.contains("-look_ahead"), "{qsv_av1}");
+        // AMF: CQP with per-frame QPs, VBAQ on the older codecs.
+        let amf = mk(Level::AmfHevc);
+        assert!(
+            amf.contains("-c:v hevc_amf -quality quality -rc cqp"),
+            "{amf}"
+        );
+        assert!(amf.contains("-qp_i 26 -qp_p 28"), "{amf}");
+        assert!(amf.contains("-vbaq 1"), "{amf}");
+        let amf_av1 = mk(Level::AmfAv1);
+        assert!(amf_av1.contains("-c:v av1_amf"), "{amf_av1}");
+        assert!(!amf_av1.contains("-vbaq"), "{amf_av1}");
+    }
+
+    #[test]
+    fn svt_preset_and_film_grain_flow_into_args() {
+        // Lean source (3 Mbps 1080p): no film-grain even when enabled —
+        // there is nothing to synthesise.
+        let mut lean = test_media();
+        lean.vbitrate = Some(3_000_000);
+        lean.bytes = 225_000_000;
+        let plan = StreamPlan {
+            has_audio: false,
+            copy_subs: false,
+            audio_copy_eligible: false,
+            audio_codec: crate::pipeline::AudioCodec::Opus(crate::pipeline::DEFAULT_OPUS_BPS),
+            opus_bps: Some(crate::pipeline::DEFAULT_OPUS_BPS),
+            all_audio: false,
+            force_aac: false,
+            force_audio: false,
+            audio_layout_note: "",
+        };
+        let mk = |m: &MediaFile, preset: NvencPreset, fgs: bool| {
+            build_args(
+                m,
+                Level::CpuAv1,
+                preset,
+                30,
+                crate::pipeline::ScalePolicy::Preserve,
+                true,
+                Path::new("out.mkv"),
+                &plan,
+                &[],
+                &caps(),
+                fgs,
+            )
+            .join(" ")
+        };
+        assert!(mk(&lean, NvencPreset::P5, true).contains("-preset 8"));
+        assert!(mk(&lean, NvencPreset::P3, true).contains("-preset 6"));
+        // Dense 30 Mbps 4K source with FGS on: parameters present.
+        let args = mk(&test_media(), NvencPreset::P5, true);
+        assert!(args.contains("film-grain=8:film-grain-denoise=1"), "{args}");
+        // Same dense source, switch off: plain encode.
+        let off = mk(&test_media(), NvencPreset::P5, false);
+        assert!(!off.contains("film-grain"), "{off}");
+        // Lean source with FGS on: still plain (nothing to synthesise).
+        assert!(!mk(&lean, NvencPreset::P5, true).contains("film-grain"));
+    }
+
+    /// `nvenc_args` at an arbitrary level/caps, for the per-family tests.
+    fn nvenc_args_at(level: Level, m: &MediaFile, caps: &HwCaps) -> Vec<String> {
+        let plan = StreamPlan {
+            has_audio: false,
+            copy_subs: false,
+            audio_copy_eligible: false,
+            audio_codec: crate::pipeline::AudioCodec::Opus(crate::pipeline::DEFAULT_OPUS_BPS),
+            opus_bps: Some(crate::pipeline::DEFAULT_OPUS_BPS),
+            all_audio: false,
+            force_aac: false,
+            force_audio: false,
+            audio_layout_note: "",
+        };
+        build_args(
+            m,
+            level,
+            NvencPreset::P5,
+            28,
+            crate::pipeline::ScalePolicy::Preserve,
+            true,
+            Path::new("out.mkv"),
+            &plan,
+            &[],
+            caps,
+            false,
+        )
     }
 
     #[test]
@@ -1813,6 +2216,8 @@ Conversion failed!\n";
             Path::new("out.mkv"),
             &plan,
             &[],
+            &caps(),
+            false,
         );
         let joined = args.join(" ");
         assert!(joined.contains("-c:a aac -b:a 128k"), "{joined}");
@@ -1850,6 +2255,8 @@ Conversion failed!\n";
             Path::new("out.mkv"),
             &plan,
             &[],
+            &caps(),
+            false,
         );
         let joined = args.join(" ");
         assert!(joined.contains("-map 0:a "), "{joined}");
@@ -1886,6 +2293,8 @@ Conversion failed!\n";
             Path::new("out.mkv"),
             &plan,
             &[],
+            &caps(),
+            false,
         );
         let joined = args.join(" ");
         assert!(joined.contains("-c:a libopus -b:a 512k"), "{joined}");
@@ -1919,6 +2328,8 @@ Conversion failed!\n";
             Path::new("out.mkv"),
             &plan,
             &[],
+            &caps(),
+            false,
         );
         let joined = args.join(" ");
         assert!(joined.contains("-c:a libopus -b:a 256k"), "{joined}");
@@ -1960,6 +2371,8 @@ Conversion failed!\n";
             Path::new("out.mkv"),
             &plan,
             &["-crf".into(), "32".into()],
+            &caps(),
+            true,
         );
         let joined = args.join(" ");
         assert!(joined.contains("-c:v copy"), "{joined}");
@@ -2012,6 +2425,8 @@ Conversion failed!\n";
             Path::new("out.mkv"),
             &plan,
             &[],
+            &caps(),
+            false,
         );
         let joined = args.join(" ");
         assert!(joined.contains("scale=320:240"), "{joined}");

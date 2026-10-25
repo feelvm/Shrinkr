@@ -1,5 +1,13 @@
-//! Benchmark mode: same source(s) through x264 CRF28 (baseline A) and
-//! HEVC NVENC CQ28 P3–P6 (B–E), recording size/time/fps/realtime/CPU/GPU.
+//! Benchmark mode: same source(s) through x264 CRF28 (baseline A), HEVC
+//! NVENC CQ28 at P3–P6 (B–E), plus AV1 NVENC P5 (F) and SVT-AV1 preset 8
+//! (G) when this machine can run them — recording size/time/fps/
+//! realtime/GPU per row.
+//!
+//! Every successful row also feeds the estimate calibration
+//! (`crate::calib`): measured size vs the model's prediction becomes a
+//! per-encoder correction factor, persisted and applied to future
+//! estimates. Benchmarking once makes the Goal-segment numbers measured
+//! on this GPU instead of from a generic table.
 //!
 //! Usable two ways:
 //!
@@ -9,7 +17,7 @@
 
 use crate::ffmpeg::{EncodeBackend, FfmpegBackend};
 use crate::media::{human_bytes, MediaFile};
-use crate::pipeline::{Level, NvencPreset, ScalePolicy, VideoBackend};
+use crate::pipeline::{EstParams, Level, NvencPreset, ScalePolicy, VideoBackend};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -23,39 +31,47 @@ pub struct BenchItem {
     pub cq: u32,
 }
 
-pub fn matrix(cq: u32) -> Vec<BenchItem> {
-    vec![
-        BenchItem {
-            tag: "A:x264-crf28".into(),
-            backend: VideoBackend::CpuX264,
+/// Rows are capability-gated: a machine that can't run an encoder never
+/// sees (or waits through) its row.
+pub fn matrix(cq: u32, caps: &crate::hw::HwCaps) -> Vec<BenchItem> {
+    let mut v = vec![BenchItem {
+        tag: "A:x264-crf28".into(),
+        backend: VideoBackend::CpuX264,
+        preset: NvencPreset::P5,
+        cq: 28, // baseline stays pinned; the other rows sweep `cq`
+    }];
+    if caps.hevc_nvenc {
+        for (p, tag) in [
+            (NvencPreset::P3, "B:nvenc-p3"),
+            (NvencPreset::P4, "C:nvenc-p4"),
+            (NvencPreset::P5, "D:nvenc-p5"),
+            (NvencPreset::P6, "E:nvenc-p6"),
+        ] {
+            v.push(BenchItem {
+                tag: tag.into(),
+                backend: VideoBackend::HevcNvenc,
+                preset: p,
+                cq,
+            });
+        }
+    }
+    if caps.av1_nvenc_usable {
+        v.push(BenchItem {
+            tag: "F:av1-nvenc-p5".into(),
+            backend: VideoBackend::Av1Nvenc,
             preset: NvencPreset::P5,
-            cq: 28, // baseline stays pinned; NVENC rows sweep `cq`
-        },
-        BenchItem {
-            tag: "B:nvenc-p3".into(),
-            backend: VideoBackend::HevcNvenc,
-            preset: NvencPreset::P3,
             cq,
-        },
-        BenchItem {
-            tag: "C:nvenc-p4".into(),
-            backend: VideoBackend::HevcNvenc,
-            preset: NvencPreset::P4,
+        });
+    }
+    if caps.svt_av1 {
+        v.push(BenchItem {
+            tag: "G:svt-av1-p8".into(),
+            backend: VideoBackend::CpuAv1,
+            preset: NvencPreset::P5, // P5 maps to SVT preset 8
             cq,
-        },
-        BenchItem {
-            tag: "D:nvenc-p5".into(),
-            backend: VideoBackend::HevcNvenc,
-            preset: NvencPreset::P5,
-            cq,
-        },
-        BenchItem {
-            tag: "E:nvenc-p6".into(),
-            backend: VideoBackend::HevcNvenc,
-            preset: NvencPreset::P6,
-            cq,
-        },
-    ]
+        });
+    }
+    v
 }
 
 #[derive(Clone, Debug)]
@@ -137,8 +153,9 @@ fn csv_esc(s: &str) -> String {
     }
 }
 
-/// Run the 5-way matrix on one source file. Outputs go to `out_dir`.
-/// `dry_run` prints commands without executing.
+/// Run the capability-gated matrix on one source file. Outputs go to
+/// `out_dir`. `dry_run` prints commands without executing. Successful
+/// rows feed the estimate calibration afterwards.
 pub fn run_on_file(
     m: &MediaFile,
     out_dir: &Path,
@@ -151,18 +168,33 @@ pub fn run_on_file(
     let _ = std::fs::create_dir_all(out_dir);
     let be = FfmpegBackend;
     let cancel = Arc::new(AtomicBool::new(false));
+    let caps = crate::hw::caps();
     let mut rows = vec![];
+    // (settings, measured output/input ratio) per successful row — the
+    // calibration input.
+    let mut measured: Vec<(EstParams, f64)> = vec![];
     let stem = m.path.file_stem().and_then(|s| s.to_str()).unwrap_or("src");
-    for item in matrix(cq) {
+    for item in matrix(cq, caps) {
         let safe_tag: String = item
             .tag
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '_' })
             .collect();
         let out = out_dir.join(format!("{stem}-{safe_tag}.mkv"));
+        let est_params = || EstParams {
+            backend: item.backend,
+            preset: item.preset,
+            cq: item.cq,
+            scale,
+            opus_bps: Some(crate::pipeline::DEFAULT_OPUS_BPS),
+            all_audio: false,
+            image_cq: 28,
+            image_scale: ScalePolicy::Preserve,
+            image_preserve_format: false,
+            film_grain: false,
+        };
         if dry_run {
-            let levels =
-                crate::pipeline::select_levels_for_media(item.backend, crate::hw::caps(), m);
+            let levels = crate::pipeline::select_levels_for_media(item.backend, caps, m);
             let level = levels.first().copied().unwrap_or(Level::CpuX264);
             let plan = crate::pipeline::plan_streams(
                 m,
@@ -180,6 +212,8 @@ pub fn run_on_file(
                 &out,
                 &plan,
                 &[],
+                caps,
+                false,
             );
             on_step(&format!(
                 "[dry-run {}] {}",
@@ -202,12 +236,16 @@ pub fn run_on_file(
             &[],
             Some(crate::pipeline::DEFAULT_OPUS_BPS),
             false,
+            // Bench rows keep film-grain off: the matrix compares encoders,
+            // and FGS would make the SVT row measure a different tool.
+            false,
             &|_| {},
             &cancel,
         );
         let _wall = t0.elapsed().as_secs_f64();
         match r {
             Ok(er) => {
+                measured.push((est_params(), er.ratio));
                 rows.push(BenchRow {
                     tag: item.tag.clone(),
                     source: m.path.display().to_string(),
@@ -234,6 +272,22 @@ pub fn run_on_file(
             Err(e) => rows.push(BenchRow::fail(&item.tag, m, format!("FAIL: {e}"))),
         }
         let _ = std::fs::remove_file(&out);
+    }
+    if !dry_run && !measured.is_empty() {
+        let name = m
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("source");
+        let cal = crate::calib::from_measurements(m, &measured, name);
+        let touched: Vec<String> = cal.factors.keys().cloned().collect();
+        crate::calib::apply(cal);
+        if !touched.is_empty() {
+            on_step(&format!(
+                "calibrated estimates for: {} (persisted for future runs)",
+                touched.join(", ")
+            ));
+        }
     }
     rows
 }
@@ -313,6 +367,58 @@ pub fn collect_inputs(arg: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn caps(hevc_nvenc: bool, av1_nvenc: bool, svt: bool) -> crate::hw::HwCaps {
+        crate::hw::HwCaps {
+            cuda_hwaccel: hevc_nvenc,
+            hevc_nvenc,
+            h264_nvenc: hevc_nvenc,
+            av1_nvenc_listed: av1_nvenc,
+            av1_nvenc_usable: av1_nvenc,
+            nvenc_b_ref_mode: false,
+            vt_h264: false,
+            vt_hevc: false,
+            qsv_h264: false,
+            qsv_hevc: false,
+            qsv_av1_listed: false,
+            qsv_av1_usable: false,
+            amf_h264: false,
+            amf_hevc: false,
+            amf_av1_listed: false,
+            amf_av1_usable: false,
+            svt_av1: svt,
+            cuvid_decoders: vec![],
+            gpu_label: "test".into(),
+            hwaccels: vec![],
+        }
+    }
+
+    #[test]
+    fn matrix_follows_capabilities() {
+        // CPU-only machine: just the x264 baseline, nothing to wait through.
+        let cpu = matrix(28, &caps(false, false, false));
+        assert_eq!(cpu.len(), 1);
+        assert!(cpu[0].tag.starts_with("A:x264"));
+        // RTX 40 box: baseline + 4 NVENC presets + AV1 NVENC + SVT.
+        let rtx40 = matrix(28, &caps(true, true, true));
+        let tags: Vec<&str> = rtx40.iter().map(|i| i.tag.as_str()).collect();
+        assert_eq!(
+            tags,
+            vec![
+                "A:x264-crf28",
+                "B:nvenc-p3",
+                "C:nvenc-p4",
+                "D:nvenc-p5",
+                "E:nvenc-p6",
+                "F:av1-nvenc-p5",
+                "G:svt-av1-p8",
+            ]
+        );
+        // RTX 30 (trial failed): AV1 NVENC absent, SVT still there.
+        let rtx30 = matrix(28, &caps(true, false, true));
+        assert!(!rtx30.iter().any(|i| i.tag.contains("av1-nvenc")));
+        assert!(rtx30.iter().any(|i| i.tag.contains("svt-av1")));
+    }
 
     #[test]
     fn collect_inputs_is_video_only() {

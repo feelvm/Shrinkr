@@ -788,6 +788,7 @@ fn PipelineCard() -> Element {
     let image_preserve_format = s.image_preserve_format;
     let keep_subs = s.keep_subs;
     let all_audio = s.all_audio;
+    let film_grain = s.film_grain;
     let skip_efficient = s.skip_efficient;
     let replace = s.replace;
     let min_saving = s.min_saving_pct;
@@ -812,9 +813,10 @@ fn PipelineCard() -> Element {
     );
     let saving_label = format!("{min_saving:.0}");
     let parallel_label = format!("{parallel}");
-    // Feature greying: options a re-encode backend needs but this machine
-    // lacks are disabled in place rather than hidden, so the plan and the
-    // dropdown always agree on what exists.
+    // Capability gating: hardware backends this machine can't run are
+    // absent from the dropdown entirely (detection trials the AV1
+    // variants with the real flag set) — the menu never offers an option
+    // that would fail over to a fallback.
     let caps = shrinkr_core::hw::caps();
     rsx! {
         Card {
@@ -847,8 +849,14 @@ fn PipelineCard() -> Element {
                                 class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
                                 onchange: move |e: FormEvent| {
                                     state.write().backend = match e.value().as_str() {
+                                        "av1-nvenc" => VideoBackend::Av1Nvenc,
                                         "hevc" => VideoBackend::HevcNvenc,
                                         "h264" => VideoBackend::H264Nvenc,
+                                        "vt-hevc" => VideoBackend::VtHevc,
+                                        "qsv-hevc" => VideoBackend::QsvHevc,
+                                        "qsv-av1" => VideoBackend::QsvAv1,
+                                        "amf-hevc" => VideoBackend::AmfHevc,
+                                        "amf-av1" => VideoBackend::AmfAv1,
                                         "x264" => VideoBackend::CpuX264,
                                         "x265" => VideoBackend::CpuX265,
                                         "av1" => VideoBackend::CpuAv1,
@@ -856,17 +864,46 @@ fn PipelineCard() -> Element {
                                         _ => VideoBackend::Auto,
                                     };
                                 },
-                                option { value: "auto", selected: backend == VideoBackend::Auto, "Auto (NVDEC→NVENC→CPU)" }
-                                option { value: "hevc", selected: backend == VideoBackend::HevcNvenc, disabled: !caps.hevc_nvenc, "NVENC HEVC" }
-                                option { value: "h264", selected: backend == VideoBackend::H264Nvenc, disabled: !caps.h264_nvenc, "NVENC H.264" }
+                                // Hardware backends appear only when this
+                                // machine can actually run them (detection
+                                // includes a trial encode for the AV1
+                                // variants) — an incompatible option is
+                                // never shown, never mind selectable.
+                                option { value: "auto", selected: backend == VideoBackend::Auto, "Auto (best HW → CPU)" }
+                                if caps.av1_nvenc_usable {
+                                    option { value: "av1-nvenc", selected: backend == VideoBackend::Av1Nvenc, "NVENC AV1 (RTX 40+)" }
+                                }
+                                if caps.hevc_nvenc {
+                                    option { value: "hevc", selected: backend == VideoBackend::HevcNvenc, "NVENC HEVC" }
+                                }
+                                if caps.h264_nvenc {
+                                    option { value: "h264", selected: backend == VideoBackend::H264Nvenc, "NVENC H.264" }
+                                }
+                                if caps.vt_hevc {
+                                    option { value: "vt-hevc", selected: backend == VideoBackend::VtHevc, "VideoToolbox HEVC (Apple)" }
+                                }
+                                if caps.qsv_hevc {
+                                    option { value: "qsv-hevc", selected: backend == VideoBackend::QsvHevc, "Quick Sync HEVC (Intel)" }
+                                }
+                                if caps.qsv_av1_usable {
+                                    option { value: "qsv-av1", selected: backend == VideoBackend::QsvAv1, "Quick Sync AV1 (Arc)" }
+                                }
+                                if caps.amf_hevc {
+                                    option { value: "amf-hevc", selected: backend == VideoBackend::AmfHevc, "AMF HEVC (AMD)" }
+                                }
+                                if caps.amf_av1_usable {
+                                    option { value: "amf-av1", selected: backend == VideoBackend::AmfAv1, "AMF AV1 (RX 7000+)" }
+                                }
                                 option { value: "x264", selected: backend == VideoBackend::CpuX264, "CPU x264 (CRF = slider)" }
                                 option { value: "x265", selected: backend == VideoBackend::CpuX265, "CPU x265 slow (CRF = slider)" }
-                                option { value: "av1", selected: backend == VideoBackend::CpuAv1, disabled: !caps.svt_av1, "CPU AV1 SVT (slow)" }
+                                if caps.svt_av1 {
+                                    option { value: "av1", selected: backend == VideoBackend::CpuAv1, "CPU AV1 SVT (slow)" }
+                                }
                                 option { value: "copy", selected: backend == VideoBackend::CopyVideo, "Audio only" }
                             }
                         }
                         div { class: "flex flex-col gap-1",
-                            Label { "NVENC preset" }
+                            Label { "Encoder preset" }
                             select {
                                 class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
                                 onchange: move |e: FormEvent| {
@@ -881,6 +918,9 @@ fn PipelineCard() -> Element {
                                 option { value: "p4", selected: preset == NvencPreset::P4, "P4 (medium)" }
                                 option { value: "p5", selected: preset == NvencPreset::P5, "P5 (slow)" }
                                 option { value: "p6", selected: preset == NvencPreset::P6, "P6 (slower)" }
+                            }
+                            p { class: "text-xs text-muted-foreground",
+                                "Speed↔size on every family: NVENC P-series, Quick Sync and SVT presets follow this knob."
                             }
                         }
                         div { class: "flex flex-col gap-1",
@@ -961,17 +1001,29 @@ fn PipelineCard() -> Element {
                     div { class: "flex items-center gap-3",
                         div { class: "w-28 shrink-0",
                             Label {
-                                if backend == VideoBackend::CopyVideo {
-                                    "Quality (N/A)"
-                                } else if backend.cq_is_av1_crf() {
-                                    "AV1 CRF"
-                                } else if backend == VideoBackend::CpuX264 {
-                                    "x264 CRF"
-                                } else if backend == VideoBackend::CpuX265 {
-                                    "x265 CRF"
-                                } else {
-                                    "NVENC CQ"
-                                }
+                            if backend == VideoBackend::CopyVideo {
+                                "Quality (N/A)"
+                            } else if backend.cq_is_av1_crf() {
+                                "AV1 CRF"
+                            } else if backend == VideoBackend::CpuX264 {
+                                "x264 CRF"
+                            } else if backend == VideoBackend::CpuX265 {
+                                "x265 CRF"
+                            } else if matches!(
+                                backend,
+                                VideoBackend::Av1Nvenc
+                                    | VideoBackend::QsvAv1
+                                    | VideoBackend::AmfAv1
+                            ) {
+                                "AV1 CQ"
+                            } else if matches!(
+                                backend,
+                                VideoBackend::VtHevc | VideoBackend::QsvHevc | VideoBackend::AmfHevc
+                            ) {
+                                "GPU CQ"
+                            } else {
+                                "NVENC CQ"
+                            }
                             }
                         }
                         div { class: "max-w-md flex-1",
@@ -1006,6 +1058,18 @@ fn PipelineCard() -> Element {
                                 on_checked_change: move |v| state.write().all_audio = v,
                             }
                             "Keep all audio tracks (dual-audio)"
+                        }
+                        // SVT-only tool: hidden entirely when the build
+                        // lacks the encoder, like every other capability-
+                        // gated option.
+                        if caps.svt_av1 {
+                            label { class: "flex items-center gap-2 text-sm",
+                                Checkbox {
+                                    checked: film_grain,
+                                    on_checked_change: move |v| state.write().film_grain = v,
+                                }
+                                "AV1 film-grain synthesis (grainy sources)"
+                            }
                         }
                     }
                     div { class: "flex flex-col gap-1",
@@ -1583,6 +1647,8 @@ fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
                     std::path::Path::new("<tmp>.mkv"),
                     &plan,
                     &extra_args,
+                    caps(),
+                    params.film_grain,
                 );
                 command_line(&args)
             })
@@ -1716,6 +1782,7 @@ fn solve_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         extra_args,
         params.opus_bps,
         params.all_audio,
+        params.film_grain,
         spec,
     );
 }

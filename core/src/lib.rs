@@ -3,6 +3,7 @@
 //! headless CLI.
 
 pub mod bench;
+pub mod calib;
 pub mod convert;
 pub mod ffmpeg;
 pub mod ffmpeg_fetch;
