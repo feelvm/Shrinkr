@@ -448,6 +448,24 @@ fn Sidebar() -> Element {
     let exec_total = s.exec_total;
     let exec_overall = s.exec_overall();
     let exec_items = s.exec_items.clone();
+    // Files already waiting behind the running batch (auto-queued
+    // mid-run or added via the Queue button). They live in `pending`
+    // until the batch drains, and must be visible here — otherwise a
+    // fully-queued scan reads as "Queue 0 more" with nothing happening.
+    let pending_files: Vec<(String, String)> = s
+        .pending
+        .iter()
+        .map(|f| {
+            (
+                f.path
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                f.res_label(),
+            )
+        })
+        .collect();
     let n_eligible = s.eligible().len();
     // Files addable to the running batch queue (the mid-run Queue
     // button): below-threshold files count too — the click is explicit.
@@ -462,10 +480,13 @@ fn Sidebar() -> Element {
         0.0
     };
     let probe_label = format!("Probing {probe_done}/{probe_total} …");
-    let progress_label = format!(
+    let mut progress_label = format!(
         "Working {exec_done}/{exec_total} — {:.0}%",
         exec_overall * 100.0
     );
+    if !pending_files.is_empty() {
+        progress_label.push_str(&format!(" (+{} waiting)", pending_files.len()));
+    }
     let process_label = format!("Process {n_eligible} file(s)");
     // OS drag & drop onto the sidebar queues shrink sources.
     let drop_tx = pump_tx();
@@ -667,6 +688,21 @@ fn Sidebar() -> Element {
                                     span { class: "shrink-0 text-xs text-muted-foreground", "{item.status_text()}" }
                                 }
                                 Progress { value: item.frac * 100.0 }
+                            }
+                        }
+                        // Files queued behind the running batch (scanned
+                        // in mid-run or pressed in via the Queue button).
+                        // Same row but with no bar: they start when the
+                        // current batch drains (logs say when each joined).
+                        for (p_name, p_res) in pending_files {
+                            div { class: "flex flex-col gap-1",
+                                div { class: "flex items-center gap-2",
+                                    span { class: "min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground/60", "{p_name}" }
+                                    if p_res != "?" {
+                                        span { class: "shrink-0 text-xs text-muted-foreground/60", "{p_res}" }
+                                    }
+                                    span { class: "shrink-0 text-xs text-muted-foreground/60", "waiting" }
+                                }
                             }
                         }
                     }
