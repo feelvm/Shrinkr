@@ -475,7 +475,7 @@ impl Default for AppState {
             image_scale: ScalePolicy::Preserve,
             image_preserve_format: true,
             film_grain: true,
-            keep_subs: true,
+            keep_subs: false,
             all_audio: false,
             opus_bps: None,
             min_saving_pct: 10.0,

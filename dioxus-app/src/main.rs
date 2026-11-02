@@ -1076,7 +1076,7 @@ fn PipelineCard() -> Element {
                                 checked: keep_subs,
                                 on_checked_change: move |v| state.write().keep_subs = v,
                             }
-                            "Keep subtitles (copied, tiny)"
+                            "Keep subtitles"
                         }
                         label { class: "flex items-center gap-2 text-sm",
                             Checkbox {
