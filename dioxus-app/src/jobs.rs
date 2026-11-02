@@ -1267,6 +1267,9 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                     ));
                     return;
                 };
+                // Failure bookkeeping continues off this snapshot; the
+                // chained leg appends onto the run's failed list.
+                s.exec_files = files.clone();
                 s.exec_items = files
                     .iter()
                     .map(|f| {
@@ -1342,6 +1345,12 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             if let Some(job) = job {
                 if let Some(item) = s.exec_items.get_mut(job) {
                     item.failed = true;
+                }
+                // Capture the full media record while state still holds
+                // the snapshot: the Retry button re-runs exactly what
+                // failed, with fresh metadata.
+                if let Some(f) = s.exec_files.get(job).cloned() {
+                    s.failed_files.push(f);
                 }
             }
             s.push_log(format!("warn: {}", msg));

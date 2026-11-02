@@ -288,6 +288,16 @@ pub struct AppState {
     pub target_solving: bool,
     pub executing: bool,
     pub exec_items: Vec<ExecItem>,
+    /// The files behind `exec_items`, index-aligned. The worker owns the
+    /// batch, but state keeps light clones so per-index events (failures)
+    /// can resolve back to full media metadata — that's what retry runs on.
+    pub exec_files: Vec<MediaFile>,
+    /// Files that failed this run, full records captured at failure time.
+    /// A failed encode placed nothing, so the snapshot's metadata is still
+    /// what should run again. Accumulates across chained batches; cleared
+    /// when a fresh Process run starts (Retry is not a reset — a retry's
+    /// failures stay retryable).
+    pub failed_files: Vec<MediaFile>,
     pub exec_total: usize,
     /// Files in this batch whose encode finished but produced a result that
     /// wasn't smaller than the source (discarded, original kept). Reported
@@ -477,6 +487,8 @@ impl Default for AppState {
             target_solving: false,
             executing: false,
             exec_items: vec![],
+            exec_files: vec![],
+            failed_files: vec![],
             exec_total: 0,
             exec_discarded: 0,
             cancel: None,
@@ -783,6 +795,16 @@ impl AppState {
             .iter()
             .filter(|i| i.done || i.failed)
             .count()
+    }
+
+    /// Files that failed this run — leveraged straight out of the run's
+    /// own records (`failed_files`): a failed encode placed nothing, so
+    /// the snapshot's metadata is exactly what should run again.
+    /// Accumulates across chained batches (their ExecDone swaps
+    /// `exec_items`, but failures from the previous leg are counted here
+    /// until a fresh Process resets the run).
+    pub fn retry_files(&self) -> &[MediaFile] {
+        &self.failed_files
     }
 
     /// Group progress: mean of per-file fractions. Monotonic by

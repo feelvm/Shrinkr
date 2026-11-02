@@ -452,6 +452,9 @@ fn Sidebar() -> Element {
     // Files addable to the running batch queue (the mid-run Queue
     // button): below-threshold files count too — the click is explicit.
     let n_queueable = s.queueable().len();
+    // Failed files from the last finished run — feeds the Retry button.
+    let n_retry = s.retry_files().len();
+    let retry_file_word = if n_retry == 1 { "file" } else { "files" };
     drop(s);
     let probe_pct = if probe_total > 0 {
         probe_done as f64 / probe_total as f64 * 100.0
@@ -631,7 +634,8 @@ fn Sidebar() -> Element {
                 }
             }
             // Run control, directly under the Library card: the Process
-            // button when idle, batch progress + cancel mid-run.
+            // button when idle (plus Retry while the last run left
+            // failures), batch progress + cancel mid-run.
             div { class: "flex flex-col gap-2",
                 if !executing {
                     Button {
@@ -639,6 +643,14 @@ fn Sidebar() -> Element {
                         class: "w-full",
                         onclick: move |_| crate::process_clicked(state, pump_tx()),
                         "{process_label}"
+                    }
+                    if n_retry > 0 {
+                        Button {
+                            variant: ButtonVariant::Warning,
+                            class: "w-full",
+                            onclick: move |_| crate::retry_clicked(state, pump_tx()),
+                            "Retry {n_retry} failed {retry_file_word}"
+                        }
                     }
                 } else {
                     Progress { value: exec_overall * 100.0 }
@@ -1606,9 +1618,6 @@ fn queue_clicked(mut state: Signal<AppState>) {
 }
 
 fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
-    use shrinkr_core::ffmpeg::{build_args, command_line};
-    use shrinkr_core::hw::caps;
-    use shrinkr_core::pipeline::{plan_streams_with, select_levels_for_media};
     let s = state.read();
     let idx = s.eligible();
     if idx.is_empty() {
@@ -1648,19 +1657,52 @@ fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         }
         return;
     }
+    let files: Vec<_> = idx.iter().map(|&i| s.files[i].clone()).collect();
+    drop(s);
+    start_batch(state, tx, files);
+}
+
+/// Re-run this run's failed files with the current settings. Failure is
+/// technical (decode, disk, flags), not a threshold verdict, so there's
+/// no preflight re-gate — the attempt either runs or fails again with a
+/// fresh log line. The failed list restarts at what this retry produces.
+fn retry_clicked(state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
+    let s = state.read();
+    // Belt and braces: the button only exists between runs.
+    if s.executing {
+        return;
+    }
+    let files = s.retry_files().to_vec();
+    drop(s);
+    if files.is_empty() {
+        return;
+    }
+    start_batch(state, tx, files);
+}
+
+/// Shared run entry for Process and Retry: ffmpeg sanity check, extra
+/// flags parsed up front (typos fail in the log, not halfway through a
+/// batch), a first-command echo, then the worker hand-off.
+fn start_batch(
+    mut state: Signal<AppState>,
+    tx: UnboundedSender<JobMsg>,
+    files: Vec<shrinkr_core::media::MediaFile>,
+) {
+    use shrinkr_core::ffmpeg::{build_args, command_line};
+    use shrinkr_core::hw::caps;
+    use shrinkr_core::pipeline::{plan_streams_with, select_levels_for_media};
     if shrinkr_core::process::cmd("ffmpeg")
         .arg("-version")
         .output()
         .is_err()
     {
-        drop(s);
         state.write().push_log(
             "ERROR: ffmpeg not found — press Download FFmpeg in the header, or grab a release archive (FFmpeg is bundled)."
                 .into(),
         );
         return;
     }
-    let files: Vec<_> = idx.iter().map(|&i| s.files[i].clone()).collect();
+    let s = state.read();
     let params = s.est_params();
     let keep_subs = s.keep_subs;
     let parallel = s.parallel.clamp(1, 8);
@@ -1748,6 +1790,10 @@ fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
                 )
             })
             .collect();
+        // Failure bookkeeping runs off this snapshot; a fresh run (Process
+        // or Retry) restarts the failed list — retries re-fail into it.
+        w.exec_files = files.clone();
+        w.failed_files.clear();
         w.exec_total = files.len();
         w.exec_discarded = 0;
         w.cancel = Some(cancel.clone());
