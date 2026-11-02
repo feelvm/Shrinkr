@@ -31,7 +31,7 @@ use shrinkr_core::images::{jpeg_q_for, webp_quality_for};
 use shrinkr_core::log::{Level, LogEntry};
 use shrinkr_core::media::human_bytes;
 use shrinkr_core::pipeline::{
-    preflight_auto_with, size_change_label, NvencPreset, Preflight, ScalePolicy, VideoBackend,
+    preflight_auto_with, NvencPreset, Preflight, ScalePolicy, VideoBackend,
 };
 use state::{AppState, Goal};
 use std::sync::{atomic::AtomicBool, Arc};
@@ -1299,6 +1299,19 @@ fn fmt_secs(secs: f64) -> String {
 /// derived by matching the current settings against each goal's resolved
 /// triple, so hand-tuning any knob drops the highlight instead of fighting
 /// the user.
+/// One Goal segment's second line, split so the leading percent can
+/// carry its own color (green shrink / orange growth) while the rest of
+/// the line keeps the segment's muted tone.
+struct GoalSub {
+    /// The percent (or the "no gain…" phrase when nothing shrinks).
+    main: String,
+    /// Tailwind color classes for [`Self::main`]; empty = inherit the
+    /// line's tone (used by "no gain", which isn't a size).
+    main_cls: &'static str,
+    /// " · ~time · n files (n warned)" tail.
+    rest: String,
+}
+
 #[component]
 fn GoalPicker() -> Element {
     let mut state = use_context::<Signal<AppState>>();
@@ -1311,7 +1324,7 @@ fn GoalPicker() -> Element {
     // encoder + preset alone — the axis stays a working speed↔size
     // control instead of never highlighting.
     let lossless = s.lossless;
-    let segs: Vec<(Goal, bool, Option<String>)> = Goal::ALL
+    let segs: Vec<(Goal, bool, Option<GoalSub>)> = Goal::ALL
         .iter()
         .map(|&goal| {
             let active = if lossless {
@@ -1342,21 +1355,29 @@ fn GoalPicker() -> Element {
                         // sign flip is enough — but never clamp: if the
                         // shrinking subset ever estimates a gain, say +
                         // honestly.
-                        let size = if pct >= 0.0 {
-                            format!("{pct:.0}%")
+                        let (text, cls) = if pct >= 0.0 {
+                            (format!("{pct:.0}%"), "text-green-500")
                         } else {
-                            format!("+{:.0}%", -pct)
+                            (format!("+{:.0}%", -pct), "text-orange-300")
                         };
-                        format!(
-                            "{size} · ~{} · {counted} {files_note}{warn_note}",
-                            fmt_secs(est.secs),
-                        )
+                        GoalSub {
+                            main: text,
+                            main_cls: cls,
+                            rest: format!(
+                                " · ~{} · {counted} {files_note}{warn_note}",
+                                fmt_secs(est.secs),
+                            ),
+                        }
                     }
-                    None => format!(
-                        "no gain{} · ~{} · {counted} {files_note}{warn_note}",
-                        if lossless { " at CQ 18" } else { "" },
-                        fmt_secs(est.secs),
-                    ),
+                    None => GoalSub {
+                        main: format!("no gain{}", if lossless { " at CQ 18" } else { "" }),
+                        // Not a size value — inherits the line's tone.
+                        main_cls: "",
+                        rest: format!(
+                            " · ~{} · {counted} {files_note}{warn_note}",
+                            fmt_secs(est.secs),
+                        ),
+                    },
                 })
             };
             (goal, active, line)
@@ -1380,7 +1401,6 @@ fn GoalPicker() -> Element {
                         } else {
                             "text-xs text-muted-foreground/75"
                         };
-                        let sub = line.unwrap_or_else(|| goal.subtitle().to_string());
                         rsx! {
                             button {
                                 key: "{goal:?}",
@@ -1394,7 +1414,15 @@ fn GoalPicker() -> Element {
                                     w.cq = c;
                                 },
                                 span { class: "font-medium", "{goal.label()}" }
-                                span { class: "{sub_cls}", "{sub}" }
+                                span { class: "{sub_cls}",
+                                    {match line {
+                                        Some(g) => rsx! {
+                                            span { class: "font-medium {g.main_cls}", "{g.main}" }
+                                            "{g.rest}"
+                                        },
+                                        None => rsx! { "{goal.subtitle()}" },
+                                    }}
+                                }
                             }
                         }
                     }
@@ -1526,14 +1554,43 @@ fn EstimateCard() -> Element {
         .sum();
     // Signed wording: a growing plan says how much it grows (bytes and
     // percent) instead of showing the same total with a 0% difference.
-    let change = size_change_label(elig_b, new_b);
-    let headline = format!(
-        "{} eligible • {} → {} • {}",
-        elig,
-        human_bytes(elig_b),
-        human_bytes(new_b),
-        change
-    );
+    // Split the change phrase so sizes and %-delta can carry the
+    // direction color (green shrink / orange growth) — the same palette
+    // the plan rows below use for ✓/⚠.
+    let (delta_b, delta_pct, delta_dir) = {
+        let d = new_b.abs_diff(elig_b);
+        let pct = if d == 0 {
+            "no size change".to_string()
+        } else {
+            let v = d as f64 / elig_b.max(1) as f64 * 100.0;
+            // Don't round a real change down to the misleading "0%".
+            if v < 0.5 {
+                "<1%".to_string()
+            } else {
+                format!("{v:.0}%")
+            }
+        };
+        let dir = if new_b == elig_b {
+            "none"
+        } else if new_b > elig_b {
+            "larger"
+        } else {
+            "smaller"
+        };
+        (human_bytes(d), pct, dir)
+    };
+    let change_cls = match delta_dir {
+        "larger" => "text-orange-300",
+        "smaller" => "text-green-500",
+        _ => "",
+    };
+    // The delta phrase mirrors core's size_change_label wording so the
+    // two always read the same; the rich parts get the direction color.
+    let delta_phrase = match delta_dir {
+        "larger" => format!("{delta_b} larger (+{delta_pct})"),
+        "smaller" => format!("{delta_b} smaller (−{delta_pct})"),
+        _ => delta_pct.clone(),
+    };
     let warn_note = if warned > 0 {
         format!(" • {warned} below {threshold:.0}% (warned, still queued)")
     } else {
@@ -1585,7 +1642,14 @@ fn EstimateCard() -> Element {
                 CardDescription { "Which files will be processed, and why the rest skip" }
             }
             CardContent {
-                p { class: "text-sm font-semibold", "{headline}" }
+                p { class: "text-sm font-semibold",
+                    "{elig} eligible • "
+                    span { class: "text-foreground", "{human_bytes(elig_b)}" }
+                    " → "
+                    span { class: "text-foreground", "{human_bytes(new_b)}" }
+                    " • "
+                    span { class: "{change_cls} font-medium", "{delta_phrase}" }
+                }
                 p { class: "text-xs text-muted-foreground", "{subline}" }
                 div { class: "mt-2 max-h-36 overflow-y-auto rounded-md border border-border p-2",
                     for (mark , text , cls) in rows {
