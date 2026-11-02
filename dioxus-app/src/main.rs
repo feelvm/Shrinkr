@@ -1272,20 +1272,45 @@ fn GoalPicker() -> Element {
                 goal.matches(backend, preset, cq, caps)
             };
             let est = s.goal_estimate(goal);
-            let line = est.saving_frac().map(|frac| {
-                let pct = -frac * 100.0;
-                let size = if pct >= 0.0 {
-                    format!("{pct:.0}%")
-                } else {
-                    format!("+{:.0}%", -pct)
-                };
-                format!(
-                    "{size} · ~{} · {} file{}",
-                    fmt_secs(est.secs),
-                    est.files,
-                    if est.files == 1 { "" } else { "s" }
-                )
-            });
+            let counted = est.files + est.warned;
+            let files_note = if counted == 1 { "file" } else { "files" };
+            // When nothing shrinks, "no gain" already says where every
+            // file went — the warned count would only duplicate it.
+            let warn_note = if est.files > 0 && est.warned > 0 {
+                format!(" ({} warned)", est.warned)
+            } else {
+                String::new()
+            };
+            let line = if counted == 0 {
+                // Nothing probed yet: the subtitle says what the goal is
+                // for; no probed videos would make a fake zero misleading.
+                None
+            } else {
+                Some(match est.saving_frac() {
+                    Some(frac) => {
+                        let pct = -frac * 100.0;
+                        // Warn files stay out of the shrink math (they
+                        // can only grow and get discarded), so a plain
+                        // sign flip is enough — but never clamp: if the
+                        // shrinking subset ever estimates a gain, say +
+                        // honestly.
+                        let size = if pct >= 0.0 {
+                            format!("{pct:.0}%")
+                        } else {
+                            format!("+{:.0}%", -pct)
+                        };
+                        format!(
+                            "{size} · ~{} · {counted} {files_note}{warn_note}",
+                            fmt_secs(est.secs),
+                        )
+                    }
+                    None => format!(
+                        "no gain{} · ~{} · {counted} {files_note}{warn_note}",
+                        if lossless { " at CQ 18" } else { "" },
+                        fmt_secs(est.secs),
+                    ),
+                })
+            };
             (goal, active, line)
         })
         .collect();

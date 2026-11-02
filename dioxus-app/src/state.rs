@@ -143,16 +143,28 @@ pub struct GoalEstimate {
     pub total_b: u64,
     pub new_b: u64,
     pub secs: f64,
-    /// Videos this goal would actually re-encode. Goals pass the
-    /// threshold gate differently, so segment times differ even at
-    /// equal savings — the count makes that visible.
+    /// Videos this goal would actually re-encode to a smaller file.
+    /// Goals pass the threshold gate differently, so segment times
+    /// differ even at equal savings — the count makes that visible.
     pub files: usize,
+    /// Warn-verdict videos: below-threshold (often growing) estimates
+    /// the goal would encode anyway and discard if the result comes out
+    /// larger — they can't grow the kept output, only burn time, so
+    /// they stay out of the shrink math and surface as a count on the
+    /// segment line.
+    pub warned: usize,
+    /// Warn sizes, so tests can still compare a capped run's estimates
+    /// against a released one (Lossless pins CQ away).
+    pub warned_total_b: u64,
+    pub warned_new_b: u64,
 }
 
 impl GoalEstimate {
-    /// Shrink as a fraction of input (negative = the plan grows; only
-    /// possible in exotic settings since below-threshold files are
-    /// excluded). `None` when there are no eligible videos.
+    /// Net change of the *shrinking* subset as a fraction of its bytes
+    /// (positive would mean growth; not reachable with the Shrink gate
+    /// today, but never clamped in case the model shifts). Warn verdicts
+    /// don't enter this — they can only grow, and the placement guard
+    /// keeps their originals. `None` when nothing shrinks.
     pub fn saving_frac(&self) -> Option<f64> {
         if self.total_b == 0 {
             None
@@ -699,6 +711,11 @@ impl AppState {
     /// in the batch's own bytes and minutes. Under Lossless the goal's CQ
     /// is overridden right back — all three segments share the pinned
     /// quality and differ only in encoder speed and efficiency.
+    ///
+    /// Only shrinking files enter the percentage: warn verdicts (below
+    /// threshold, often growing at a pinned CQ 18) would otherwise read
+    /// "+38%" on a shrink axis although the run discards those results
+    /// and keeps the originals — they surface as a warned count instead.
     pub fn goal_estimate(&self, goal: Goal) -> GoalEstimate {
         let caps = shrinkr_core::hw::caps();
         let (backend, preset, cq) = goal.resolve(caps);
@@ -716,13 +733,20 @@ impl AppState {
                 // segment contrast with three identical numbers.
                 continue;
             }
-            if !preflight_auto_with(f, &p, t, policy).will_shrink() {
+            let verdict = preflight_auto_with(f, &p, t, policy);
+            if !verdict.will_shrink() {
                 continue;
             }
-            est.total_b += f.bytes;
-            est.new_b += estimate_file(f, &p).new_bytes;
             est.secs += f.total_frames() / backend_fps(backend);
-            est.files += 1;
+            if verdict.is_warn() {
+                est.warned += 1;
+                est.warned_total_b += f.bytes;
+                est.warned_new_b += estimate_file(f, &p).new_bytes;
+            } else {
+                est.total_b += f.bytes;
+                est.new_b += estimate_file(f, &p).new_bytes;
+                est.files += 1;
+            }
         }
         est.secs /= self.parallel.max(1) as f64;
         est
@@ -876,18 +900,41 @@ mod tests {
         s.min_saving_pct = 0.0;
         s.skip_efficient = false;
         s.files.push(video());
-        let pinned = s.goal_estimate(Goal::Fastest).new_b;
+        let pinned = s.goal_estimate(Goal::Fastest);
         let released = {
             s.lossless = false;
-            s.goal_estimate(Goal::Fastest).new_b
+            s.goal_estimate(Goal::Fastest)
         };
+        // Growth estimates surface in the warn bucket, not the shrink
+        // sum — the pinned run's file lands there; the released (cq28)
+        // run shrinks it. Compare the per-file output sizes to keep the
+        // original inequality: cq18 must estimate bigger.
+        assert_eq!(pinned.warned, 1);
+        assert_eq!(pinned.files, 0);
+        assert!(released.files == 1 && released.warned == 0);
         assert!(
-            pinned > released,
+            pinned.warned_new_b > released.new_b,
             "cq{} estimate {} should exceed the cq28 plan {}",
             LOSSLESS_CQ,
-            pinned,
-            released
+            pinned.warned_new_b,
+            released.new_b
         );
+    }
+
+    #[test]
+    fn goal_segments_hide_growth_and_say_no_gain() {
+        // The reason for the warn bucket: a pinned CQ 18 run over
+        // already-tight sources once read "+38%" on a shrink axis. Growth
+        // can never reach the displayed percentage (the run would discard
+        // those results and keep the originals anyway).
+        let mut s = app();
+        s.min_saving_pct = 0.0;
+        s.skip_efficient = false;
+        s.files.push(video());
+        let est = s.goal_estimate(Goal::Fastest);
+        assert_eq!(est.warned_total_b, video().bytes);
+        assert!(est.total_b == 0 && est.new_b == 0);
+        assert!(est.saving_frac().is_none());
     }
 
     #[test]
