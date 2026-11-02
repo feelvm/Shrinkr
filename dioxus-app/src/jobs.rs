@@ -1102,7 +1102,9 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                                 ));
                             }
                         } else {
-                            s.push_log(format!("{name} would skip — in library, not queued"));
+                            s.push_log(format!(
+                                "{name} would skip — in library; the mid-run Queue button runs it anyway (warned)"
+                            ));
                         }
                     }
                 }
@@ -1198,6 +1200,7 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 // Pending files stay in the library, unrun.
                 let n = s.pending.len();
                 s.pending.clear();
+                s.pending_warn = false;
                 s.executing = false;
                 if stopped_no_gain {
                     let discarded = s.exec_discarded;
@@ -1241,7 +1244,12 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 return;
             }
             if !s.pending.is_empty() {
-                // Chain: files queued mid-run go next, same settings.
+                // Chain: files queued mid-run go next, same settings —
+                // except warn mode when the user explicitly queued files
+                // with the Queue button (below-threshold files joined on
+                // purpose, so they run instead of skipping).
+                let warn = s.pending_warn;
+                s.pending_warn = false;
                 let files = std::mem::take(&mut s.pending);
                 let Some(cfg) = s.exec_cfg.clone() else {
                     s.executing = false;
@@ -1268,6 +1276,7 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                                 .and_then(|x| x.to_str())
                                 .unwrap_or("?")
                                 .to_string(),
+                            f.path.clone(),
                             f.res_label(),
                         )
                     })
@@ -1277,8 +1286,13 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 let cancel = Arc::new(AtomicBool::new(false));
                 s.cancel = Some(cancel.clone());
                 s.push_log(format!(
-                    "Queued batch: starting {} more file(s) with the same settings …",
-                    files.len()
+                    "Queued batch: starting {} more file(s) with the same settings{} …",
+                    files.len(),
+                    if warn {
+                        " (warn mode: below-threshold files run after all)"
+                    } else {
+                        ""
+                    }
                 ));
                 start_exec(
                     tx,
@@ -1288,7 +1302,11 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                     cfg.parallel,
                     cfg.replace,
                     cfg.threshold,
-                    cfg.threshold_policy,
+                    if warn {
+                        ThresholdPolicy::Warn
+                    } else {
+                        cfg.threshold_policy
+                    },
                     cfg.extra_args,
                     cancel,
                 );

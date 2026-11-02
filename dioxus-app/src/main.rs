@@ -449,6 +449,9 @@ fn Sidebar() -> Element {
     let exec_overall = s.exec_overall();
     let exec_items = s.exec_items.clone();
     let n_eligible = s.eligible().len();
+    // Files addable to the running batch queue (the mid-run Queue
+    // button): below-threshold files count too — the click is explicit.
+    let n_queueable = s.queueable().len();
     drop(s);
     let probe_pct = if probe_total > 0 {
         probe_done as f64 / probe_total as f64 * 100.0
@@ -654,6 +657,17 @@ fn Sidebar() -> Element {
                                 Progress { value: item.frac * 100.0 }
                             }
                         }
+                    }
+                    // Mid-run manual queue: everything preflight can run
+                    // on joins the waiting queue (below-threshold files
+                    // run with a warning; the no-gain guard keeps
+                    // originals safe when estimates are optimistic).
+                    Button {
+                        variant: ButtonVariant::Default,
+                        class: "w-full",
+                        disabled: n_queueable == 0,
+                        onclick: move |_| queue_clicked(state),
+                        "Queue {n_queueable} more file(s)"
                     }
                     Button {
                         variant: ButtonVariant::Destructive,
@@ -1539,6 +1553,33 @@ fn EstimateCard() -> Element {
 
 /// UI-thread part of Process: eligibility gate with loud skip reasons,
 /// then state setup + worker handoff.
+/// Mid-run manual queue: move the still-queueable library files behind
+/// the running batch. Everything preflight can run on joins — including
+/// below-threshold files, run with a warning in the chained batch
+/// (`pending_warn`); the no-gain guard keeps their originals safe. The
+/// files encode with the running batch's frozen settings.
+fn queue_clicked(mut state: Signal<AppState>) {
+    let s = state.read();
+    // Belt and braces: the button only exists mid-run and is disabled
+    // when nothing is addable.
+    if !s.executing {
+        return;
+    }
+    let idx = s.queueable();
+    if idx.is_empty() {
+        return;
+    }
+    let files: Vec<_> = idx.iter().map(|&i| s.files[i].clone()).collect();
+    drop(s);
+    let mut w = state.write();
+    let added = files.len();
+    w.pending.extend(files);
+    w.pending_warn = true;
+    w.push_log(format!(
+        "Queued {added} more file(s) behind the running batch — they start when it finishes, same settings (below-threshold files warn)."
+    ));
+}
+
 fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     use shrinkr_core::ffmpeg::{build_args, command_line};
     use shrinkr_core::hw::caps;
@@ -1677,6 +1718,7 @@ fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
                         .and_then(|x| x.to_str())
                         .unwrap_or("?")
                         .to_string(),
+                    f.path.clone(),
                     f.res_label(),
                 )
             })

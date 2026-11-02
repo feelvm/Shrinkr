@@ -181,6 +181,9 @@ pub struct ExecCfg {
 #[derive(Clone, Debug)]
 pub struct ExecItem {
     pub name: String,
+    /// Source path, so queue-anyway logic can tell which library files
+    /// are already part of the running batch (names can collide).
+    pub path: PathBuf,
     /// Source resolution ("1920x1080"; "?" when the file has no
     /// dimensions, e.g. audio).
     pub res: String,
@@ -191,9 +194,10 @@ pub struct ExecItem {
 }
 
 impl ExecItem {
-    pub fn new(name: String, res: String) -> Self {
+    pub fn new(name: String, path: PathBuf, res: String) -> Self {
         Self {
             name,
+            path,
             res,
             frac: 0.0,
             fps: 0.0,
@@ -282,6 +286,11 @@ pub struct AppState {
     /// Files probed while a batch runs. Drained into a chained batch at
     /// ExecDone (same settings); discarded to the library on cancel.
     pub pending: Vec<MediaFile>,
+    /// True when the user explicitly queued files via the mid-run Queue
+    /// button: below-threshold files joined deliberately, so the chained
+    /// batch runs warn instead of skip (the no-gain guard still keeps
+    /// originals safe). Cleared once the chain starts or on cancel.
+    pub pending_warn: bool,
     /// Settings snapshot of the running batch, for chained batches.
     pub exec_cfg: Option<ExecCfg>,
     /// Pump sender, stored so job handlers can start chained batches.
@@ -460,6 +469,7 @@ impl Default for AppState {
             exec_discarded: 0,
             cancel: None,
             pending: vec![],
+            pending_warn: false,
             exec_cfg: None,
             job_tx: None,
             log: vec![LogEntry::new("Add folders and/or files, then Scan.".into())],
@@ -610,6 +620,37 @@ impl AppState {
             .iter()
             .enumerate()
             .filter(|(_, f)| preflight_auto_with(f, &p, t, policy).will_shrink())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Library files still addable to a running batch via the mid-run
+    /// Queue button. Warn policy, so below-threshold files count too —
+    /// the user pressed this deliberately; the no-gain guard keeps
+    /// originals safe when the estimate was optimistic. Estimates use
+    /// the running batch's settings snapshot (the chained batch encodes
+    /// with it), so a mid-run slider change can't smuggle a file in that
+    /// the chain's preflight would then reject for a different reason.
+    /// Files already queued or already in the running batch are excluded
+    /// by path.
+    pub fn queueable(&self) -> Vec<usize> {
+        let (p, t) = match self.exec_cfg.as_ref() {
+            Some(cfg) => (cfg.params.clone(), cfg.threshold),
+            None => (self.est_params(), self.threshold()),
+        };
+        let queued: std::collections::HashSet<_> = self
+            .pending
+            .iter()
+            .map(|f| f.path.clone())
+            .chain(self.exec_items.iter().map(|i| i.path.clone()))
+            .collect();
+        self.files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                !queued.contains(&f.path)
+                    && preflight_auto_with(f, &p, t, ThresholdPolicy::Warn).will_shrink()
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -975,5 +1016,55 @@ mod tests {
             s.backend,
             s.effective_opus()
         ));
+    }
+
+    #[test]
+    fn queueable_counts_below_threshold_files_the_skip_policy_would_drop() {
+        // A high threshold puts every file with any estimated saving
+        // below it: the skip policy drops it from a run, but the mid-run
+        // Queue button is a deliberate click, so warn policy counts it.
+        let mut s = app();
+        s.lossless = false;
+        s.min_saving_pct = 99.0;
+        s.files.push(video());
+        assert!(s.eligible().is_empty());
+        assert_eq!(s.queueable().len(), 1);
+    }
+
+    #[test]
+    fn queueable_excludes_pending_and_running_files() {
+        let mut s = app();
+        s.lossless = false;
+        s.min_saving_pct = 99.0;
+        let mut second = video();
+        second.path = std::path::PathBuf::from("t2.mp4");
+        let mut third = video();
+        third.path = std::path::PathBuf::from("t3.mp4");
+        s.files = vec![video(), second.clone(), third];
+        s.executing = true;
+        s.exec_cfg = Some(ExecCfg {
+            params: s.est_params(),
+            keep_subs: true,
+            parallel: 2,
+            replace: true,
+            threshold: 99.0,
+            threshold_policy: ThresholdPolicy::Skip,
+            extra_args: vec![],
+        });
+        // One file queued behind the batch, one pending in the queue.
+        s.pending.push(second.clone());
+        // The first video is the file currently encoding.
+        s.exec_items.push(ExecItem::new(
+            "t.mp4".into(),
+            s.files[0].path.clone(),
+            "1920x1080".into(),
+        ));
+        s.exec_items.push(ExecItem::new(
+            "t2.mp4".into(),
+            second.path,
+            "1920x1080".into(),
+        ));
+        // Only the untouched third file is addable.
+        assert_eq!(s.queueable(), vec![2]);
     }
 }
