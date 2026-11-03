@@ -11,6 +11,7 @@ pub mod hw;
 pub mod images;
 pub mod log;
 pub mod media;
+pub mod pause;
 pub mod pipeline;
 pub mod process;
 pub mod target;

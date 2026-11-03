@@ -444,6 +444,7 @@ fn Sidebar() -> Element {
     // Run state — the Process button and its batch progress live at the
     // bottom of this sidebar, next to the import controls.
     let executing = s.executing;
+    let paused = s.paused;
     let exec_done = s.exec_done();
     let exec_total = s.exec_total;
     let exec_overall = s.exec_overall();
@@ -486,6 +487,9 @@ fn Sidebar() -> Element {
     );
     if !pending_files.is_empty() {
         progress_label.push_str(&format!(" (+{} waiting)", pending_files.len()));
+    }
+    if paused {
+        progress_label.push_str(" · paused");
     }
     let process_label = format!("Process {n_eligible} file(s)");
     // OS drag & drop onto the sidebar queues shrink sources.
@@ -716,6 +720,14 @@ fn Sidebar() -> Element {
                         disabled: n_queueable == 0,
                         onclick: move |_| queue_clicked(state),
                         "Queue {n_queueable} more file(s)"
+                    }
+                    Button {
+                        variant: ButtonVariant::Secondary,
+                        class: "w-full",
+                        onclick: move |_| crate::jobs::pause_exec(state),
+                        // Pause freezes the in-flight encodes in place and
+                        // holds the waiting files; the same button resumes.
+                        if paused { "Resume" } else { "Pause" }
                     }
                     Button {
                         variant: ButtonVariant::Destructive,

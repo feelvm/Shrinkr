@@ -305,6 +305,11 @@ pub struct AppState {
     /// itself.
     pub exec_discarded: usize,
     pub cancel: Option<Arc<AtomicBool>>,
+    /// True while the run is paused: in-flight encodes are suspended
+    /// (mirrors the core-level pause flag; flipped by the Pause button,
+    /// cleared at batch start and ExecDone). UI label only — no worker
+    /// decisions read this field.
+    pub paused: bool,
     /// Files probed while a batch runs. Drained into a chained batch at
     /// ExecDone (same settings); discarded to the library on cancel.
     pub pending: Vec<MediaFile>,
@@ -492,6 +497,7 @@ impl Default for AppState {
             exec_total: 0,
             exec_discarded: 0,
             cancel: None,
+            paused: false,
             pending: vec![],
             pending_warn: false,
             exec_cfg: None,

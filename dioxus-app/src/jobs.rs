@@ -447,6 +447,8 @@ pub fn start_exec(
     cancel: Arc<AtomicBool>,
 ) {
     // Caller guarantees non-empty files; the worker always ends with ExecDone.
+    // A fresh batch never inherits a pause (chained legs start here too).
+    shrinkr_core::pause::reset();
     thread::spawn(move || {
         let t0 = Instant::now();
         // Never start a batch into a folder this process can't write to:
@@ -495,6 +497,12 @@ pub fn start_exec(
             let tmp_root = tmp_root.clone();
             let cancel = cancel.clone();
             handles.push(thread::spawn(move || loop {
+                // Paused run: hold before claiming the next file until
+                // resumed or cancelled — cancel wins so a pause left set
+                // can't stall an aborted batch past its ExecDone.
+                while shrinkr_core::pause::get() && !cancel.load(Ordering::Relaxed) {
+                    thread::sleep(std::time::Duration::from_millis(150));
+                }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= files.len() {
                     break;
@@ -690,6 +698,15 @@ pub fn start_target_solve(
             ),
         }
     });
+}
+
+/// Toggle the run pause: suspend in-flight ffmpeg children and stop
+/// claiming new files (resume does the same flag flip in reverse).
+pub fn pause_exec(mut state: Signal<AppState>) {
+    let mut w = state.write();
+    let paused = !w.paused;
+    shrinkr_core::pause::set(paused);
+    w.paused = paused;
 }
 
 pub fn cancel_exec(state: Signal<AppState>) {
@@ -1194,6 +1211,10 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             elapsed_s,
             stopped_no_gain,
         } => {
+            // Never leave a stale pause behind: the button disappears with
+            // the run, and the next batch must start unpaused.
+            shrinkr_core::pause::reset();
+            s.paused = false;
             let cancelled =
                 stopped_no_gain || s.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
             if cancelled {

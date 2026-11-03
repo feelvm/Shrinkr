@@ -1112,6 +1112,10 @@ fn run_once(
     let sampling2 = sampling.clone();
     let gpu_handle = std::thread::spawn(move || crate::hw::sample_gpu_util(sampling2));
 
+    // Pause watcher: suspends the child while the run-level flag is set
+    // (same lifetime pattern as the sampler — dropped below, after wait()).
+    let running = Arc::new(AtomicBool::new(true));
+
     let mut child = crate::process::cmd("ffmpeg")
         .args(args)
         .stdout(Stdio::piped())
@@ -1119,6 +1123,8 @@ fn run_once(
         .stdin(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn ffmpeg ({}): {}", level.encoder_name(), e))?;
+
+    let pause_handle = crate::pause::spawn_watcher(child.id(), cancel.clone(), running.clone());
 
     // Parse `-progress pipe:1` from stdout; keep stderr tail for error +
     // `-benchmark`-style drill-down.
@@ -1146,6 +1152,7 @@ fn run_once(
             if cancel.load(Ordering::Relaxed) {
                 let _ = child.kill();
                 sampling.store(false, Ordering::Relaxed);
+                running.store(false, Ordering::Relaxed);
                 return Err("cancelled".into());
             }
             let line = line.trim().to_string();
@@ -1172,6 +1179,8 @@ fn run_once(
     let st = child.wait().map_err(|e| format!("wait ffmpeg: {e}"))?;
     sampling.store(false, Ordering::Relaxed);
     let (gpu_avg, gpu_max, _) = gpu_handle.join().unwrap_or((0, 0, 0));
+    running.store(false, Ordering::Relaxed);
+    let _ = pause_handle.join();
 
     if !st.success() {
         let tail = stderr_tail.lock().map(|g| g.clone()).unwrap_or_default();
