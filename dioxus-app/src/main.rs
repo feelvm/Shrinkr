@@ -1820,9 +1820,11 @@ fn EstimateCard() -> Element {
             CardContent {
                 p { class: "text-sm font-semibold",
                     "{elig} eligible • "
-                    span { class: "text-foreground", "{human_bytes(elig_b)}" }
+                    // Both sizes carry the direction color so the before/
+                    // after pair reads at a glance, like the delta does.
+                    span { class: "{change_cls}", "{human_bytes(elig_b)}" }
                     " → "
-                    span { class: "text-foreground", "{human_bytes(new_b)}" }
+                    span { class: "{change_cls}", "{human_bytes(new_b)}" }
                     " • "
                     span { class: "{change_cls} font-medium", "{delta_phrase}" }
                 }
