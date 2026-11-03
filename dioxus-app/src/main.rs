@@ -17,9 +17,9 @@ mod state;
 
 use components::ui::{
     Alert, AlertDescription, AlertTitle, AlertVariant, Badge, BadgeVariant, Button, ButtonVariant,
-    Callout, CalloutVariant, Card, CardContent, CardDescription, CardHeader, CardTitle, Checkbox,
-    Collapsible, Empty, EmptyDescription, EmptyTitle, Label, Progress, Slider, Spinner, Tabs,
-    TabsContent, TabsList, TabsTrigger,
+    Callout, CalloutVariant, Card, CardContent, CardHeader, CardTitle, Checkbox, Collapsible,
+    Empty, EmptyDescription, EmptyTitle, Label, Progress, Slider, Spinner, Tabs, TabsContent,
+    TabsList, TabsTrigger,
 };
 use dioxus::document;
 use dioxus::html::{DragEvent, HasFileData};
@@ -681,14 +681,6 @@ fn Sidebar() -> Element {
                             p { class: "mt-1 text-xs text-muted-foreground", "{probe_label}" }
                         }
                     }
-                    if executing {
-                        // Mid-run legend: a pick is scanned and staged, and
-                        // committing it to the queue is a separate click
-                        // that snapshots the settings picked at that point.
-                        p { class: "mt-2 text-xs text-muted-foreground",
-                            "Mid-run: picks are scanned and staged — press Add to queue to run them with the settings you pick now. Waiting rows can be skipped or removed (✕) before their turn; deleted files stay in the library."
-                        }
-                    }
                 }
             }
             Card {
@@ -1044,11 +1036,6 @@ fn PipelineCard() -> Element {
                             }
                             "Lossless (no perceptible quality loss)"
                         }
-                        if lossless {
-                            p { class: "text-xs text-muted-foreground",
-                                "Quality pinned to CQ 18 (visually lossless), resolution preserved, audio kept as-is instead of re-encoded. Backend, preset and Goal still trade speed for file size."
-                            }
-                        }
                     }
                     div { class: "grid grid-cols-1 gap-3 md:grid-cols-3",
                         div { class: "flex flex-col gap-1",
@@ -1126,9 +1113,6 @@ fn PipelineCard() -> Element {
                                 option { value: "p4", selected: preset == NvencPreset::P4, "P4 (medium)" }
                                 option { value: "p5", selected: preset == NvencPreset::P5, "P5 (slow)" }
                                 option { value: "p6", selected: preset == NvencPreset::P6, "P6 (slower)" }
-                            }
-                            p { class: "text-xs text-muted-foreground",
-                                "Speed↔size on every family: NVENC P-series, Quick Sync and SVT presets follow this knob."
                             }
                         }
                         div { class: "flex flex-col gap-1",
@@ -1364,15 +1348,6 @@ fn PipelineCard() -> Element {
                                     on_checked_change: move |v| state.write().replace = v,
                                 }
                                 "Replace originals after verified encode"
-                            }
-                            if !audio_only {
-                                p { class: "text-xs text-muted-foreground",
-                                    if skip_efficient {
-                                        "Files estimated to save less than the minimum are skipped."
-                                    } else {
-                                        "Files estimated to save less than the minimum are still queued — the plan warns instead of skipping."
-                                    }
-                                }
                             }
                         }
                         div { class: "flex items-center gap-3",
@@ -1774,16 +1749,13 @@ fn EstimateCard() -> Element {
     };
     let subline = if skipped > 0 {
         format!(
-            "{} skipped file(s) ({} excluded){warn_note} • About {:.1}h — change any Pipeline setting and this updates",
+            "{} skipped file(s) ({} excluded){warn_note} • About {:.1}h",
             skipped,
             human_bytes(skipped_b),
             secs / 3600.0
         )
     } else {
-        format!(
-            "About {:.1}h{warn_note} — change any Pipeline setting and this updates",
-            secs / 3600.0
-        )
+        format!("About {:.1}h{warn_note}", secs / 3600.0)
     };
     let rows: Vec<(String, String, String, String)> = s
         .preflight_rows()
@@ -1815,7 +1787,6 @@ fn EstimateCard() -> Element {
         Card {
             CardHeader {
                 CardTitle { "Estimate & plan" }
-                CardDescription { "Which files will be processed, and why the rest skip" }
             }
             CardContent {
                 p { class: "text-sm font-semibold",
@@ -1860,9 +1831,6 @@ fn EstimateCard() -> Element {
                             onclick: move |_| crate::solve_clicked(state, pump_tx()),
                             if target_solving { "Solving…" } else { "Solve CRF" }
                         }
-                    }
-                    p { class: "text-xs text-muted-foreground",
-                        "Solves the quality value for the first eligible file and sets the slider. Batch runs reuse it."
                     }
                 }
                 div { class: "mt-2",
@@ -2298,7 +2266,6 @@ fn BenchCard() -> Element {
         Card {
             CardHeader {
                 CardTitle { "Benchmark — x264 vs NVENC P3–P6" }
-                CardDescription { "Same file through 5 configs, then pick the default from data" }
             }
             CardContent {
                 div { class: "flex flex-col gap-3",
@@ -2461,7 +2428,6 @@ fn ConvertCard() -> Element {
         Card {
             CardHeader {
                 CardTitle { "Convert — change file type" }
-                CardDescription { "Change a file's type — video, audio, image, subtitle or document" }
             }
             CardContent {
                 div { class: "flex flex-col gap-3",
@@ -2704,9 +2670,6 @@ fn ConvertCard() -> Element {
                     }
                     Collapsible { title: "What convert supports",
                         "Video→video, video→audio (extract soundtrack), audio→audio, image→image, subtitle→subtitle, Word→Word, spreadsheet→spreadsheet. Only outputs this machine can write are offered. {caps_summary}"
-                    }
-                    Collapsible { title: "How convert works",
-                        "Remuxes (-c copy) when the codecs fit the new container, otherwise re-encodes once with high-quality defaults. Video→audio extracts the soundtrack only (MP3 192k, M4A 128k, Opus 96k, Vorbis q5, FLAC lossless, WAV PCM). Documents go through LibreOffice (one at a time). Size estimates are exact for remuxes, approximate (~) otherwise."
                     }
                 }
             }
