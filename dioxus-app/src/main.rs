@@ -1777,21 +1777,26 @@ fn EstimateCard() -> Element {
                     }
                 }
                 if has_video {
-                    div { class: "mt-2 flex items-center gap-2",
-                        input {
-                            class: "w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs",
-                            r#type: "text",
-                            placeholder: "400MB or 2x",
-                            value: "{target_text}",
-                            oninput: move |e: FormEvent| {
-                                state.write().target_text = e.value();
-                            },
+                    div { class: "mt-2",
+                        p { class: "text-xs text-muted-foreground",
+                            "Want a specific size? Enter it (400MB) or how much smaller (2x) — the quality setting is picked automatically to hit it."
                         }
-                        Button {
-                            variant: ButtonVariant::Outline,
-                            disabled: target_solving,
-                            onclick: move |_| crate::solve_clicked(state, pump_tx()),
-                            if target_solving { "Solving…" } else { "Solve CRF" }
+                        div { class: "mt-1 flex items-center gap-2",
+                            input {
+                                class: "w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs",
+                                r#type: "text",
+                                placeholder: "400MB or 2x",
+                                value: "{target_text}",
+                                oninput: move |e: FormEvent| {
+                                    state.write().target_text = e.value();
+                                },
+                            }
+                            Button {
+                                variant: ButtonVariant::Outline,
+                                disabled: target_solving,
+                                onclick: move |_| crate::solve_clicked(state, pump_tx()),
+                                if target_solving { "Fitting…" } else { "Fit to size" }
+                            }
                         }
                     }
                 }
@@ -2099,7 +2104,7 @@ fn start_batch(
     );
 }
 
-/// UI-thread part of Solve CRF: parse the target + flags up front, then
+/// UI-thread part of Fit to size: parse the target + flags up front, then
 /// hand the first eligible file to the solver worker. The solved value is
 /// written back into the quality slider (batch runs reuse it).
 fn solve_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
@@ -2123,7 +2128,7 @@ fn solve_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     else {
         drop(s);
         state.write().push_log(
-            "Solve CRF is video-only — no eligible video in the plan (images don't take a CRF)."
+            "Fit to size is video-only — no eligible video in the plan (images don't take a CRF)."
                 .into(),
         );
         return;
