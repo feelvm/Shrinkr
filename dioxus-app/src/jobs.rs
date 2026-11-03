@@ -1207,8 +1207,10 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                     // Probed while a batch runs: stage it — the file is
                     // in the library, but joining the queue needs the
                     // explicit "Add to queue" click, which snapshots the
-                    // user's picked settings for this batch.
-                    if s.executing {
+                    // user's picked settings for this batch. A codec
+                    // muted in the Library never passes to the queue —
+                    // not even via staging; the file stays greyed out.
+                    if s.executing && !s.muted_codecs.contains(&f.vcodec) {
                         s.staged.push(f.clone());
                         let name = f
                             .path

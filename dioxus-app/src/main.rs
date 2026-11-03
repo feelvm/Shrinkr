@@ -442,6 +442,9 @@ fn Sidebar() -> Element {
     let probe_done = s.probe_done;
     let probe_total = s.probe_total;
     let files_summary = crate::sidebar_summary(&s);
+    // Codec circles' checked state (unchecked = muted): the rows read it
+    // directly, so a click greys the type out on the next frame.
+    let muted_set = s.muted_codecs.clone();
     // Run state — the Process button and its batch progress live at the
     // bottom of this sidebar, next to the import controls.
     let executing = s.executing;
@@ -689,9 +692,35 @@ fn Sidebar() -> Element {
                 }
                 CardContent {
                     for (codec , n , bytes) in files_summary {
-                        div { class: "flex justify-between text-xs",
-                            span { "{codec}: {n} files" }
-                            span { class: "text-muted-foreground", "{human_bytes(bytes)}" }
+                        {
+                            // Round checkbox per codec type: unchecked mutes
+                            // the type — the row greys out and its files
+                            // never pass to the queue.
+                            let muted = muted_set.contains(&codec);
+                            let codec_toggle = codec.clone();
+                            rsx! {
+                                div { class: "flex items-center justify-between gap-2 py-0.5 text-xs",
+                                    div { class: "flex min-w-0 items-center gap-2",
+                                        Checkbox {
+                                            class: "rounded-full",
+                                            checked: !muted,
+                                            aria_label: "process {codec}",
+                                            on_checked_change: move |on| {
+                                                toggle_codec(state, &codec_toggle, on);
+                                            },
+                                        }
+                                        span {
+                                            class: if muted {
+                                                "truncate text-muted-foreground/60 line-through"
+                                            } else {
+                                                "truncate"
+                                            },
+                                            "{codec}: {n} files"
+                                        }
+                                    }
+                                    span { class: "text-muted-foreground", "{human_bytes(bytes)}" }
+                                }
+                            }
                         }
                     }
                 }
@@ -879,6 +908,32 @@ fn sidebar_summary(s: &AppState) -> Vec<(String, usize, u64)> {
     let mut rows: Vec<_> = by.into_iter().map(|(c, (n, b))| (c, n, b)).collect();
     rows.sort_by_key(|(_, _, b)| std::cmp::Reverse(*b));
     rows
+}
+
+/// Library codec circle toggled: unchecked mutes the type — its files
+/// grey out in the library and every queue gate drops them (Process,
+/// mid-run Queue, mid-run staging). Files already passed to the queue
+/// keep running; the mute governs what gets queued from now on.
+fn toggle_codec(mut state: Signal<AppState>, codec: &str, on: bool) {
+    let mut w = state.write();
+    if on {
+        w.muted_codecs.remove(codec);
+    } else {
+        w.muted_codecs.insert(codec.to_string());
+    }
+    let n = w.files.iter().filter(|f| f.vcodec == codec).count();
+    if on {
+        w.push_log(format!(
+            "{codec} re-enabled — {n} file(s) back in the plan."
+        ));
+    } else {
+        let mut line =
+            format!("{codec} muted — {n} file(s) stay in the library and won't be queued.");
+        if w.executing {
+            line.push_str(" Files already queued keep running.");
+        }
+        w.push_log(line);
+    }
 }
 
 #[component]
@@ -1894,6 +1949,12 @@ fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     let idx = s.eligible();
     if idx.is_empty() {
         let files = s.files.clone();
+        let muted_set = s.muted_codecs.clone();
+        let muted_n = s
+            .files
+            .iter()
+            .filter(|f| s.muted_codecs.contains(&f.vcodec))
+            .count();
         let p = s.est_params();
         let t = s.threshold();
         let policy = s.threshold_policy();
@@ -1904,11 +1965,22 @@ fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         if files.is_empty() {
             w.push_log("  (no probed files — Scan first)".into());
         }
-        for f in files.iter().take(10) {
+        // Muted-codec files are not part of the run at all: their
+        // threshold verdicts would just be noise here.
+        for f in files
+            .iter()
+            .filter(|f| !muted_set.contains(&f.vcodec))
+            .take(10)
+        {
             if let Preflight::Skip { reason } = preflight_auto_with(f, &p, t, policy) {
                 let name = f.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
                 w.push_log(format!("  ✗ {}: {}", name, reason));
             }
+        }
+        if muted_n > 0 {
+            w.push_log(format!(
+                "  hint: {muted_n} file(s) are unchecked in the Library (codec muted) — tick the circle back on to include them."
+            ));
         }
         let audio_only = p.backend == VideoBackend::CopyVideo && p.opus_bps.is_some();
         if audio_only {

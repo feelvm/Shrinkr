@@ -286,6 +286,14 @@ fn fps_suffix(fps: f64) -> String {
 pub struct AppState {
     pub targets: Vec<PathBuf>,
     pub files: Vec<MediaFile>,
+    /// Codec types unchecked in the Library card (the round checkboxes).
+    /// A muted codec's files stay in the library — greyed out — but never
+    /// pass to the queue: `eligible`/`queueable` drop them, mid-run
+    /// staging skips them, and the plan rows say so. Keyed by codec name
+    /// and sticky across scans, so a re-scan of the same folder keeps the
+    /// choice visible on the greyed rows; files already queued keep
+    /// running (the mute governs what gets queued next).
+    pub muted_codecs: HashSet<String>,
     pub scanning: bool,
     pub probing: bool,
     pub probe_done: usize,
@@ -516,6 +524,7 @@ impl Default for AppState {
         Self {
             targets: vec![],
             files: vec![],
+            muted_codecs: HashSet::new(),
             scanning: false,
             probing: false,
             probe_done: 0,
@@ -604,13 +613,17 @@ impl AppState {
         }
     }
 
-    /// `(shrink, warned, skipped)` over the probed library.
+    /// `(shrink, warned, skipped)` over the probed library. Muted codecs
+    /// sit outside every bucket — they are not part of the run at all.
     pub fn plan_counts(&self) -> (usize, usize, usize) {
         let p = self.est_params();
         let t = self.threshold();
         let policy = self.threshold_policy();
         let mut counts = (0, 0, 0);
         for f in &self.files {
+            if self.muted_codecs.contains(&f.vcodec) {
+                continue;
+            }
             match preflight_auto_with(f, &p, t, policy) {
                 Preflight::Shrink { .. } => counts.0 += 1,
                 Preflight::Warn { .. } => counts.1 += 1,
@@ -700,6 +713,7 @@ impl AppState {
         self.files
             .iter()
             .enumerate()
+            .filter(|(_, f)| !self.muted_codecs.contains(&f.vcodec))
             .filter(|(_, f)| preflight_auto_with(f, &p, t, policy).will_shrink())
             .map(|(i, _)| i)
             .collect()
@@ -730,7 +744,8 @@ impl AppState {
             .iter()
             .enumerate()
             .filter(|(_, f)| {
-                !queued.contains(&f.path)
+                !self.muted_codecs.contains(&f.vcodec)
+                    && !queued.contains(&f.path)
                     && preflight_auto_with(f, &p, t, ThresholdPolicy::Warn).will_shrink()
             })
             .map(|(i, _)| i)
@@ -809,6 +824,10 @@ impl AppState {
                 // segment contrast with three identical numbers.
                 continue;
             }
+            // Muted codecs are not part of any goal's run either.
+            if self.muted_codecs.contains(&f.vcodec) {
+                continue;
+            }
             let verdict = preflight_auto_with(f, &p, t, policy);
             if !verdict.will_shrink() {
                 continue;
@@ -830,7 +849,10 @@ impl AppState {
 
     /// (filename, resolution, verdict) rows for the plan list. Resolution
     /// is "?" when the file has no dimensions. `Preflight::Warn` rows are
-    /// part of the run but flagged for the user.
+    /// part of the run but flagged for the user. Muted-codec files come
+    /// back as `Preflight::Skip` with a mute reason — they never run, and
+    /// the plan list must say why instead of showing their threshold
+    /// verdict (which would imply they are queued).
     pub fn preflight_rows(&self) -> Vec<(String, String, Preflight)> {
         let p = self.est_params();
         let t = self.threshold();
@@ -844,6 +866,10 @@ impl AppState {
                     .and_then(|s| s.to_str())
                     .unwrap_or("?")
                     .to_string();
+                if self.muted_codecs.contains(&f.vcodec) {
+                    let reason = format!("{} muted in Library — not queued", f.vcodec);
+                    return (name, f.res_label(), Preflight::Skip { reason });
+                }
                 (name, f.res_label(), preflight_auto_with(f, &p, t, policy))
             })
             .collect()
@@ -1162,6 +1188,44 @@ mod tests {
         s.files.push(video());
         assert!(s.eligible().is_empty());
         assert_eq!(s.queueable().len(), 1);
+    }
+
+    #[test]
+    fn muted_codec_stays_in_library_but_never_reaches_the_queue() {
+        // Unchecking a codec circle in the Library greys the row out and
+        // drops its files from every gate: Process (eligible), the mid-run
+        // Queue button (queueable), the headline estimate, the plan rows
+        // and the Goal segments. The plan row says "muted", not the
+        // threshold verdict — the file isn't queued at all.
+        let mut s = app();
+        s.lossless = false;
+        s.min_saving_pct = 0.0;
+        s.skip_efficient = false;
+        let mut hevc = video();
+        hevc.vcodec = "hevc".into();
+        hevc.path = std::path::PathBuf::from("h.mkv");
+        s.files = vec![video(), hevc];
+        s.muted_codecs.insert("h264".into());
+        // Both run gates drop the muted codec.
+        assert_eq!(s.eligible(), vec![1]);
+        assert_eq!(s.queueable(), vec![1]);
+        // The headline estimate covers exactly the unmuted bytes.
+        let (total_b, _, _, _) = s.estimate();
+        assert_eq!(total_b, s.files[1].bytes);
+        // The plan row explains the skip as a mute; the other file runs.
+        let rows = s.preflight_rows();
+        assert!(matches!(
+            &rows[0].2,
+            Preflight::Skip { reason } if reason.contains("muted")
+        ));
+        assert!(rows[1].2.will_shrink());
+        // plan_counts keeps the muted file out of every bucket.
+        assert_eq!(s.plan_counts(), (1, 0, 0));
+        // Goal segments don't count it either.
+        assert_eq!(s.goal_estimate(Goal::Fastest).files, 1);
+        // Un-muting puts everything back.
+        s.muted_codecs.clear();
+        assert_eq!(s.eligible().len(), 2);
     }
 
     #[test]
