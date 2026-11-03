@@ -34,6 +34,7 @@ use shrinkr_core::pipeline::{
     preflight_auto_with, NvencPreset, Preflight, ScalePolicy, VideoBackend,
 };
 use state::{AppState, Goal};
+use std::collections::HashSet;
 use std::sync::{atomic::AtomicBool, Arc};
 
 /// 64x64 RGBA dump of assets/icons/icon.png; decoded at compile time to
@@ -449,12 +450,46 @@ fn Sidebar() -> Element {
     let exec_total = s.exec_total;
     let exec_overall = s.exec_overall();
     let exec_items = s.exec_items.clone();
-    // Files already waiting behind the running batch (auto-queued
-    // mid-run or added via the Queue button). They live in `pending`
-    // until the batch drains, and must be visible here — otherwise a
-    // fully-queued scan reads as "Queue 0 more" with nothing happening.
-    let pending_files: Vec<(String, String)> = s
+    // The run's skip set (paths the user skipped or deleted from the
+    // queue): rows read their "skipped" badge from it, so a click shows
+    // on the next frame without waiting for the worker's confirmation
+    // message. Its removal happens through the shared Arc, hence the
+    // lock at read time.
+    let skips: HashSet<std::path::PathBuf> = s
+        .exec_skips
+        .as_ref()
+        .and_then(|m| m.lock().ok())
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    // Files already waiting behind the running batch (queued via the
+    // Queue button or committed with Add to queue). They live in
+    // `pending` until the batch drains, and must be visible here —
+    // otherwise a fully-queued run reads as nothing happening. A skipped
+    // one stays in its segment (it proves the decision to the user) but
+    // no longer counts as waiting.
+    let pending_files: Vec<(String, String, std::path::PathBuf, bool)> = s
         .pending
+        .iter()
+        .flat_map(|seg| seg.files.iter())
+        .map(|f| {
+            let path = f.path.clone();
+            let skipped = skips.contains(&path);
+            (
+                f.path
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                f.res_label(),
+                path,
+                skipped,
+            )
+        })
+        .collect();
+    // Mid-run scan results staged for the pick→settings→Add-to-queue
+    // flow: visible in the library, not yet committed to the queue.
+    let staged_files: Vec<(String, String, std::path::PathBuf)> = s
+        .staged
         .iter()
         .map(|f| {
             (
@@ -464,9 +499,11 @@ fn Sidebar() -> Element {
                     .unwrap_or("?")
                     .to_string(),
                 f.res_label(),
+                f.path.clone(),
             )
         })
         .collect();
+    let n_staged = staged_files.len();
     let n_eligible = s.eligible().len();
     // Files addable to the running batch queue (the mid-run Queue
     // button): below-threshold files count too — the click is explicit.
@@ -481,12 +518,13 @@ fn Sidebar() -> Element {
         0.0
     };
     let probe_label = format!("Probing {probe_done}/{probe_total} …");
+    let waiting = pending_files.iter().filter(|(.., sk)| !*sk).count();
     let mut progress_label = format!(
         "Working {exec_done}/{exec_total} — {:.0}%",
         exec_overall * 100.0
     );
-    if !pending_files.is_empty() {
-        progress_label.push_str(&format!(" (+{} waiting)", pending_files.len()));
+    if waiting > 0 {
+        progress_label.push_str(&format!(" (+{waiting} waiting)"));
     }
     if paused {
         progress_label.push_str(" · paused");
@@ -643,6 +681,14 @@ fn Sidebar() -> Element {
                             p { class: "mt-1 text-xs text-muted-foreground", "{probe_label}" }
                         }
                     }
+                    if executing {
+                        // Mid-run legend: a pick is scanned and staged, and
+                        // committing it to the queue is a separate click
+                        // that snapshots the settings picked at that point.
+                        p { class: "mt-2 text-xs text-muted-foreground",
+                            "Mid-run: picks are scanned and staged — press Add to queue to run them with the settings you pick now. Waiting rows can be skipped or removed (✕) before their turn; deleted files stay in the library."
+                        }
+                    }
                 }
             }
             Card {
@@ -683,31 +729,119 @@ fn Sidebar() -> Element {
                     p { class: "text-xs font-semibold", "Per-file progress ({exec_done}/{exec_total})" }
                     div { class: "flex max-h-40 flex-col gap-2 overflow-y-auto",
                         for item in exec_items {
-                            div { class: "flex flex-col gap-1",
-                                div { class: "flex items-center gap-2",
-                                    span { class: "min-w-0 flex-1 truncate font-mono text-xs", "{item.name}" }
-                                    if item.res != "?" {
-                                        span { class: "shrink-0 text-xs text-muted-foreground", "{item.res}" }
+                            {
+                                // Deleted from the queue before its turn: gone
+                                // from the panel (the log line remembers it).
+                                let path = item.path.clone();
+                                let skipped = skips.contains(&path);
+                                // One PathBuf clone per control: the move
+                                // closures each own their file target.
+                                let path_del = path.clone();
+                                // In-flight (progress started) and finished
+                                // rows can no longer be skipped or deleted.
+                                let actionable = !item.done && !item.failed && item.frac == 0.0;
+                                rsx! {
+                                    if !item.removed {
+                                        div { class: "flex flex-col gap-1",
+                                            div { class: "flex items-center gap-2",
+                                                span { class: "min-w-0 flex-1 truncate font-mono text-xs", "{item.name}" }
+                                                if item.res != "?" {
+                                                    span { class: "shrink-0 text-xs text-muted-foreground", "{item.res}" }
+                                                }
+                                                span { class: "shrink-0 text-xs text-muted-foreground",
+                                                    if skipped { "skipped" } else { "{item.status_text()}" }
+                                                }
+                                                if actionable && !skipped {
+                                                    button {
+                                                        class: "shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                                                        title: "Skip — this file will not be encoded",
+                                                        onclick: move |_| crate::jobs::skip_queued(state, &path),
+                                                        "Skip"
+                                                    }
+                                                    button {
+                                                        class: "shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                                                        title: "Delete from queue",
+                                                        onclick: move |_| crate::jobs::unqueue(state, &path_del),
+                                                        "✕"
+                                                    }
+                                                }
+                                            }
+                                            Progress { value: item.frac * 100.0 }
+                                        }
                                     }
-                                    span { class: "shrink-0 text-xs text-muted-foreground", "{item.status_text()}" }
                                 }
-                                Progress { value: item.frac * 100.0 }
                             }
                         }
-                        // Files queued behind the running batch (scanned
-                        // in mid-run or pressed in via the Queue button).
+                        // Files queued behind the running batch (queued in
+                        // via the Queue button or the Add to queue click).
                         // Same row but with no bar: they start when the
                         // current batch drains (logs say when each joined).
-                        for (p_name, p_res) in pending_files {
-                            div { class: "flex flex-col gap-1",
-                                div { class: "flex items-center gap-2",
-                                    span { class: "min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground/60", "{p_name}" }
-                                    if p_res != "?" {
-                                        span { class: "shrink-0 text-xs text-muted-foreground/60", "{p_res}" }
+                        // Skip/delete act straight on the waiting list.
+                        for (p_name , p_res , p_path , p_skipped) in pending_files {
+                            {
+                                // One PathBuf clone per control: the move
+                                // closures each own their file target.
+                                let p_del = p_path.clone();
+                                rsx! {
+                                    div { class: "flex flex-col gap-1",
+                                        div { class: "flex items-center gap-2",
+                                            span { class: "min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground/60", "{p_name}" }
+                                            if p_res != "?" {
+                                                span { class: "shrink-0 text-xs text-muted-foreground/60", "{p_res}" }
+                                            }
+                                            span { class: "shrink-0 text-xs text-muted-foreground/60",
+                                                if p_skipped { "skipped" } else { "waiting" }
+                                            }
+                                            if !p_skipped {
+                                                button {
+                                                    class: "shrink-0 rounded px-1 text-xs text-muted-foreground/60 hover:bg-accent hover:text-accent-foreground",
+                                                    title: "Skip — this file will not be encoded",
+                                                    onclick: move |_| crate::jobs::skip_queued(state, &p_path),
+                                                    "Skip"
+                                                }
+                                                button {
+                                                    class: "shrink-0 rounded px-1 text-xs text-muted-foreground/60 hover:bg-accent hover:text-accent-foreground",
+                                                    title: "Delete from queue",
+                                                    onclick: move |_| crate::jobs::unqueue(state, &p_del),
+                                                    "✕"
+                                                }
+                                            }
+                                        }
                                     }
-                                    span { class: "shrink-0 text-xs text-muted-foreground/60", "waiting" }
                                 }
                             }
+                        }
+                        // Mid-run picks scanned into the library but not
+                        // yet committed: they queue only via the button
+                        // below, with the settings picked at that moment.
+                        // Deleting here just leaves staging.
+                        for (s_name , s_res , s_path) in staged_files {
+                            div { class: "flex flex-col gap-1",
+                                div { class: "flex items-center gap-2",
+                                    span { class: "min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground/60", "{s_name}" }
+                                    if s_res != "?" {
+                                        span { class: "shrink-0 text-xs text-muted-foreground/60", "{s_res}" }
+                                    }
+                                    span { class: "shrink-0 text-xs text-muted-foreground/60", "staged — add to queue" }
+                                    button {
+                                        class: "shrink-0 rounded px-1 text-xs text-muted-foreground/60 hover:bg-accent hover:text-accent-foreground",
+                                        title: "Delete from queue",
+                                        onclick: move |_| crate::jobs::unqueue(state, &s_path),
+                                        "✕"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Commit staged picks: their files encode with the
+                    // settings picked at this moment (explicit click ⇒
+                    // below-threshold files run with a warning).
+                    if n_staged > 0 {
+                        Button {
+                            variant: ButtonVariant::Default,
+                            class: "w-full",
+                            onclick: move |_| add_staged_clicked(state),
+                            "Add {n_staged} to queue"
                         }
                     }
                     // Mid-run manual queue: everything preflight can run
@@ -1547,6 +1681,36 @@ fn ScalePicker(
     }
 }
 
+/// Split a preflight reason into (text, highlighted) word segments: size
+/// values ("219.2 MB") and percentages ("−51%)" ) stand out inside the
+/// long one-line verdict. Unit words ride along with their number;
+/// punctuation stays attached to its token. Highlighted segments keep
+/// the row's own color — only the weight changes.
+fn est_parts(reason: &str) -> Vec<(String, bool)> {
+    const UNITS: [&str; 3] = ["GB", "MB", "KB"];
+    let toks: Vec<&str> = reason.split(' ').collect();
+    let mut out = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        let unit_next = i + 1 < toks.len() && UNITS.contains(&toks[i + 1]);
+        if t.contains('%') {
+            out.push((t.to_string(), true));
+            i += 1;
+        } else if unit_next && t.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            // Number + unit are one value ("219.2 MB") — kept together.
+            out.push((format!("{t} {}", toks[i + 1]), true));
+            i += 2;
+        } else if !t.is_empty() {
+            out.push((t.to_string(), false));
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 #[component]
 fn EstimateCard() -> Element {
     let mut state = use_context::<Signal<AppState>>();
@@ -1621,7 +1785,7 @@ fn EstimateCard() -> Element {
             secs / 3600.0
         )
     };
-    let rows: Vec<(String, String, String)> = s
+    let rows: Vec<(String, String, String, String)> = s
         .preflight_rows()
         .into_iter()
         .map(|(name, res, verdict)| {
@@ -1633,11 +1797,11 @@ fn EstimateCard() -> Element {
                 Preflight::Skip { reason } => ("✗", "text-xs text-muted-foreground", reason),
             };
             let label = if res == "?" {
-                format!("{name}: {reason}")
+                format!("{name}: ")
             } else {
-                format!("{name} · {res}: {reason}")
+                format!("{name} · {res}: ")
             };
-            (mark.to_string(), label, cls.to_string())
+            (mark.to_string(), label, reason, cls.to_string())
         })
         .collect();
     let target_text = s.target_text.clone();
@@ -1664,8 +1828,17 @@ fn EstimateCard() -> Element {
                 }
                 p { class: "text-xs text-muted-foreground", "{subline}" }
                 div { class: "mt-2 max-h-36 overflow-y-auto rounded-md border border-border p-2",
-                    for (mark , text , cls) in rows {
-                        p { class: "{cls}", "{mark} {text}" }
+                    for (mark , prefix , reason , cls) in rows {
+                        p { class: "{cls}",
+                            "{mark} {prefix}"
+                            for (seg , hl) in est_parts(&reason) {
+                                if hl {
+                                    span { class: "font-semibold", "{seg} " }
+                                } else {
+                                    "{seg} "
+                                }
+                            }
+                        }
                     }
                 }
                 if has_video {
@@ -1700,13 +1873,11 @@ fn EstimateCard() -> Element {
     }
 }
 
-/// UI-thread part of Process: eligibility gate with loud skip reasons,
-/// then state setup + worker handoff.
 /// Mid-run manual queue: move the still-queueable library files behind
 /// the running batch. Everything preflight can run on joins — including
-/// below-threshold files, run with a warning in the chained batch
-/// (`pending_warn`); the no-gain guard keeps their originals safe. The
-/// files encode with the running batch's frozen settings.
+/// below-threshold files, run with a warning; the no-gain guard keeps
+/// their originals safe. The files encode with the running batch's
+/// frozen settings.
 fn queue_clicked(mut state: Signal<AppState>) {
     let s = state.read();
     // Belt and braces: the button only exists mid-run and is disabled
@@ -1719,13 +1890,65 @@ fn queue_clicked(mut state: Signal<AppState>) {
         return;
     }
     let files: Vec<_> = idx.iter().map(|&i| s.files[i].clone()).collect();
+    let Some(cfg) = s.exec_cfg.clone() else {
+        return;
+    };
     drop(s);
     let mut w = state.write();
     let added = files.len();
-    w.pending.extend(files);
-    w.pending_warn = true;
+    w.pending.push(crate::state::PendingSegment {
+        files,
+        cfg,
+        warn: true,
+    });
     w.push_log(format!(
         "Queued {added} more file(s) behind the running batch — they start when it finishes, same settings (below-threshold files warn)."
+    ));
+}
+
+/// Mid-run "Add to queue": commit the staged files — folders picked
+/// while a batch runs and scanned into the library — behind that batch.
+/// The click snapshots the settings: these files encode with exactly
+/// what the sidebar holds at this moment (warn policy, so
+/// below-threshold files the user deliberately staged run after all;
+/// the no-gain guard keeps their originals safe).
+fn add_staged_clicked(mut state: Signal<AppState>) {
+    let s = state.read();
+    // Belt and braces: the button only exists mid-run.
+    if !s.executing || s.staged.is_empty() {
+        return;
+    }
+    let extra_args = match shrinkr_core::ffmpeg::parse_extra_args(&s.extra_args) {
+        Ok(v) => v,
+        Err(e) => {
+            drop(s);
+            state
+                .write()
+                .push_log(format!("ERROR: extra ffmpeg flags rejected: {e}"));
+            return;
+        }
+    };
+    let cfg = crate::state::ExecCfg {
+        params: s.est_params(),
+        keep_subs: s.keep_subs,
+        parallel: s.parallel.clamp(1, 8),
+        replace: s.replace,
+        threshold: s.threshold(),
+        threshold_policy: s.threshold_policy(),
+        extra_args,
+    };
+    let files: Vec<_> = s.staged.clone();
+    drop(s);
+    let mut w = state.write();
+    let added = files.len();
+    w.pending.push(crate::state::PendingSegment {
+        files,
+        cfg,
+        warn: true,
+    });
+    w.staged.clear();
+    w.push_log(format!(
+        "Queued {added} staged file(s) behind the running batch — they start when it finishes, with the picked settings (below-threshold files warn)."
     ));
 }
 
@@ -1885,9 +2108,14 @@ fn start_batch(
         threshold_policy,
         extra_args: extra_args.clone(),
     };
+    // A fresh run starts with an empty skip set; queue decisions from the
+    // previous run don't leak into this one. Shared with the workers so a
+    // mid-run Skip/✕ beats the queue.
+    let skips = Arc::new(std::sync::Mutex::new(HashSet::new()));
     {
         let mut w = state.write();
         w.executing = true;
+        w.exec_skips = Some(skips.clone());
         w.exec_items = files
             .iter()
             .map(|f| {
@@ -1935,6 +2163,7 @@ fn start_batch(
         threshold_policy,
         extra_args,
         cancel,
+        skips,
     );
 }
 
