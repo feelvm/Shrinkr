@@ -31,7 +31,7 @@ use shrinkr_core::images::{jpeg_q_for, webp_quality_for};
 use shrinkr_core::log::{Level, LogEntry};
 use shrinkr_core::media::human_bytes;
 use shrinkr_core::pipeline::{
-    preflight_auto_with, NvencPreset, Preflight, ScalePolicy, VideoBackend,
+    preflight_auto_with, size_change_label, NvencPreset, Preflight, ScalePolicy, VideoBackend,
 };
 use state::{AppState, Goal};
 use std::collections::HashSet;
@@ -1705,43 +1705,14 @@ fn EstimateCard() -> Element {
         .sum();
     // Signed wording: a growing plan says how much it grows (bytes and
     // percent) instead of showing the same total with a 0% difference.
-    // Split the change phrase so sizes and %-delta can carry the
-    // direction color (green shrink / orange growth) — the same palette
-    // the plan rows below use for ✓/⚠.
-    let (delta_b, delta_pct, delta_dir) = {
-        let d = new_b.abs_diff(elig_b);
-        let pct = if d == 0 {
-            "no size change".to_string()
-        } else {
-            let v = d as f64 / elig_b.max(1) as f64 * 100.0;
-            // Don't round a real change down to the misleading "0%".
-            if v < 0.5 {
-                "<1%".to_string()
-            } else {
-                format!("{v:.0}%")
-            }
-        };
-        let dir = if new_b == elig_b {
-            "none"
-        } else if new_b > elig_b {
-            "larger"
-        } else {
-            "smaller"
-        };
-        (human_bytes(d), pct, dir)
-    };
-    let change_cls = match delta_dir {
-        "larger" => "text-orange-300",
-        "smaller" => "text-green-500",
-        _ => "",
-    };
-    // The delta phrase mirrors core's size_change_label wording so the
-    // two always read the same; the rich parts get the direction color.
-    let delta_phrase = match delta_dir {
-        "larger" => format!("{delta_b} larger (+{delta_pct})"),
-        "smaller" => format!("{delta_b} smaller (−{delta_pct})"),
-        _ => delta_pct.clone(),
-    };
+    let change = size_change_label(elig_b, new_b);
+    let headline = format!(
+        "{} eligible • {} → {} • {}",
+        elig,
+        human_bytes(elig_b),
+        human_bytes(new_b),
+        change
+    );
     let warn_note = if warned > 0 {
         format!(" • {warned} below {threshold:.0}% (warned, still queued)")
     } else {
@@ -1789,16 +1760,7 @@ fn EstimateCard() -> Element {
                 CardTitle { "Estimate & plan" }
             }
             CardContent {
-                p { class: "text-sm font-semibold",
-                    "{elig} eligible • "
-                    // Both sizes carry the direction color so the before/
-                    // after pair reads at a glance, like the delta does.
-                    span { class: "{change_cls}", "{human_bytes(elig_b)}" }
-                    " → "
-                    span { class: "{change_cls}", "{human_bytes(new_b)}" }
-                    " • "
-                    span { class: "{change_cls} font-medium", "{delta_phrase}" }
-                }
+                p { class: "text-sm font-semibold", "{headline}" }
                 p { class: "text-xs text-muted-foreground", "{subline}" }
                 div { class: "mt-2 max-h-36 overflow-y-auto rounded-md border border-border p-2",
                     for (mark , prefix , reason , cls) in rows {
