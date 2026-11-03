@@ -5,7 +5,7 @@
 //! `Signal<AppState>`. (Dioxus 0.7 signals use unsync storage, so this
 //! separation is required — and it keeps every race in one place.)
 
-use crate::state::{tool_ok, AppState};
+use crate::state::{pop_next_segment, tool_ok, AppState};
 use dioxus::prelude::*;
 use futures_channel::mpsc::UnboundedSender;
 use shrinkr_core::bench;
@@ -14,7 +14,7 @@ use shrinkr_core::media::{human_bytes, probe_file, MediaFile};
 use shrinkr_core::pipeline::{preflight_auto_with, EstParams, Preflight, ThresholdPolicy};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::AtomicBool, atomic::AtomicUsize, atomic::Ordering, Arc};
+use std::sync::{atomic::AtomicBool, atomic::AtomicUsize, atomic::Ordering, Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -70,6 +70,13 @@ pub enum JobMsg {
     /// nothing wrong to report, so it must not surface as an error.
     ExecAborted {
         job: usize,
+    },
+    /// The user skipped or removed this file from the queue mid-run, and
+    /// its turn came: the worker stepped over it without encoding.
+    /// Bookkeeping treats it like an explained skip — done, not failed.
+    ExecUserSkip {
+        job: usize,
+        detail: String,
     },
     ExecDone {
         freed: i64,
@@ -445,6 +452,7 @@ pub fn start_exec(
     threshold_policy: ThresholdPolicy,
     extra_args: Vec<String>,
     cancel: Arc<AtomicBool>,
+    skips: Arc<Mutex<HashSet<PathBuf>>>,
 ) {
     // Caller guarantees non-empty files; the worker always ends with ExecDone.
     // A fresh batch never inherits a pause (chained legs start here too).
@@ -496,6 +504,7 @@ pub fn start_exec(
             let extra_args = extra_args.clone();
             let tmp_root = tmp_root.clone();
             let cancel = cancel.clone();
+            let skips = skips.clone();
             handles.push(thread::spawn(move || loop {
                 // Paused run: hold before claiming the next file until
                 // resumed or cancelled — cancel wins so a pause left set
@@ -508,6 +517,29 @@ pub fn start_exec(
                     break;
                 }
                 if cancel.load(Ordering::Relaxed) {
+                    continue;
+                }
+                // Skipped or removed from the queue mid-run: the file's
+                // turn still comes (the claim is index-based), but no
+                // encode happens. The UI already hid or flagged the row;
+                // this closes the loop on the worker side.
+                let user_skipped =
+                    skips.lock().map(|g| g.contains(&files[i].path)).unwrap_or(false);
+                if user_skipped {
+                    let name = files[i]
+                        .path
+                        .file_name()
+                        .and_then(|x| x.to_str())
+                        .unwrap_or("?");
+                    send(
+                        &tx,
+                        JobMsg::ExecUserSkip {
+                            job: i,
+                            detail: format!(
+                                "skip {name}: skipped from the queue at the user's request — not encoded"
+                            ),
+                        },
+                    );
                     continue;
                 }
                 match run_one_job(
@@ -718,6 +750,81 @@ pub fn cancel_exec(state: Signal<AppState>) {
 pub fn cancel_convert(state: Signal<AppState>) {
     if let Some(c) = state.read().convert_cancel.clone() {
         c.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Skip one waiting file mid-run: it will not encode when its turn comes
+/// (the row reads "skipped"); it stays in the library. Works for the
+/// running batch's unclaimed rows and for queued-behind-batch files via
+/// the shared skip set — the worker checks it before each claimed file,
+/// and the chain start filters it. Rows already encoding or finished
+/// carry no skip control, so reaching here means the file was waiting.
+pub fn skip_queued(mut state: Signal<AppState>, path: &Path) {
+    let mut w = state.write();
+    if !w.executing {
+        return;
+    }
+    if let Some(set) = &w.exec_skips {
+        if let Ok(mut g) = set.lock() {
+            g.insert(path.to_path_buf());
+        }
+    }
+    let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("?");
+    w.push_log(format!(
+        "skipped {name}: will not run — skipped from the queue (stays in the library)."
+    ));
+}
+
+/// Delete one file from the queue mid-run (file stays in the library).
+/// Queued-behind-batch files drop out of their segment immediately;
+/// staged picks leave staging; a not-yet-claimed row of the running
+/// batch is hidden at once and skipped by the worker when its turn
+/// comes. In-flight or finished rows carry no delete control.
+pub fn unqueue(mut state: Signal<AppState>, path: &Path) {
+    let mut w = state.write();
+    if !w.executing {
+        return;
+    }
+    let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("?");
+    // Waiting behind the batch: straight out of its segment.
+    let mut was_pending = false;
+    for seg in w.pending.iter_mut() {
+        if let Some(pos) = seg.files.iter().position(|f| f.path == path) {
+            seg.files.remove(pos);
+            was_pending = true;
+            break;
+        }
+    }
+    if was_pending {
+        // A segment emptied by this deletion disappears from the panel.
+        w.pending.retain(|seg| !seg.files.is_empty());
+        w.push_log(format!(
+            "Removed {name} from the queue — it stays in the library."
+        ));
+        return;
+    }
+    // Staged mid-run picks: leaving staging (Add to queue never sees them).
+    if let Some(pos) = w.staged.iter().position(|f| f.path == path) {
+        w.staged.remove(pos);
+        w.push_log(format!(
+            "Removed {name} from staging — it stays in the library, not queued."
+        ));
+        return;
+    }
+    // Running batch, not yet claimed: hide the row and let the worker's
+    // skip check close it out when the file's turn comes.
+    if let Some(item) = w.exec_items.iter_mut().find(|i| i.path == path) {
+        if !item.done && !item.failed && item.frac == 0.0 {
+            item.removed = true;
+            if let Some(set) = &w.exec_skips {
+                if let Ok(mut g) = set.lock() {
+                    g.insert(path.to_path_buf());
+                }
+            }
+            w.push_log(format!(
+                "Removed {name} from the queue — it stays in the library."
+            ));
+        }
     }
 }
 
@@ -1057,6 +1164,17 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             // the pending queue holds its own clones.
             if !s.executing {
                 s.files.clear();
+            } else if !s.scanning && !s.probing {
+                // Mid-run pick: those files are meant for the queue, so
+                // scan them right away — no manual Scan press needed.
+                // Probed files land in `staged`; "Add to queue" remains
+                // the explicit commit gate.
+                let targets = std::mem::take(&mut s.targets);
+                s.scanning = true;
+                s.push_log(format!("Scanning {} picked item(s) …", targets.len()));
+                if let Some(tx) = s.job_tx.clone() {
+                    start_scan(tx, targets);
+                }
             }
         }
         JobMsg::ScanDone(paths) => {
@@ -1086,43 +1204,22 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 // the library and re-queue finished files.
                 if !s.files.iter().any(|x| x.path == f.path) {
                     s.files.push(f.clone());
-                    // Probed while a batch runs: join its queue instead of
-                    // waiting for the next manual Process (preflight-filtered
-                    // now; the worker re-checks at run time).
+                    // Probed while a batch runs: stage it — the file is
+                    // in the library, but joining the queue needs the
+                    // explicit "Add to queue" click, which snapshots the
+                    // user's picked settings for this batch.
                     if s.executing {
+                        s.staged.push(f.clone());
                         let name = f
                             .path
                             .file_name()
                             .and_then(|x| x.to_str())
                             .unwrap_or("?")
                             .to_string();
-                        let p = s.est_params();
-                        // Join with the running batch's own settings, so a
-                        // mid-run scan can't flip warn-only into skipping.
-                        let (t, policy) = s
-                            .exec_cfg
-                            .as_ref()
-                            .map(|c| (c.threshold, c.threshold_policy))
-                            .unwrap_or((s.threshold(), s.threshold_policy()));
-                        let verdict = preflight_auto_with(&f, &p, t, policy);
-                        if verdict.will_shrink() {
-                            s.pending.push(f);
-                            let waiting = s.pending.len();
-                            if verdict.is_warn() {
-                                s.push_log(format!(
-                                    "queued {name} with a warning ({waiting} waiting): {}",
-                                    verdict.reason()
-                                ));
-                            } else {
-                                s.push_log(format!(
-                                    "queued {name} ({waiting} waiting behind the running batch)"
-                                ));
-                            }
-                        } else {
-                            s.push_log(format!(
-                                "{name} would skip — in library; the mid-run Queue button runs it anyway (warned)"
-                            ));
-                        }
+                        let staged = s.staged.len();
+                        s.push_log(format!(
+                            "{name} staged ({staged} staged) — Add to queue runs them with the picked settings"
+                        ));
                     }
                 }
             }
@@ -1133,7 +1230,20 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
         JobMsg::ProbeDone => {
             s.probing = false;
             if s.executing {
-                s.push_log("Scan finished — new files join the run queue.".into());
+                let staged = s.staged.len();
+                s.push_log(format!(
+                    "Scan finished — {staged} new file(s) staged. Press Add to queue to run them with the picked settings."
+                ));
+                // A second pick can wait in targets while this scan ran:
+                // chain straight into it so the staging flow keeps up.
+                if !s.targets.is_empty() && !s.scanning {
+                    let targets = std::mem::take(&mut s.targets);
+                    s.scanning = true;
+                    s.push_log(format!("Scanning {} picked item(s) …", targets.len()));
+                    if let Some(tx) = s.job_tx.clone() {
+                        start_scan(tx, targets);
+                    }
+                }
                 return;
             }
             let n_files = s.files.len();
@@ -1161,6 +1271,9 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
         }
         JobMsg::ExecWarn { msg } => s.push_log(msg),
         JobMsg::ExecProgress { job, frac, fps } => {
+            // Path cloned before the item borrows, so the skip-set fixup
+            // below the borrows can get to it.
+            let path = s.exec_items.get(job).map(|i| i.path.clone());
             if let Some(item) = s.exec_items.get_mut(job) {
                 // Fractions only move forward; fps-only lines (frac<0)
                 // refresh the rate and keep the last position.
@@ -1169,6 +1282,21 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 }
                 if fps > 0.0 {
                     item.fps = fps;
+                }
+            }
+            // A skip/remove click that landed just after the worker
+            // claimed the file loses the race: the encode is already
+            // running. Restore the row and drop the skip entry so the
+            // file finishes like any other.
+            let started = s.exec_items.get(job).is_some_and(|i| i.frac > 0.0);
+            if started {
+                if let Some(item) = s.exec_items.get_mut(job) {
+                    item.removed = false;
+                }
+                if let (Some(p), Some(set)) = (path.as_deref(), s.exec_skips.as_ref()) {
+                    if let Ok(mut g) = set.lock() {
+                        g.remove(p);
+                    }
                 }
             }
         }
@@ -1206,6 +1334,16 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 item.frac = 1.0;
             }
         }
+        JobMsg::ExecUserSkip { job, detail } => {
+            // The user skipped or removed this file from the queue, and
+            // the worker stepped over it when its turn came — done row,
+            // one log line, never a failure.
+            if let Some(item) = s.exec_items.get_mut(job) {
+                item.done = true;
+                item.frac = 1.0;
+            }
+            s.push_log(detail);
+        }
         JobMsg::ExecDone {
             freed,
             elapsed_s,
@@ -1219,10 +1357,14 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 stopped_no_gain || s.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
             if cancelled {
                 // Pending files stay in the library, unrun.
-                let n = s.pending.len();
+                let n = s.pending_len();
+                let staged = s.staged.len();
                 s.pending.clear();
-                s.pending_warn = false;
+                s.staged.clear();
                 s.executing = false;
+                // The run's skip set dies with it; the next Process starts
+                // with a fresh queue decision.
+                s.exec_skips = None;
                 if stopped_no_gain {
                     let discarded = s.exec_discarded;
                     s.exec_discarded = 0;
@@ -1256,8 +1398,13 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                     } else {
                         format!(" {n} queued file(s) kept in the library, not run.")
                     };
+                    let staged_note = if staged == 0 {
+                        String::new()
+                    } else {
+                        format!(" {staged} scanned file(s) stayed in the library — not queued.")
+                    };
                     s.push_log(format!(
-                        "Cancelled after {:.0}s. Freed {}.{queued}",
+                        "Cancelled after {:.0}s. Freed {}.{queued}{staged_note}",
                         elapsed_s,
                         human_bytes(freed.max(0) as u64)
                     ));
@@ -1265,78 +1412,101 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 return;
             }
             if !s.pending.is_empty() {
-                // Chain: files queued mid-run go next, same settings —
-                // except warn mode when the user explicitly queued files
-                // with the Queue button (below-threshold files joined on
-                // purpose, so they run instead of skipping).
-                let warn = s.pending_warn;
-                s.pending_warn = false;
-                let files = std::mem::take(&mut s.pending);
-                let Some(cfg) = s.exec_cfg.clone() else {
-                    s.executing = false;
-                    s.push_log(format!(
-                        "warn: {} queued file(s) lost — no run config stored",
-                        files.len()
-                    ));
-                    return;
-                };
-                let Some(tx) = s.job_tx.clone() else {
-                    s.executing = false;
-                    s.push_log(format!(
-                        "warn: {} queued file(s) lost — no job channel",
-                        files.len()
-                    ));
-                    return;
-                };
-                // Failure bookkeeping continues off this snapshot; the
-                // chained leg appends onto the run's failed list.
-                s.exec_files = files.clone();
-                s.exec_items = files
-                    .iter()
-                    .map(|f| {
-                        crate::state::ExecItem::new(
-                            f.path
-                                .file_name()
-                                .and_then(|x| x.to_str())
-                                .unwrap_or("?")
-                                .to_string(),
-                            f.path.clone(),
-                            f.res_label(),
-                        )
-                    })
-                    .collect();
-                s.exec_total = files.len();
-                s.exec_discarded = 0;
-                let cancel = Arc::new(AtomicBool::new(false));
-                s.cancel = Some(cancel.clone());
-                s.push_log(format!(
-                    "Queued batch: starting {} more file(s) with the same settings{} …",
-                    files.len(),
-                    if warn {
-                        " (warn mode: below-threshold files run after all)"
-                    } else {
-                        ""
+                // Chain: each mid-run queue addition carries the settings
+                // snapshot taken when it was queued, so files picked with
+                // different sidebar settings run in their own legs. The
+                // next ExecDone drains whatever segments remain — minus
+                // files the user skipped while they waited, which drop
+                // here and stay in the library, unrun.
+                let mut pending = std::mem::take(&mut s.pending);
+                let (seg, skipped_waiting) = {
+                    let guard = s.exec_skips.as_ref().and_then(|m| m.lock().ok());
+                    match guard {
+                        Some(g) => pop_next_segment(&mut pending, &g),
+                        None => pop_next_segment(&mut pending, &HashSet::new()),
                     }
-                ));
-                start_exec(
-                    tx,
-                    files,
-                    cfg.params,
-                    cfg.keep_subs,
-                    cfg.parallel,
-                    cfg.replace,
-                    cfg.threshold,
-                    if warn {
-                        ThresholdPolicy::Warn
-                    } else {
-                        cfg.threshold_policy
-                    },
-                    cfg.extra_args,
-                    cancel,
-                );
-                return;
+                };
+                s.pending = pending;
+                if skipped_waiting > 0 {
+                    s.push_log(format!(
+                        "Skipped {skipped_waiting} queued file(s) — they stay in the library, not run."
+                    ));
+                }
+                if let Some(seg) = seg {
+                    let Some(tx) = s.job_tx.clone() else {
+                        s.executing = false;
+                        s.push_log(format!(
+                            "warn: {} queued file(s) lost — no job channel",
+                            seg.files.len()
+                        ));
+                        return;
+                    };
+                    // Failure bookkeeping continues off this snapshot; the
+                    // chained leg appends onto the run's failed list.
+                    s.exec_files = seg.files.clone();
+                    s.exec_items = seg
+                        .files
+                        .iter()
+                        .map(|f| {
+                            crate::state::ExecItem::new(
+                                f.path
+                                    .file_name()
+                                    .and_then(|x| x.to_str())
+                                    .unwrap_or("?")
+                                    .to_string(),
+                                f.path.clone(),
+                                f.res_label(),
+                            )
+                        })
+                        .collect();
+                    s.exec_total = seg.files.len();
+                    s.exec_discarded = 0;
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    s.cancel = Some(cancel.clone());
+                    s.push_log(format!(
+                        "Queued batch: starting {} file(s) with the queued settings{} …",
+                        seg.files.len(),
+                        if seg.warn {
+                            " (warn mode: below-threshold files run after all)"
+                        } else {
+                            ""
+                        }
+                    ));
+                    start_exec(
+                        tx,
+                        seg.files,
+                        seg.cfg.params,
+                        seg.cfg.keep_subs,
+                        seg.cfg.parallel,
+                        seg.cfg.replace,
+                        seg.cfg.threshold,
+                        if seg.warn {
+                            ThresholdPolicy::Warn
+                        } else {
+                            seg.cfg.threshold_policy
+                        },
+                        seg.cfg.extra_args,
+                        cancel,
+                        s.exec_skips
+                            .clone()
+                            .unwrap_or_else(|| Arc::new(Mutex::new(HashSet::new()))),
+                    );
+                    return;
+                }
+                // Only skipped files waited: the run ends here instead of
+                // starting a leg with nothing in it (the tail below closes
+                // it out).
+                s.exec_skips = None;
             }
             s.executing = false;
+            s.exec_skips = None;
+            if !s.staged.is_empty() {
+                let staged_left = s.staged.len();
+                s.staged.clear();
+                s.push_log(format!(
+                    "{staged_left} staged file(s) stayed in the library — not queued."
+                ));
+            }
             for item in &mut s.exec_items {
                 // Belt and braces: a finished batch leaves no item half-done.
                 if !item.failed {

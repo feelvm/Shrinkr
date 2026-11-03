@@ -10,6 +10,7 @@ use shrinkr_core::pipeline::{
     estimate_file, preflight_auto_with, EstParams, NvencPreset, Preflight, ScalePolicy,
     ThresholdPolicy, VideoBackend,
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// The three video goals on the single speed↔size axis. The names state
@@ -173,7 +174,7 @@ impl GoalEstimate {
         }
     }
 }
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 /// Encode settings snapshot for chained batches: files queued mid-run
 /// re-run with exactly what the finished batch used.
@@ -186,6 +187,42 @@ pub struct ExecCfg {
     pub threshold: f64,
     pub threshold_policy: ThresholdPolicy,
     pub extra_args: Vec<String>,
+}
+
+/// One mid-run queue addition: a group of files plus the settings they
+/// run with. Each segment becomes its own chained batch when the current
+/// one drains, so two additions picked with different sidebar settings
+/// keep their own — the queue-time settings, not one shared snapshot.
+#[derive(Clone, Debug)]
+pub struct PendingSegment {
+    pub files: Vec<MediaFile>,
+    pub cfg: ExecCfg,
+    /// Explicit queue clicks let below-threshold files join on purpose
+    /// (ThresholdPolicy::Warn); the no-gain guard keeps originals safe.
+    pub warn: bool,
+}
+
+/// Pop the next pending segment that still has files to run, counting
+/// skipped files out of the way. A file the user skipped while it waited
+/// (its path sits in the run's skip set) is dropped from its segment and
+/// stays in the library, unrun; segments emptied by the drop are unsurfaced
+/// too. `(None, 0)` when nothing runnable remains. The chain start uses
+/// this instead of a plain front-pop so a skip beats the chain.
+pub fn pop_next_segment(
+    pending: &mut Vec<PendingSegment>,
+    skips: &HashSet<PathBuf>,
+) -> (Option<PendingSegment>, usize) {
+    let mut dropped = 0usize;
+    while !pending.is_empty() {
+        let mut seg = pending.remove(0);
+        let before = seg.files.len();
+        seg.files.retain(|f| !skips.contains(&f.path));
+        dropped += before - seg.files.len();
+        if !seg.files.is_empty() {
+            return (Some(seg), dropped);
+        }
+    }
+    (None, dropped)
 }
 
 /// Per-file encode progress. The group bar is the mean of these, so it
@@ -203,6 +240,11 @@ pub struct ExecItem {
     pub fps: f64,
     pub done: bool,
     pub failed: bool,
+    /// Deleted from the queue before its turn: the row is hidden from
+    /// the run panel, and the worker skips the file when it reaches it.
+    /// Cleared again if the encode turns out to already be running
+    /// (progress arrives) — the row comes back at its real position.
+    pub removed: bool,
 }
 
 impl ExecItem {
@@ -215,6 +257,7 @@ impl ExecItem {
             fps: 0.0,
             done: false,
             failed: false,
+            removed: false,
         }
     }
 
@@ -310,14 +353,21 @@ pub struct AppState {
     /// cleared at batch start and ExecDone). UI label only — no worker
     /// decisions read this field.
     pub paused: bool,
-    /// Files probed while a batch runs. Drained into a chained batch at
-    /// ExecDone (same settings); discarded to the library on cancel.
-    pub pending: Vec<MediaFile>,
-    /// True when the user explicitly queued files via the mid-run Queue
-    /// button: below-threshold files joined deliberately, so the chained
-    /// batch runs warn instead of skip (the no-gain guard still keeps
-    /// originals safe). Cleared once the chain starts or on cancel.
-    pub pending_warn: bool,
+    /// Mid-run queue additions, each with the settings picked when it was
+    /// queued. Drained front-to-back into chained batches at ExecDone;
+    /// discarded back to the library on cancel.
+    pub pending: Vec<PendingSegment>,
+    /// Paths the user skipped or deleted from the queue while the run is
+    /// going. Shared with the running batch's workers, who check it
+    /// before starting each claimed file, so a skip beats the
+    /// work-stealing queue; queued-behind-batch files are filtered by it
+    /// when their chain leg starts. Cleared when the run ends — a fresh
+    /// run starts with an empty set.
+    pub exec_skips: Option<Arc<Mutex<HashSet<PathBuf>>>>,
+    /// Mid-run scan results waiting for the explicit "Add to queue"
+    /// click. They live in the library already; staging is just the
+    /// commit gate for the queue.
+    pub staged: Vec<MediaFile>,
     /// Settings snapshot of the running batch, for chained batches.
     pub exec_cfg: Option<ExecCfg>,
     /// Pump sender, stored so job handlers can start chained batches.
@@ -499,7 +549,8 @@ impl Default for AppState {
             cancel: None,
             paused: false,
             pending: vec![],
-            pending_warn: false,
+            exec_skips: None,
+            staged: vec![],
             exec_cfg: None,
             job_tx: None,
             log: vec![LogEntry::new("Add folders and/or files, then Scan.".into())],
@@ -661,8 +712,8 @@ impl AppState {
     /// the running batch's settings snapshot (the chained batch encodes
     /// with it), so a mid-run slider change can't smuggle a file in that
     /// the chain's preflight would then reject for a different reason.
-    /// Files already queued or already in the running batch are excluded
-    /// by path.
+    /// Files already queued, staged for the queue, or already in the
+    /// running batch are excluded by path.
     pub fn queueable(&self) -> Vec<usize> {
         let (p, t) = match self.exec_cfg.as_ref() {
             Some(cfg) => (cfg.params.clone(), cfg.threshold),
@@ -671,7 +722,8 @@ impl AppState {
         let queued: std::collections::HashSet<_> = self
             .pending
             .iter()
-            .map(|f| f.path.clone())
+            .flat_map(|seg| seg.files.iter().map(|f| f.path.clone()))
+            .chain(self.staged.iter().map(|f| f.path.clone()))
             .chain(self.exec_items.iter().map(|i| i.path.clone()))
             .collect();
         self.files
@@ -683,6 +735,12 @@ impl AppState {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Total files waiting across queue segments — the number the run
+    /// panel's "(+N waiting)" label and cancel summaries report.
+    pub fn pending_len(&self) -> usize {
+        self.pending.iter().map(|seg| seg.files.len()).sum()
     }
 
     /// (eligible_input_bytes, new_bytes, byte delta, est_seconds). The
@@ -1126,8 +1184,13 @@ mod tests {
             threshold_policy: ThresholdPolicy::Skip,
             extra_args: vec![],
         });
-        // One file queued behind the batch, one pending in the queue.
-        s.pending.push(second.clone());
+        // One file queued behind the batch (a mid-run addition segment),
+        // one pending in the queue.
+        s.pending.push(PendingSegment {
+            files: vec![second.clone()],
+            cfg: s.exec_cfg.clone().unwrap(),
+            warn: true,
+        });
         // The first video is the file currently encoding.
         s.exec_items.push(ExecItem::new(
             "t.mp4".into(),
@@ -1141,5 +1204,101 @@ mod tests {
         ));
         // Only the untouched third file is addable.
         assert_eq!(s.queueable(), vec![2]);
+    }
+
+    #[test]
+    fn queueable_excludes_staged_files() {
+        // Staged mid-run scan results aren't queued yet, but queueing
+        // them via the Queue button would double up — the Add to queue
+        // click is their commit gate, so the excluded block covers it.
+        let mut s = app();
+        s.lossless = false;
+        s.min_saving_pct = 99.0;
+        let mut second = video();
+        second.path = std::path::PathBuf::from("t2.mp4");
+        let mut third = video();
+        third.path = std::path::PathBuf::from("t3.mp4");
+        s.files = vec![video(), second.clone(), third];
+        s.executing = true;
+        s.exec_cfg = Some(ExecCfg {
+            params: s.est_params(),
+            keep_subs: true,
+            parallel: 2,
+            replace: true,
+            threshold: 99.0,
+            threshold_policy: ThresholdPolicy::Skip,
+            extra_args: vec![],
+        });
+        s.staged.push(second);
+        // The staged file drops out; the untouched first and third files
+        // stay addable via the Queue button.
+        assert_eq!(s.queueable(), vec![0, 2]);
+    }
+
+    #[test]
+    fn pending_len_counts_files_across_segments() {
+        // The waiting count flattens segments: two additions with 1 and
+        // 2 files read as 3 files waiting behind the batch.
+        let mut s = app();
+        let params = s.est_params();
+        let seg = move |files: Vec<MediaFile>| PendingSegment {
+            files,
+            cfg: ExecCfg {
+                params: params.clone(),
+                keep_subs: true,
+                parallel: 2,
+                replace: true,
+                threshold: 10.0,
+                threshold_policy: ThresholdPolicy::Warn,
+                extra_args: vec![],
+            },
+            warn: false,
+        };
+        s.pending.push(seg(vec![video()]));
+        s.pending.push(seg(vec![video(), video()]));
+        assert_eq!(s.pending_len(), 3);
+    }
+
+    #[test]
+    fn pop_next_segment_drops_skipped_files_and_emptied_segments() {
+        // A skipped waiting file must not run when its chain leg starts:
+        // pop_next_segment filters it out, counts it in `dropped`, and
+        // skips segments it emptied without surfacing them.
+        let mut s = app();
+        let params = s.est_params();
+        let seg = move |files: Vec<MediaFile>| PendingSegment {
+            files,
+            cfg: ExecCfg {
+                params: params.clone(),
+                keep_subs: true,
+                parallel: 2,
+                replace: true,
+                threshold: 10.0,
+                threshold_policy: ThresholdPolicy::Warn,
+                extra_args: vec![],
+            },
+            warn: false,
+        };
+        let mut second = video();
+        second.path = std::path::PathBuf::from("t2.mp4");
+        s.pending.push(seg(vec![video()]));
+        s.pending.push(seg(vec![video(), second.clone()]));
+        // Only the default path ("t.mp4") is skipped: the first segment
+        // empties and dies, the second keeps its second file.
+        let mut skips = HashSet::new();
+        skips.insert(video().path);
+        let (seg, dropped) = pop_next_segment(&mut s.pending, &skips);
+        // Every skipped file is accounted for: 1 (segment emptied) + 1.
+        assert_eq!(dropped, 2);
+        // The surviving segment holds only the untouched second file:
+        // both skipped videos were dropped with their segments/peers.
+        let seg = seg.expect("second segment has a runnable file");
+        assert_eq!(seg.files.len(), 1);
+        assert_eq!(seg.files[0].path, second.path);
+        assert!(s.pending.is_empty());
+        // Nothing runnable left: None arrives with no further drops.
+        let (none, dropped) = pop_next_segment(&mut s.pending, &skips);
+        assert!(none.is_none());
+        assert_eq!(dropped, 0);
     }
 }
