@@ -214,6 +214,7 @@ mod tests {
 
     fn params_for(backend: VideoBackend) -> EstParams {
         EstParams {
+            preserve_quality: false,
             backend,
             preset: NvencPreset::P5,
             cq: 28,

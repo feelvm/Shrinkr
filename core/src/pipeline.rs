@@ -141,10 +141,10 @@ impl NvencPreset {
     /// the shared control is a speed↔size lever on the CPU path too.
     pub fn svt(&self) -> u8 {
         match self {
-            NvencPreset::P3 => 6,
-            NvencPreset::P4 => 7,
+            NvencPreset::P3 => 10,
+            NvencPreset::P4 => 9,
             NvencPreset::P5 => 8,
-            NvencPreset::P6 => 9,
+            NvencPreset::P6 => 7,
         }
     }
 
@@ -587,6 +587,9 @@ pub fn x264_ratio_for(vcodec: &str) -> f64 {
 
 #[derive(Clone, Copy, Debug)]
 pub struct EstParams {
+    /// Conservative video encode, protected audio, and a measured quality
+    /// check before placement. Still-image settings remain independent.
+    pub preserve_quality: bool,
     pub backend: VideoBackend,
     pub preset: NvencPreset,
     pub cq: u32,
@@ -616,6 +619,21 @@ pub struct EstParams {
     /// on exactly the files the plain model predicts poorly. The grain is
     /// synthetic, which is why this stays a visible switch.
     pub film_grain: bool,
+}
+
+impl EstParams {
+    /// Resolve protection per source so estimates and encodes use the same
+    /// audio decision. An unsafe target falls back to copying every track.
+    pub fn for_media(&self, m: &MediaFile) -> Self {
+        let mut p = *self;
+        if p.preserve_quality {
+            p.cq = crate::quality::VIDEO_CQ;
+            p.all_audio = true;
+            p.film_grain = false;
+            p.opus_bps = crate::quality::audio_target(m, p.opus_bps, p.backend);
+        }
+        p
+    }
 }
 
 /// Default Opus target: transparent-ish stereo, lean 5.1.
@@ -763,6 +781,8 @@ fn quality_label(p: &EstParams) -> String {
 /// Full-file estimate: video part (factored) + audio part (copy or 64k
 /// Opus), split via stream bitrate when known.
 pub fn estimate_file(m: &MediaFile, p: &EstParams) -> FileEstimate {
+    let resolved = p.for_media(m);
+    let p = &resolved;
     let density = source_density(m);
     // Film-grain synthesis denoises before encoding, so a dense/grainy
     // source stops behaving like one: the density penalty (which exists
@@ -963,6 +983,8 @@ pub fn preflight_with(
     policy: ThresholdPolicy,
 ) -> Preflight {
     use crate::media::human_bytes;
+    let resolved = p.for_media(m);
+    let p = &resolved;
     // Corrupt / undecodable inputs are rejected by probe already; a missing
     // video stream here means skip, not crash.
     if m.vcodec == "unknown" || m.width == 0 {
@@ -1534,6 +1556,7 @@ mod tests {
 
     fn params() -> EstParams {
         EstParams {
+            preserve_quality: false,
             backend: VideoBackend::Auto,
             preset: NvencPreset::P5,
             cq: 28,
@@ -1608,6 +1631,7 @@ mod tests {
         let levels = select_levels_for_media(VideoBackend::CpuAv1, &no_svt, &m);
         assert_eq!(levels, vec![Level::CpuAv1, Level::CpuX264]);
         let av1_params = EstParams {
+            preserve_quality: false,
             backend: VideoBackend::CpuAv1,
             preset: NvencPreset::P5,
             cq: 28,
@@ -1620,6 +1644,7 @@ mod tests {
             film_grain: false,
         };
         let x265_params = EstParams {
+            preserve_quality: false,
             backend: VideoBackend::CpuX265,
             ..av1_params
         };
@@ -2416,8 +2441,9 @@ mod tests {
     #[test]
     fn svt_preset_follows_the_shared_knob() {
         assert_eq!(NvencPreset::P5.svt(), 8);
-        assert_eq!(NvencPreset::P3.svt(), 6);
-        assert_eq!(NvencPreset::P6.svt(), 9);
+        let presets = NvencPreset::all_bench().map(|p| p.svt());
+        assert_eq!(presets, [10, 9, 8, 7]);
+        assert!(presets.windows(2).all(|pair| pair[0] > pair[1]));
         assert_eq!(NvencPreset::P5.qsv(), "medium");
         assert_eq!(NvencPreset::P3.qsv(), "veryfast");
         assert_eq!(NvencPreset::P4.amf(), "balanced");

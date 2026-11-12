@@ -16,7 +16,6 @@ use crate::media::MediaFile;
 use crate::pipeline::{
     effective_scale_target, Level, NvencPreset, ScalePolicy, StreamPlan, VideoBackend,
 };
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1112,82 +1111,33 @@ fn run_once(
     let sampling2 = sampling.clone();
     let gpu_handle = std::thread::spawn(move || crate::hw::sample_gpu_util(sampling2));
 
-    // Pause watcher: suspends the child while the run-level flag is set
-    // (same lifetime pattern as the sampler — dropped below, after wait()).
-    let running = Arc::new(AtomicBool::new(true));
-
-    let mut child = crate::process::cmd("ffmpeg")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn ffmpeg ({}): {}", level.encoder_name(), e))?;
-
-    let pause_handle = crate::pause::spawn_watcher(child.id(), cancel.clone(), running.clone());
-
-    // Parse `-progress pipe:1` from stdout; keep stderr tail for error +
-    // `-benchmark`-style drill-down.
-    let stderr_tail = Arc::new(std::sync::Mutex::new(String::new()));
-    let stderr_tail2 = stderr_tail.clone();
-    if let Some(err) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let r = BufReader::new(err);
-            let mut tail: Vec<String> = vec![];
-            for line in r.lines().filter_map(|l| l.ok()) {
-                tail.push(line);
-                if tail.len() > 40 {
-                    tail.remove(0);
-                }
-            }
-            if let Ok(mut g) = stderr_tail2.lock() {
-                *g = tail.join("\n");
-            }
-        });
-    }
-
-    if let Some(out) = child.stdout.take() {
-        let reader = BufReader::new(out);
-        for line in reader.lines().filter_map(|l| l.ok()) {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                sampling.store(false, Ordering::Relaxed);
-                running.store(false, Ordering::Relaxed);
-                return Err("cancelled".into());
-            }
-            let line = line.trim().to_string();
+    let outcome = crate::process::run_with_progress(
+        crate::process::cmd("ffmpeg").args(args),
+        cancel,
+        true,
+        |line| {
             if let Some(v) = line.strip_prefix("out_time_ms=") {
-                let fps_now = 0.0; // instantaneous fps arrives on fps= lines; frac is primary
                 if let Ok(us) = v.parse::<i64>() {
-                    let frac = if us < 0 {
-                        0.0
-                    } else {
-                        (us as f64 / total_us as f64).clamp(0.0, 1.0)
-                    };
-                    progress(Progress { frac, fps: fps_now });
+                    let frac = (us as f64 / total_us as f64).clamp(0.0, 1.0);
+                    progress(Progress { frac, fps: 0.0 });
                 }
             } else if let Some(v) = line.strip_prefix("fps=") {
-                if let Ok(f) = v.trim().parse::<f64>() {
-                    progress(Progress { frac: -1.0, fps: f });
+                if let Ok(fps) = v.trim().parse::<f64>() {
+                    progress(Progress { frac: -1.0, fps });
                 }
             }
-            if line == "progress=end" {
-                break;
-            }
-        }
-    }
-    let st = child.wait().map_err(|e| format!("wait ffmpeg: {e}"))?;
+        },
+    );
+    // Always stop/join the sampler, even if spawning or cancellation failed.
     sampling.store(false, Ordering::Relaxed);
     let (gpu_avg, gpu_max, _) = gpu_handle.join().unwrap_or((0, 0, 0));
-    running.store(false, Ordering::Relaxed);
-    let _ = pause_handle.join();
-
-    if !st.success() {
-        let tail = stderr_tail.lock().map(|g| g.clone()).unwrap_or_default();
+    let outcome = outcome?;
+    let bench_tail = outcome.stderr_tail;
+    if !outcome.status.success() {
         return Err(format!(
             "ffmpeg ({}) failed: {}",
             level.encoder_name(),
-            error_snippet(&tail, st)
+            error_snippet(&bench_tail, outcome.status)
         ));
     }
 
@@ -1256,7 +1206,6 @@ fn run_once(
     let avg_fps = media.total_frames() / elapsed;
     let realtime = media.duration_s.max(0.01) / elapsed;
     let ratio = new_len as f64 / media.bytes.max(1) as f64;
-    let bench_tail = stderr_tail.lock().map(|g| g.clone()).unwrap_or_default();
     // FFmpeg may silently fall back to software decode inside a HW-level
     // attempt (exit 0 + "Failed setup for format cuda" on stderr, e.g. for
     // yuv444p inputs whose CUDA path the driver rejects). The output is
@@ -2149,7 +2098,7 @@ mod tests {
             .join(" ")
         };
         assert!(mk(&lean, NvencPreset::P5, true).contains("-preset 8"));
-        assert!(mk(&lean, NvencPreset::P3, true).contains("-preset 6"));
+        assert!(mk(&lean, NvencPreset::P3, true).contains("-preset 10"));
         // Dense 30 Mbps 4K source with FGS on: parameters present.
         let args = mk(&test_media(), NvencPreset::P5, true);
         assert!(args.contains("film-grain=8:film-grain-denoise=1"), "{args}");

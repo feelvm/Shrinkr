@@ -909,7 +909,7 @@ pub fn build_copy_args(
         // Subtitles: only the subtitle stream (never drag cover art along).
         MediaKind::Subtitle => a.push("0:s:0?".into()),
         // Audio-only outputs (audio→audio, video→audio extraction).
-        MediaKind::Audio => a.push("0:a:0".into()),
+        MediaKind::Audio => a.push("0:a".into()),
         MediaKind::Video if is_audio_extract(kind, target_ext) => a.push("0:a:0".into()),
         _ => a.push("0".into()),
     }
@@ -983,16 +983,26 @@ pub fn build_reencode_args(
         }
         MediaKind::Video => {
             a.push("-map".into());
-            a.push("0:v:0".into());
+            a.push("0:v".into());
             if m.audio_stream_count > 0 {
                 a.push("-map".into());
-                a.push("0:a:0".into());
+                a.push("0:a".into());
             }
-            if m.sub_count > 0 && matches!(target_ext, "mkv" | "mp4" | "mov" | "avi") {
+            if m.sub_count > 0 {
                 a.push("-map".into());
                 a.push("0:s?".into());
                 a.push("-c:s".into());
-                a.push("copy".into());
+                a.push(
+                    match target_ext {
+                        "mp4" | "mov" => "mov_text",
+                        "webm" => "webvtt",
+                        _ => "copy",
+                    }
+                    .into(),
+                );
+            }
+            if m.attach_count > 0 {
+                a.extend(["-map".into(), "0:t?".into(), "-c:t".into(), "copy".into()]);
             }
             a.push("-map_metadata".into());
             a.push("-1".into());
@@ -1032,7 +1042,7 @@ pub fn build_reencode_args(
         }
         MediaKind::Audio => {
             a.push("-map".into());
-            a.push("0:a:0".into());
+            a.push("0:a".into());
             a.push("-map_metadata".into());
             a.push("-1".into());
             a.push("-dn".into());
@@ -1091,42 +1101,58 @@ pub fn run_convert(
     progress: &dyn Fn(f64),
     cancel: &Arc<AtomicBool>,
 ) -> Result<ConvertResult, String> {
-    if is_audio_extract(kind, target_ext) && m.audio_stream_count == 0 {
-        return Err("no audio track to extract — this video is silent".into());
+    if out_path == m.path
+        || out_path.canonicalize().ok().is_some_and(|out| {
+            m.path
+                .canonicalize()
+                .ok()
+                .is_some_and(|source| source == out)
+        })
+    {
+        return Err("conversion output must differ from the source".into());
     }
-    // A wiped temp folder must not read as a codec/container failure.
-    crate::ffmpeg::ensure_output_dir(out_path)?;
-    let copy_ok = copy_compatible(m, kind, target_ext);
-    if copy_ok {
-        let args = build_copy_args(&m.path, kind, target_ext, out_path);
-        match run_once(&args, m.duration_s, progress, cancel) {
-            Ok((bytes, elapsed)) => {
-                verify_output(out_path, kind, target_ext)?;
-                return Ok(ConvertResult {
-                    output_bytes: bytes,
-                    elapsed_s: elapsed,
-                    copied: true,
-                });
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(out_path);
-                if cancel.load(Ordering::Relaxed) {
-                    return Err("cancelled".into());
+    let result = (|| {
+        if is_audio_extract(kind, target_ext) && m.audio_stream_count == 0 {
+            return Err("no audio track to extract — this video is silent".into());
+        }
+        // A wiped temp folder must not read as a codec/container failure.
+        crate::ffmpeg::ensure_output_dir(out_path)?;
+        let copy_ok = copy_compatible(m, kind, target_ext);
+        if copy_ok {
+            let args = build_copy_args(&m.path, kind, target_ext, out_path);
+            match run_once(&args, m.duration_s, progress, cancel) {
+                Ok((bytes, elapsed)) => {
+                    verify_output(out_path, kind, target_ext, Some(m), cancel)?;
+                    return Ok(ConvertResult {
+                        output_bytes: bytes,
+                        elapsed_s: elapsed,
+                        copied: true,
+                    });
                 }
-                crate::ffmpeg::log::debug_log(&format!(
-                    "convert copy → {target_ext} failed ({e}); trying re-encode"
-                ));
+                Err(e) => {
+                    let _ = std::fs::remove_file(out_path);
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("cancelled".into());
+                    }
+                    crate::ffmpeg::log::debug_log(&format!(
+                        "convert copy → {target_ext} failed ({e}); trying re-encode"
+                    ));
+                }
             }
         }
+        let args = build_reencode_args(m, kind, target_ext, out_path);
+        let (bytes, elapsed) = run_once(&args, m.duration_s, progress, cancel)?;
+        verify_output(out_path, kind, target_ext, Some(m), cancel)?;
+        Ok(ConvertResult {
+            output_bytes: bytes,
+            elapsed_s: elapsed,
+            copied: false,
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(out_path);
     }
-    let args = build_reencode_args(m, kind, target_ext, out_path);
-    let (bytes, elapsed) = run_once(&args, m.duration_s, progress, cancel)?;
-    verify_output(out_path, kind, target_ext)?;
-    Ok(ConvertResult {
-        output_bytes: bytes,
-        elapsed_s: elapsed,
-        copied: false,
-    })
+    result
 }
 
 // ── LibreOffice document runner ──────────────────────────────
@@ -1241,7 +1267,7 @@ pub fn run_document_convert(
         })
         .map_err(|e| format!("collect libreoffice output: {e}"))?;
     let _ = std::fs::remove_dir_all(&work);
-    verify_output(out_path, MediaKind::Document, target_ext)?;
+    verify_output(out_path, MediaKind::Document, target_ext, None, cancel)?;
     let bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
     progress(1.0);
     Ok(ConvertResult {
@@ -1257,57 +1283,25 @@ fn run_once(
     progress: &dyn Fn(f64),
     cancel: &Arc<AtomicBool>,
 ) -> Result<(u64, f64), String> {
-    use std::io::{BufRead, BufReader};
     let t0 = std::time::Instant::now();
     let total_us = (duration_s.max(1.0) * 1_000_000.0) as i64;
-    let mut child = crate::process::cmd("ffmpeg")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
-    let stderr_tail = Arc::new(std::sync::Mutex::new(String::new()));
-    let tail2 = stderr_tail.clone();
-    if let Some(err) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let r = BufReader::new(err);
-            let mut tail: Vec<String> = vec![];
-            for line in r.lines().filter_map(|l| l.ok()) {
-                tail.push(line);
-                if tail.len() > 20 {
-                    tail.remove(0);
-                }
-            }
-            if let Ok(mut g) = tail2.lock() {
-                *g = tail.join("\n");
-            }
-        });
-    }
-    if let Some(out) = child.stdout.take() {
-        for line in BufReader::new(out).lines().filter_map(|l| l.ok()) {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                return Err("cancelled".into());
-            }
-            let line = line.trim().to_string();
+    let outcome = crate::process::run_with_progress(
+        crate::process::cmd("ffmpeg").args(args),
+        cancel,
+        false,
+        |line| {
             if let Some(v) = line.strip_prefix("out_time_ms=") {
                 if let Ok(us) = v.parse::<i64>() {
                     progress((us as f64 / total_us as f64).clamp(0.0, 1.0));
                 }
             }
-            if line == "progress=end" {
-                break;
-            }
-        }
-    }
-    let st = child.wait().map_err(|e| format!("wait ffmpeg: {e}"))?;
-    if !st.success() {
-        let tail = stderr_tail.lock().map(|g| g.clone()).unwrap_or_default();
-        let last = tail.lines().last().unwrap_or("ffmpeg failed").to_string();
+        },
+    )?;
+    if !outcome.status.success() {
+        let tail = outcome.stderr_tail;
         return Err(format!(
             "ffmpeg failed: {}",
-            last.chars().take(300).collect::<String>()
+            tail.chars().take(2000).collect::<String>()
         ));
     }
     let out_path = PathBuf::from(args.last().cloned().unwrap_or_default());
@@ -1330,8 +1324,18 @@ fn run_once(
     Ok((bytes, t0.elapsed().as_secs_f64().max(0.01)))
 }
 
-fn verify_output(out_path: &Path, kind: MediaKind, target_ext: &str) -> Result<(), String> {
-    // Office outputs aren't ffprobe-readable: size is the check.
+/// Verify the complete selected content before the caller may replace a source.
+fn verify_output(
+    out_path: &Path,
+    kind: MediaKind,
+    target_ext: &str,
+    source: Option<&MediaFile>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    // Office formats cannot be read by ffprobe.
     if kind == MediaKind::Document {
         let bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
         return if bytes > 512 {
@@ -1342,29 +1346,151 @@ fn verify_output(out_path: &Path, kind: MediaKind, target_ext: &str) -> Result<(
             ))
         };
     }
-    // Video→audio extraction yields an audio-only file.
+    let source = source.ok_or("source inspection missing for conversion verification")?;
+    let output = crate::media::probe_file(out_path).map_err(|e| format!("verify probe: {e:#}"))?;
+    let mut selected_source = source.clone();
     if is_audio_extract(kind, target_ext) {
-        let probed =
-            crate::media::probe_file(out_path).map_err(|e| format!("verify probe: {e:#}"))?;
-        return if probed.audio_stream_count > 0 {
-            Ok(())
-        } else {
-            Err("output has no audio stream — extraction failed".into())
-        };
+        // A selected soundtrack may end before the video or other tracks.
+        selected_source.duration_s = primary_audio_duration(&source.path, cancel)?;
     }
-    let probed = crate::media::probe_file(out_path).map_err(|e| format!("verify probe: {e:#}"))?;
-    let ok = match kind {
-        MediaKind::Video => probed.video_stream_count > 0,
-        MediaKind::Audio => probed.audio_stream_count > 0,
-        MediaKind::Image => probed.video_stream_count > 0 || probed.bytes > 0,
-        MediaKind::Subtitle => probed.sub_count > 0 || probed.bytes > 0,
-        MediaKind::Document => true, // handled above
-    };
-    if ok {
-        Ok(())
+    verify_media(&selected_source, &output, kind, target_ext)?;
+    if kind != MediaKind::Subtitle {
+        // A readable header is insufficient: decode every output video/audio
+        // stream, with errors fatal, to catch damaged content behind good metadata.
+        let result = crate::process::run_with_progress(
+            crate::process::cmd("ffmpeg")
+                .args(["-v", "error", "-xerror", "-i"])
+                .arg(out_path)
+                .args([
+                    "-map", "0:v?", "-map", "0:a?", "-sn", "-dn", "-f", "null", "-",
+                ]),
+            cancel,
+            false,
+            |_| {},
+        )?;
+        if !result.status.success() {
+            return Err(format!("verify decode failed: {}", result.stderr_tail));
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    Ok(())
+}
+
+fn primary_audio_duration(path: &Path, cancel: &Arc<AtomicBool>) -> Result<f64, String> {
+    let mut first: Option<f64> = None;
+    let mut last: Option<f64> = None;
+    let result = crate::process::run_with_progress(
+        crate::process::cmd("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_packets",
+                "-show_entries",
+                "packet=pts_time,dts_time,duration_time",
+                "-of",
+                "compact=p=0:nk=0",
+            ])
+            .arg(path),
+        cancel,
+        false,
+        |line| {
+            let mut pts = None;
+            let mut dts = None;
+            let mut duration = 0.0;
+            for field in line.split('|') {
+                let Some((key, value)) = field.split_once('=') else {
+                    continue;
+                };
+                let Some(value) = value.parse::<f64>().ok().filter(|n| n.is_finite()) else {
+                    continue;
+                };
+                match key {
+                    "pts_time" => pts = Some(value),
+                    "dts_time" => dts = Some(value),
+                    "duration_time" => duration = value.max(0.0),
+                    _ => {}
+                }
+            }
+            if let Some(start) = pts.or(dts) {
+                first = Some(first.map_or(start, |old| old.min(start)));
+                let end = start + duration;
+                last = Some(last.map_or(end, |old| old.max(end)));
+            }
+        },
+    )?;
+    if result.status.success() {
+        if let (Some(first), Some(last)) = (first, last) {
+            if last > first {
+                return Ok(last - first);
+            }
+        }
+    }
+    Err("verify extraction: could not establish the selected audio duration — original kept".into())
+}
+
+fn verify_media(
+    source: &MediaFile,
+    output: &MediaFile,
+    kind: MediaKind,
+    target_ext: &str,
+) -> Result<(), String> {
+    let extracting = is_audio_extract(kind, target_ext);
+    let expected = if extracting {
+        (0, 1, 0)
     } else {
-        Err("output has no playable stream — conversion failed".into())
+        match kind {
+            MediaKind::Video => (
+                source.video_stream_count,
+                source.audio_stream_count,
+                source.sub_count,
+            ),
+            MediaKind::Audio => (0, source.audio_stream_count, 0),
+            MediaKind::Image => (source.video_stream_count, 0, 0),
+            MediaKind::Subtitle => (0, 0, source.sub_count),
+            MediaKind::Document => return Ok(()),
+        }
+    };
+    let actual = (
+        output.video_stream_count,
+        output.audio_stream_count,
+        output.sub_count,
+    );
+    if expected == (0, 0, 0) || actual != expected {
+        return Err(format!(
+            "verify streams: expected video/audio/subtitles {}/{}/{}, found {}/{}/{} — original kept",
+            expected.0, expected.1, expected.2, actual.0, actual.1, actual.2
+        ));
     }
+    if kind == MediaKind::Video && !extracting && output.attach_count != source.attach_count {
+        return Err("verify streams: an attachment is missing — original kept".into());
+    }
+    let timed = extracting
+        || matches!(kind, MediaKind::Video | MediaKind::Audio)
+        || (kind == MediaKind::Image && source.duration_s > 0.5);
+    if timed {
+        let before = source.duration_s;
+        let after = output.duration_s;
+        // Allow normal muxer rounding and codec priming, never a percentage of
+        // a long file: a 5% tolerance could lose minutes from a movie.
+        if !before.is_finite() || !after.is_finite() || before <= 0.0 || after <= 0.0 {
+            return Err(
+                "verify duration: could not establish a complete timeline — original kept".into(),
+            );
+        }
+        if (before - after).abs() > 0.25 {
+            return Err(format!("verify duration: output {after:.3}s differs from source {before:.3}s — original kept"));
+        }
+    }
+    let same_dimensions = output.width == source.width && output.height == source.height;
+    let rotated_dimensions = output.width == source.height && output.height == source.width;
+    if kind == MediaKind::Image && !same_dimensions && !rotated_dimensions {
+        return Err("verify image: dimensions changed — original kept".into());
+    }
+    Ok(())
 }
 
 /// Destination for a converted file.
@@ -1652,7 +1778,46 @@ mod tests {
         assert!(rj.contains("-vn"), "{rj}");
         // Plain video re-encode still maps video.
         let rv = build_reencode_args(&m, MediaKind::Video, "mp4", Path::new("out.mp4"));
-        assert!(rv.join(" ").contains("0:v:0"));
+        assert!(rv.join(" ").contains("-map 0:v "));
+    }
+
+    #[test]
+    fn verification_rejects_truncation_and_missing_tracks() {
+        let mut source = video_media("h264", "aac");
+        source.audio_stream_count = 2;
+        source.sub_count = 1;
+        let mut output = source.clone();
+        assert!(verify_media(&source, &output, MediaKind::Video, "mp4").is_ok());
+        output.audio_stream_count = 1;
+        assert!(verify_media(&source, &output, MediaKind::Video, "mp4")
+            .unwrap_err()
+            .contains("streams"));
+        output = source.clone();
+        output.sub_count = 0;
+        assert!(verify_media(&source, &output, MediaKind::Video, "mp4").is_err());
+        output = source.clone();
+        output.duration_s -= 1.0;
+        assert!(verify_media(&source, &output, MediaKind::Video, "mp4")
+            .unwrap_err()
+            .contains("duration"));
+        output.duration_s = 0.0;
+        assert!(verify_media(&source, &output, MediaKind::Video, "mp4").is_err());
+        output.duration_s = f64::NAN;
+        assert!(verify_media(&source, &output, MediaKind::Video, "mp4").is_err());
+    }
+
+    #[test]
+    fn extraction_verification_expects_only_the_selected_audio() {
+        let mut source = video_media("h264", "aac");
+        source.audio_stream_count = 2;
+        source.sub_count = 1;
+        let mut output = source.clone();
+        output.video_stream_count = 0;
+        output.audio_stream_count = 1;
+        output.sub_count = 0;
+        assert!(verify_media(&source, &output, MediaKind::Video, "m4a").is_ok());
+        output.audio_stream_count = 0;
+        assert!(verify_media(&source, &output, MediaKind::Video, "m4a").is_err());
     }
 
     #[test]

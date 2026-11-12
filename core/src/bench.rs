@@ -182,6 +182,7 @@ pub fn run_on_file(
             .collect();
         let out = out_dir.join(format!("{stem}-{safe_tag}.mkv"));
         let est_params = || EstParams {
+            preserve_quality: false,
             backend: item.backend,
             preset: item.preset,
             cq: item.cq,

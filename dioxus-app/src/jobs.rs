@@ -18,29 +18,31 @@ use std::sync::{atomic::AtomicBool, atomic::AtomicUsize, atomic::Ordering, Arc, 
 use std::thread;
 use std::time::Instant;
 
-/// How many files in a row may be encoded and then discarded (result not
-/// smaller than the source) before the batch stops itself. A library that
-/// is already efficiently encoded hits this on every single file, and
-/// grinding through the whole thing writes nothing — one real run spent
-/// 7 hours that way. One success resets the streak, so a mixed library
-/// still runs to completion.
-const NO_GAIN_STOP_AFTER: usize = 10;
-
 #[derive(Debug)]
 pub enum JobMsg {
     TargetsAdded(Vec<PathBuf>),
-    ScanDone(Vec<PathBuf>),
+    ScanDone {
+        gen: u64,
+        paths: Vec<PathBuf>,
+    },
     ProbeOne {
+        gen: u64,
         done: usize,
         total: usize,
         file: Option<MediaFile>,
         err: Option<String>,
     },
-    ProbeDone,
+    ProbeDone {
+        gen: u64,
+    },
     ExecProgress {
         job: usize,
         frac: f64,
         fps: f64,
+    },
+    ExecCheckingQuality {
+        job: usize,
+        name: String,
     },
     /// A queued file is below the min-saving threshold but the user chose
     /// to run it anyway; surfaces the warning without failing the job.
@@ -65,8 +67,8 @@ pub enum JobMsg {
         job: usize,
         detail: String,
     },
-    /// A file was still encoding when the run ended (user cancel, or the
-    /// repeated-no-gain stop). Neither success nor failure — there is
+    /// A file was still encoding when the user cancelled. Neither success
+    /// nor failure — there is
     /// nothing wrong to report, so it must not surface as an error.
     ExecAborted {
         job: usize,
@@ -81,10 +83,6 @@ pub enum JobMsg {
     ExecDone {
         freed: i64,
         elapsed_s: f64,
-        /// True when the batch stopped itself after
-        /// [`NO_GAIN_STOP_AFTER`] consecutive discards, rather than the
-        /// user cancelling.
-        stopped_no_gain: bool,
     },
     ExecError {
         job: Option<usize>,
@@ -133,6 +131,35 @@ pub enum JobMsg {
         job: Option<usize>,
         msg: String,
     },
+    OptimizeAdded(Vec<PathBuf>),
+    OptimizeScanStarted {
+        n: usize,
+    },
+    OptimizeOne {
+        item: crate::state::OptimizeItem,
+        err: Option<String>,
+    },
+    OptimizeScanDone,
+    OptimizeProgress {
+        job: usize,
+        frac: f64,
+    },
+    OptimizeFileDone {
+        job: usize,
+        detail: String,
+        output_bytes: u64,
+    },
+    OptimizeNoGain {
+        job: usize,
+        detail: String,
+    },
+    OptimizeDone {
+        elapsed_s: f64,
+    },
+    OptimizeError {
+        job: Option<usize>,
+        msg: String,
+    },
     UpdateChecked(Result<Option<shrinkr_core::update::AvailableUpdate>, String>),
     UpdateInstalled(Result<String, String>),
     FfmpegFetchProgress(f64),
@@ -144,8 +171,10 @@ fn send(tx: &UnboundedSender<JobMsg>, msg: JobMsg) {
 }
 
 /// One worker: walk targets, report hits, then probe each.
-/// Keeps scan→probe ordering without UI-thread round-trips.
-pub fn start_scan(tx: UnboundedSender<JobMsg>, targets: Vec<PathBuf>) {
+/// Keeps scan→probe ordering without UI-thread round-trips. `gen` is the
+/// selection's scan token; Clear bumps it and the UI drops everything
+/// this worker reports afterwards.
+pub fn start_scan(tx: UnboundedSender<JobMsg>, targets: Vec<PathBuf>, gen: u64) {
     thread::spawn(move || {
         let mut seen: HashSet<PathBuf> = HashSet::new();
         let mut hits: Vec<PathBuf> = vec![];
@@ -177,7 +206,13 @@ pub fn start_scan(tx: UnboundedSender<JobMsg>, targets: Vec<PathBuf>) {
             }
         }
         hits.sort();
-        send(&tx, JobMsg::ScanDone(hits.clone()));
+        send(
+            &tx,
+            JobMsg::ScanDone {
+                gen,
+                paths: hits.clone(),
+            },
+        );
         // Parallel probe: ffprobe is
         // latency-bound, so a few workers hide it almost linearly.
         // `done` counts completions; arrival order may differ from path order.
@@ -202,6 +237,7 @@ pub fn start_scan(tx: UnboundedSender<JobMsg>, targets: Vec<PathBuf>) {
                     Ok(mf) => send(
                         &tx,
                         JobMsg::ProbeOne {
+                            gen,
                             done: n,
                             total,
                             file: Some(mf),
@@ -211,6 +247,7 @@ pub fn start_scan(tx: UnboundedSender<JobMsg>, targets: Vec<PathBuf>) {
                     Err(e) => send(
                         &tx,
                         JobMsg::ProbeOne {
+                            gen,
                             done: n,
                             total,
                             file: None,
@@ -223,7 +260,7 @@ pub fn start_scan(tx: UnboundedSender<JobMsg>, targets: Vec<PathBuf>) {
         for h in handles {
             let _ = h.join();
         }
-        send(&tx, JobMsg::ProbeDone);
+        send(&tx, JobMsg::ProbeDone { gen });
     });
 }
 
@@ -260,6 +297,13 @@ fn run_one_job(
     extra_args: Vec<String>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<JobOutcome, String> {
+    let params = params.for_media(&f);
+    let keep_subs = keep_subs || params.preserve_quality;
+    let extra_args = if params.preserve_quality {
+        vec![]
+    } else {
+        extra_args
+    };
     match preflight_auto_with(&f, &params, threshold, threshold_policy) {
         Preflight::Skip { reason } => {
             return Ok(JobOutcome::Skipped {
@@ -318,10 +362,11 @@ fn run_one_job(
     // The preflight estimate is only a prediction. Never replace a source
     // with a file that isn't actually smaller — warn mode deliberately
     // queues below-threshold files, and the no-gain guard keeps that safe.
-    // Audio-only passes are the exception: the video is copied untouched
+    // Unprotected audio-only passes are the exception: video is copied untouched
     // and the audio was re-encoded on request, so a larger file is the
     // intended result, not a failed encode.
-    if params.backend != shrinkr_core::pipeline::VideoBackend::CopyVideo
+    if (params.preserve_quality
+        || params.backend != shrinkr_core::pipeline::VideoBackend::CopyVideo)
         && er.output_bytes >= f.bytes
     {
         let _ = std::fs::remove_file(&tmp_out);
@@ -334,13 +379,40 @@ fn run_one_job(
             ),
         });
     }
+    let quality_note = if params.preserve_quality {
+        send(
+            tx,
+            JobMsg::ExecCheckingQuality {
+                job: job_idx,
+                name: fname.clone(),
+            },
+        );
+        match shrinkr_core::quality::verify(&f, &tmp_out, cancel) {
+            Ok(score) => format!(", quality checked (SSIM {score:.4})"),
+            Err(reason) => {
+                let _ = std::fs::remove_file(&tmp_out);
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("cancelled".into());
+                }
+                return Ok(JobOutcome::Skipped {
+                    detail: format!("skip {fname}: quality protection — {reason}; original kept"),
+                });
+            }
+        }
+    } else {
+        String::new()
+    };
+    if cancel.load(Ordering::Relaxed) {
+        let _ = std::fs::remove_file(&tmp_out);
+        return Err("cancelled".into());
+    }
     let scale_note = match er.scaled_to {
         Some((w, h)) => format!(" scale_cuda→{}x{}", w, h),
         None => String::new(),
     };
     let (saved, dest) = place_output(&f.path, &tmp_out, replace, "mkv")?;
     let dest_name = dest.file_name().and_then(|x| x.to_str()).unwrap_or("?");
-    let detail = format!(
+    let mut detail = format!(
         "done {}: {} → {} ({:.0}%) in {:.0}s, {:.0} fps, {:.2}x realtime [{} {}{}, hwdec={}, audio={}, orig={}]",
         fname,
         human_bytes(f.bytes),
@@ -360,6 +432,7 @@ fn run_one_job(
             format!("kept, wrote {dest_name}")
         }
     );
+    detail.push_str(&quality_note);
     Ok(JobOutcome::Placed { saved, detail })
 }
 
@@ -478,7 +551,6 @@ pub fn start_exec(
                     JobMsg::ExecDone {
                         freed: 0,
                         elapsed_s: 0.0,
-                        stopped_no_gain: false,
                     },
                 );
                 return;
@@ -490,8 +562,6 @@ pub fn start_exec(
         let files = Arc::new(files);
         let next = Arc::new(AtomicUsize::new(0));
         let freed = Arc::new(AtomicI64::new(0));
-        let no_gain_streak = Arc::new(AtomicUsize::new(0));
-        let stopped_no_gain = Arc::new(AtomicBool::new(false));
         let extra_args = Arc::new(extra_args);
         let mut handles = Vec::with_capacity(parallel.max(1));
         for _ in 0..parallel.max(1) {
@@ -499,8 +569,6 @@ pub fn start_exec(
             let files = files.clone();
             let next = next.clone();
             let freed = freed.clone();
-            let no_gain_streak = no_gain_streak.clone();
-            let stopped_no_gain = stopped_no_gain.clone();
             let extra_args = extra_args.clone();
             let tmp_root = tmp_root.clone();
             let cancel = cancel.clone();
@@ -556,29 +624,19 @@ pub fn start_exec(
                     &cancel,
                 ) {
                     Ok(JobOutcome::Placed { saved, detail }) => {
-                        no_gain_streak.store(0, Ordering::Relaxed);
                         freed.fetch_add(saved, Ordering::Relaxed);
                         send(&tx, JobMsg::ExecFileDone { job: i, detail });
                     }
                     Ok(JobOutcome::NoGain { detail }) => {
-                        // A library that is already efficiently encoded
-                        // discards *every* file: the first run of that kind
-                        // burned 7 hours to write nothing. Stop shortly
-                        // after the pattern is clear instead of encoding
-                        // the rest for the same outcome.
-                        let streak = no_gain_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                        // No gain applies only to this file. Later files and
+                        // queued batches must still get their own attempt.
                         send(&tx, JobMsg::ExecNoGain { job: i, detail });
-                        if streak >= NO_GAIN_STOP_AFTER {
-                            stopped_no_gain.store(true, Ordering::Relaxed);
-                            cancel.store(true, Ordering::Relaxed);
-                        }
                     }
                     Ok(JobOutcome::Skipped { detail }) => {
                         send(&tx, JobMsg::ExecSkipped { job: i, detail });
                     }
                     Err(e) if e.contains("cancelled") => {
-                        // The run ended under this file (user cancel or the
-                        // repeated-no-gain stop). Not an error, and the
+                        // The user cancelled this file. Not an error, and the
                         // batch summary already explains why.
                         send(&tx, JobMsg::ExecAborted { job: i });
                     }
@@ -613,8 +671,7 @@ pub fn start_exec(
             }
         }
         let elapsed = t0.elapsed().as_secs_f64();
-        let stopped = stopped_no_gain.load(Ordering::Relaxed);
-        if cancel.load(Ordering::Relaxed) && !stopped {
+        if cancel.load(Ordering::Relaxed) {
             send(
                 &tx,
                 JobMsg::ExecError {
@@ -628,7 +685,6 @@ pub fn start_exec(
             JobMsg::ExecDone {
                 freed: freed.load(Ordering::Relaxed),
                 elapsed_s: elapsed,
-                stopped_no_gain: stopped,
             },
         );
     });
@@ -979,6 +1035,291 @@ pub fn start_convert_scan(tx: UnboundedSender<JobMsg>, paths: Vec<PathBuf>) {
     });
 }
 
+/// Walk + classify dropped/picked paths for the Optimize tab. PDFs and
+/// PNG/JPEGs are accepted directly; no probe is needed because neither
+/// optimizer depends on media metadata.
+pub fn start_optimize_scan(tx: UnboundedSender<JobMsg>, paths: Vec<PathBuf>) {
+    use crate::state::{OptimizeItem, OptimizeKind};
+    use shrinkr_core::{optimize, pdf};
+    thread::spawn(move || {
+        send(&tx, JobMsg::OptimizeScanStarted { n: paths.len() });
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut hits: Vec<PathBuf> = vec![];
+        for p in &paths {
+            match std::fs::metadata(p) {
+                Ok(m) if m.is_dir() => {
+                    for hit in pdf::collect_pdf_inputs(p)
+                        .into_iter()
+                        .chain(optimize::collect_optimize_inputs(p))
+                    {
+                        if seen.insert(hit.clone()) {
+                            hits.push(hit);
+                        }
+                    }
+                }
+                Ok(_) => {
+                    if pdf::is_pdf(p) || optimize::is_optimizable_image(p) {
+                        if seen.insert(p.clone()) {
+                            hits.push(p.clone());
+                        }
+                    } else {
+                        send(
+                            &tx,
+                            JobMsg::OptimizeError {
+                                job: None,
+                                msg: format!("skip {}: not a PDF, PNG or JPEG", p.display()),
+                            },
+                        );
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        hits.sort();
+        hits.dedup();
+        send(&tx, JobMsg::OptimizeAdded(hits.clone()));
+        for p in hits {
+            let bytes = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            let kind = if pdf::is_pdf(&p) {
+                OptimizeKind::Pdf
+            } else {
+                OptimizeKind::Image
+            };
+            send(
+                &tx,
+                JobMsg::OptimizeOne {
+                    item: OptimizeItem::new(p, bytes, kind),
+                    err: None,
+                },
+            );
+        }
+        send(&tx, JobMsg::OptimizeScanDone);
+    });
+}
+
+enum OptimizeOutcome {
+    Done { detail: String, output_bytes: u64 },
+    NoGain { detail: String },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_one_optimize(
+    tx: &UnboundedSender<JobMsg>,
+    item: &crate::state::OptimizeItem,
+    job_idx: usize,
+    replace: bool,
+    pdf_preset: shrinkr_core::pdf::PdfPreset,
+    level: shrinkr_core::optimize::OptimizeLevel,
+    tmp_root: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> Result<OptimizeOutcome, String> {
+    use crate::state::OptimizeKind;
+    use shrinkr_core::{optimize, pdf};
+    let ext = pdf::ext_of(&item.path);
+    let name = item.name();
+    let tmp = tmp_root.join(format!("opt-{job_idx}.{ext}"));
+    send(
+        tx,
+        JobMsg::OptimizeProgress {
+            job: job_idx,
+            frac: 0.05,
+        },
+    );
+    shrinkr_core::ffmpeg::ensure_output_dir(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+    let (note, output_bytes) = match item.kind {
+        OptimizeKind::Pdf => match pdf::compress_pdf(&item.path, pdf_preset, &tmp, cancel)? {
+            pdf::PdfOutcome::Done(r) => {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err("cancelled".into());
+                }
+                (
+                    format!(
+                        "pdf {}: {} page(s), {}/{} image(s) re-encoded ({} downscaled), {} stream(s), {:.0}% smaller, {:.1}s",
+                        r.preset.label().to_lowercase(),
+                        r.pages,
+                        r.images_recompressed,
+                        r.images,
+                        r.images_downscaled,
+                        r.streams_recompressed,
+                        (1.0 - r.ratio) * 100.0,
+                        r.elapsed_s
+                    ),
+                    r.output_bytes,
+                )
+            }
+            pdf::PdfOutcome::NoGain { output_bytes } => {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(OptimizeOutcome::NoGain {
+                    detail: format!(
+                        "skip {name}: no gain - {} vs {}; original kept",
+                        human_bytes(output_bytes),
+                        human_bytes(item.bytes)
+                    ),
+                });
+            }
+        },
+        OptimizeKind::Image => match optimize::optimize_image(&item.path, &tmp, level, cancel)? {
+            optimize::OptimizeOutcome::Done(r) => {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err("cancelled".into());
+                }
+                (
+                    format!(
+                        "{} {}: {:.0}% smaller, {:.1}s",
+                        r.method,
+                        r.note,
+                        (1.0 - r.ratio) * 100.0,
+                        r.elapsed_s
+                    ),
+                    r.output_bytes,
+                )
+            }
+            optimize::OptimizeOutcome::NoGain { output_bytes } => {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(OptimizeOutcome::NoGain {
+                    detail: format!(
+                        "skip {name}: no gain - {} vs {}; original kept",
+                        human_bytes(output_bytes),
+                        human_bytes(item.bytes)
+                    ),
+                });
+            }
+        },
+    };
+    // Verified output is in the temp file; place it beside the source
+    // (or over it when replacement was requested).
+    let (_delta, dest) = place_output(&item.path, &tmp, replace, &ext)?;
+    let _ = std::fs::remove_file(&tmp);
+    let dest_name = dest.file_name().and_then(|x| x.to_str()).unwrap_or("?");
+    let detail = format!(
+        "done {name}: {} -> {} ({}), wrote {dest_name} [{note}]",
+        human_bytes(item.bytes),
+        human_bytes(output_bytes),
+        if replace { "replaced" } else { "kept" }
+    );
+    Ok(OptimizeOutcome::Done {
+        detail,
+        output_bytes,
+    })
+}
+
+/// Run the Optimize queue with two workers (PDF imaging and PNG DEFLATE
+/// searches are CPU-bound; two covers the common case without starving
+/// the UI thread's own work).
+pub fn start_optimize_exec(
+    tx: UnboundedSender<JobMsg>,
+    files: Vec<crate::state::OptimizeItem>,
+    indices: Vec<usize>,
+    replace: bool,
+    pdf_preset: shrinkr_core::pdf::PdfPreset,
+    level: shrinkr_core::optimize::OptimizeLevel,
+    cancel: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let t0 = Instant::now();
+        let tmp_root = match shrinkr_core::ffmpeg::work_root() {
+            Ok(d) => d.join("optimize"),
+            Err(e) => {
+                send(
+                    &tx,
+                    JobMsg::OptimizeError {
+                        job: None,
+                        msg: format!("work folder unusable: {e}"),
+                    },
+                );
+                send(
+                    &tx,
+                    JobMsg::OptimizeDone {
+                        elapsed_s: t0.elapsed().as_secs_f64(),
+                    },
+                );
+                return;
+            }
+        };
+        let parallel = 2usize.min(indices.len().max(1));
+        let files = Arc::new(files);
+        let queue = Arc::new(indices);
+        let next = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(parallel);
+        for _ in 0..parallel {
+            let tx = tx.clone();
+            let files = files.clone();
+            let queue = queue.clone();
+            let next = next.clone();
+            let cancel = cancel.clone();
+            let tmp_root = tmp_root.clone();
+            handles.push(thread::spawn(move || loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k >= queue.len() {
+                    break;
+                }
+                let i = queue[k];
+                if cancel.load(Ordering::Relaxed) {
+                    continue;
+                }
+                match run_one_optimize(
+                    &tx, &files[i], i, replace, pdf_preset, level, &tmp_root, &cancel,
+                ) {
+                    Ok(OptimizeOutcome::Done {
+                        detail,
+                        output_bytes,
+                    }) => send(
+                        &tx,
+                        JobMsg::OptimizeFileDone {
+                            job: i,
+                            detail,
+                            output_bytes,
+                        },
+                    ),
+                    Ok(OptimizeOutcome::NoGain { detail }) => {
+                        send(&tx, JobMsg::OptimizeNoGain { job: i, detail })
+                    }
+                    Err(e) => send(
+                        &tx,
+                        JobMsg::OptimizeError {
+                            job: Some(i),
+                            msg: if e == "cancelled" {
+                                format!("{}: cancelled", files[i].name())
+                            } else {
+                                format!("{}: {e}", files[i].name())
+                            },
+                        },
+                    ),
+                }
+            }));
+        }
+        for h in handles {
+            if h.join().is_err() {
+                send(
+                    &tx,
+                    JobMsg::OptimizeError {
+                        job: None,
+                        msg: "worker panic".into(),
+                    },
+                );
+            }
+        }
+        if cancel.load(Ordering::Relaxed) {
+            send(
+                &tx,
+                JobMsg::OptimizeError {
+                    job: None,
+                    msg: "Cancelled.".into(),
+                },
+            );
+        }
+        send(
+            &tx,
+            JobMsg::OptimizeDone {
+                elapsed_s: t0.elapsed().as_secs_f64(),
+            },
+        );
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_one_convert(
     tx: &UnboundedSender<JobMsg>,
@@ -1018,6 +1359,10 @@ fn run_one_convert(
             },
             cancel,
         )?;
+        if cancel.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&tmp_out);
+            return Err("cancelled".into());
+        }
         let (saved, dest) =
             place_converted_output(&item.path, &tmp_out, &item.target_ext, replace)?;
         let _ = std::fs::remove_file(&tmp_out);
@@ -1049,6 +1394,10 @@ fn run_one_convert(
         cancel,
     );
     let er = r?;
+    if cancel.load(Ordering::Relaxed) {
+        let _ = std::fs::remove_file(&tmp_out);
+        return Err("cancelled".into());
+    }
     let (saved, dest) = place_converted_output(&item.path, &tmp_out, &item.target_ext, replace)?;
     let _ = std::fs::remove_file(&tmp_out);
     let mode = if shrinkr_core::convert::is_audio_extract(item.kind, &item.target_ext) {
@@ -1150,6 +1499,23 @@ pub fn start_convert_exec(
     });
 }
 
+/// Scan whatever was added to `targets` when the scanner is idle. Adding
+/// files is the only scan gesture now — idle or mid-run — so targets that
+/// arrive while another scan runs wait here and drain when it finishes.
+/// Scans append to the library; Clear removes the selection.
+fn start_pending_scan(s: &mut AppState) {
+    if s.scanning || s.probing || s.targets.is_empty() {
+        return;
+    }
+    let Some(tx) = s.job_tx.clone() else {
+        return;
+    };
+    let targets = std::mem::take(&mut s.targets);
+    s.scanning = true;
+    s.push_log(format!("Scanning {} selected item(s) …", targets.len()));
+    start_scan(tx, targets, s.scan_gen);
+}
+
 /// Apply one job message to UI state. Runs on the UI thread (coroutine).
 pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
     let mut s = state.write();
@@ -1160,24 +1526,19 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                     s.targets.push(p);
                 }
             }
-            // Never wipe the library mid-run: it backs the plan lists and
-            // the pending queue holds its own clones.
-            if !s.executing {
-                s.files.clear();
-            } else if !s.scanning && !s.probing {
-                // Mid-run pick: those files are meant for the queue, so
-                // scan them right away — no manual Scan press needed.
-                // Probed files land in `staged`; "Add to queue" remains
-                // the explicit commit gate.
-                let targets = std::mem::take(&mut s.targets);
-                s.scanning = true;
-                s.push_log(format!("Scanning {} picked item(s) …", targets.len()));
-                if let Some(tx) = s.job_tx.clone() {
-                    start_scan(tx, targets);
-                }
-            }
+            // Adding is the scan gesture now: start immediately when the
+            // scanner is idle. Additions append to the selection (Clear
+            // removes it), so successive picks build one batch — and a
+            // mid-run pick probes into `staged`, where the explicit
+            // "Add to queue" click commits it with the current settings.
+            start_pending_scan(&mut s);
         }
-        JobMsg::ScanDone(paths) => {
+        JobMsg::ScanDone { gen, paths } => {
+            // A Clear since this scan started: its results belong to a
+            // selection the user already dismissed.
+            if gen != s.scan_gen {
+                return;
+            }
             s.scanning = false;
             if paths.is_empty() {
                 s.push_log("No media files found.".into());
@@ -1192,16 +1553,20 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             }
         }
         JobMsg::ProbeOne {
+            gen,
             done,
             total,
             file,
             err,
         } => {
+            if gen != s.scan_gen {
+                return;
+            }
             s.probe_done = done;
             s.probe_total = total;
             if let Some(f) = file {
-                // Same targets re-scanned mid-run would otherwise duplicate
-                // the library and re-queue finished files.
+                // Same targets re-scanned would otherwise duplicate the
+                // library and re-queue finished files.
                 if !s.files.iter().any(|x| x.path == f.path) {
                     s.files.push(f.clone());
                     // Probed while a batch runs: stage it — the file is
@@ -1229,47 +1594,43 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 s.push_log(format!("probe warn: {}", e));
             }
         }
-        JobMsg::ProbeDone => {
+        JobMsg::ProbeDone { gen } => {
+            if gen != s.scan_gen {
+                return;
+            }
             s.probing = false;
             if s.executing {
                 let staged = s.staged.len();
                 s.push_log(format!(
                     "Scan finished — {staged} new file(s) staged. Press Add to queue to run them with the picked settings."
                 ));
-                // A second pick can wait in targets while this scan ran:
-                // chain straight into it so the staging flow keeps up.
-                if !s.targets.is_empty() && !s.scanning {
-                    let targets = std::mem::take(&mut s.targets);
-                    s.scanning = true;
-                    s.push_log(format!("Scanning {} picked item(s) …", targets.len()));
-                    if let Some(tx) = s.job_tx.clone() {
-                        start_scan(tx, targets);
-                    }
-                }
-                return;
-            }
-            let n_files = s.files.len();
-            let total = s.total_bytes();
-            let t = s.threshold();
-            let (_, warned, skipped) = s.plan_counts();
-            if s.skip_efficient {
-                s.push_log(format!(
-                    "Probed {} files, {} total ({} would skip at {:.0}% threshold).",
-                    n_files,
-                    human_bytes(total),
-                    skipped,
-                    t
-                ));
             } else {
-                s.push_log(format!(
-                    "Probed {} files, {} total ({} below {:.0}% will warn, {} skip).",
-                    n_files,
-                    human_bytes(total),
-                    warned,
-                    t,
-                    skipped
-                ));
+                let n_files = s.files.len();
+                let total = s.total_bytes();
+                let t = s.threshold();
+                let (_, warned, skipped) = s.plan_counts();
+                if s.skip_efficient {
+                    s.push_log(format!(
+                        "Probed {} files, {} total ({} would skip at {:.0}% threshold).",
+                        n_files,
+                        human_bytes(total),
+                        skipped,
+                        t
+                    ));
+                } else {
+                    s.push_log(format!(
+                        "Probed {} files, {} total ({} below {:.0}% will warn, {} skip).",
+                        n_files,
+                        human_bytes(total),
+                        warned,
+                        t,
+                        skipped
+                    ));
+                }
             }
+            // A second pick can wait in targets while this scan ran, idle
+            // or mid-run: chain straight into it so auto-scan keeps up.
+            start_pending_scan(&mut s);
         }
         JobMsg::ExecWarn { msg } => s.push_log(msg),
         JobMsg::ExecProgress { job, frac, fps } => {
@@ -1301,6 +1662,13 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                     }
                 }
             }
+        }
+        JobMsg::ExecCheckingQuality { job, name } => {
+            if let Some(item) = s.exec_items.get_mut(job) {
+                item.checking_quality = true;
+                item.fps = 0.0;
+            }
+            s.push_log(format!("Checking picture and audio quality for {name}…"));
         }
         JobMsg::ExecFileDone { job, detail } => {
             if let Some(item) = s.exec_items.get_mut(job) {
@@ -1346,17 +1714,12 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             }
             s.push_log(detail);
         }
-        JobMsg::ExecDone {
-            freed,
-            elapsed_s,
-            stopped_no_gain,
-        } => {
+        JobMsg::ExecDone { freed, elapsed_s } => {
             // Never leave a stale pause behind: the button disappears with
             // the run, and the next batch must start unpaused.
             shrinkr_core::pause::reset();
             s.paused = false;
-            let cancelled =
-                stopped_no_gain || s.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+            let cancelled = s.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
             if cancelled {
                 // Pending files stay in the library, unrun.
                 let n = s.pending_len();
@@ -1367,50 +1730,21 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 // The run's skip set dies with it; the next Process starts
                 // with a fresh queue decision.
                 s.exec_skips = None;
-                if stopped_no_gain {
-                    let discarded = s.exec_discarded;
-                    s.exec_discarded = 0;
-                    // Only mention the queue when there is one.
-                    let queued = if n == 0 {
-                        String::new()
-                    } else {
-                        format!(" {n} queued file(s) kept in the library for later.")
-                    };
-                    // An explicit audio target often means the user wanted
-                    // audio work, not a video shrink — route them to the
-                    // mode where the target is an instruction and nothing
-                    // is ever discarded for being larger.
-                    let audio_hint = if s
-                        .exec_cfg
-                        .as_ref()
-                        .map(|c| c.params.opus_bps.is_some())
-                        .unwrap_or(s.opus_bps.is_some())
-                    {
-                        " To re-encode the audio to that Opus target without touching the video, run with the 'Copy video (audio-only)' backend — audio-only passes always run and are never discarded for being larger."
-                    } else {
-                        ""
-                    };
-                    s.push_log(format!(
-                        "Stopped after {:.0}s: {} file(s) in a row were encoded and then discarded because each result was larger than its source. This library is already efficiently encoded — nothing here can shrink at these settings. Leave 'Skip already-efficient files' checked (or lower the quality target) before running it again.{queued}{audio_hint}",
-                        elapsed_s, discarded
-                    ));
+                let queued = if n == 0 {
+                    String::new()
                 } else {
-                    let queued = if n == 0 {
-                        String::new()
-                    } else {
-                        format!(" {n} queued file(s) kept in the library, not run.")
-                    };
-                    let staged_note = if staged == 0 {
-                        String::new()
-                    } else {
-                        format!(" {staged} scanned file(s) stayed in the library — not queued.")
-                    };
-                    s.push_log(format!(
-                        "Cancelled after {:.0}s. Freed {}.{queued}{staged_note}",
-                        elapsed_s,
-                        human_bytes(freed.max(0) as u64)
-                    ));
-                }
+                    format!(" {n} queued file(s) kept in the library, not run.")
+                };
+                let staged_note = if staged == 0 {
+                    String::new()
+                } else {
+                    format!(" {staged} scanned file(s) stayed in the library — not queued.")
+                };
+                s.push_log(format!(
+                    "Cancelled after {:.0}s. Freed {}.{queued}{staged_note}",
+                    elapsed_s,
+                    human_bytes(freed.max(0) as u64)
+                ));
                 return;
             }
             if !s.pending.is_empty() {
@@ -1444,7 +1778,11 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                         return;
                     };
                     // Failure bookkeeping continues off this snapshot; the
-                    // chained leg appends onto the run's failed list.
+                    // chained leg appends onto the run's failed list. The
+                    // settings snapshot follows the leg now running, so the
+                    // live queue ETA uses this leg's encoder and worker
+                    // count (mid-run Queue also snapshots from here).
+                    s.exec_cfg = Some(seg.cfg.clone());
                     s.exec_files = seg.files.clone();
                     s.exec_items = seg
                         .files
@@ -1656,6 +1994,88 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             }
             s.push_log(format!("warn: {}", msg));
         }
+        JobMsg::OptimizeScanStarted { n } => {
+            s.optimize_scanning = true;
+            if n > 0 {
+                s.push_log(format!("Collecting {n} item(s) to optimize."));
+            }
+        }
+        JobMsg::OptimizeAdded(paths) => {
+            if paths.is_empty() && !s.optimize_scanning {
+                s.push_log("No PDFs or PNG/JPEG images found.".into());
+            } else if !paths.is_empty() {
+                s.push_log(format!("Found {} file(s) to optimize.", paths.len()));
+            }
+        }
+        JobMsg::OptimizeOne { item, err } => {
+            if let Some(e) = err {
+                s.push_log(format!("warn: {}: {}", item.name(), e));
+            } else if !s.optimize_files.iter().any(|x| x.path == item.path) {
+                s.optimize_files.push(item);
+            }
+        }
+        JobMsg::OptimizeScanDone => {
+            s.optimize_scanning = false;
+            let ready = s.optimize_files.iter().filter(|f| f.runnable()).count();
+            s.push_log(format!("Optimize ready: {ready} file(s)."));
+        }
+        JobMsg::OptimizeProgress { job, frac } => {
+            if let Some(item) = s.optimize_files.get_mut(job) {
+                item.frac = frac.clamp(0.0, 1.0).max(item.frac);
+            }
+        }
+        JobMsg::OptimizeFileDone {
+            job,
+            detail,
+            output_bytes,
+        } => {
+            if let Some(item) = s.optimize_files.get_mut(job) {
+                item.done = true;
+                item.frac = 1.0;
+                item.output_bytes = output_bytes;
+                item.no_gain = false;
+            }
+            s.optimize_done += 1;
+            s.push_log(detail);
+        }
+        JobMsg::OptimizeNoGain { job, detail } => {
+            if let Some(item) = s.optimize_files.get_mut(job) {
+                item.done = true;
+                item.frac = 1.0;
+                item.no_gain = true;
+            }
+            s.optimize_done += 1;
+            s.push_log(detail);
+        }
+        JobMsg::OptimizeDone { elapsed_s } => {
+            let cancelled = s
+                .optimize_cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed));
+            s.optimize_executing = false;
+            if cancelled {
+                s.push_log(format!("Optimize cancelled after {:.0}s.", elapsed_s));
+            } else {
+                let done = s.optimize_files.iter().filter(|f| f.done).count();
+                let failed = s.optimize_files.iter().filter(|f| f.failed).count();
+                let summary = if failed == 0 {
+                    format!("done: {done} file(s) optimized in {elapsed_s:.0}s.")
+                } else {
+                    format!("done: {done} optimized, {failed} failed in {elapsed_s:.0}s.")
+                };
+                s.push_log(summary);
+            }
+        }
+        JobMsg::OptimizeError { job, msg } => {
+            if let Some(job) = job {
+                if let Some(item) = s.optimize_files.get_mut(job) {
+                    item.failed = true;
+                    item.frac = 1.0;
+                }
+                s.optimize_done += 1;
+            }
+            s.push_log(format!("warn: {msg}"));
+        }
         JobMsg::BenchDone {
             rows,
             recommendation,
@@ -1732,5 +2152,88 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires FFmpeg; encodes a mixed batch"]
+    fn no_gain_files_do_not_cancel_later_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let unique = dir.path().file_name().unwrap().to_string_lossy();
+        let source = dir.path().join(format!("batch-regression-{unique}.mkv"));
+        let output = shrinkr_core::process::cmd("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x360:rate=24:duration=4",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let media = probe_file(&source).unwrap();
+        // Force the real post-encode no-gain branch without depending on the
+        // relative efficiency of a particular FFmpeg build. The final file
+        // retains its real byte count and can actually shrink.
+        let mut no_gain = media.clone();
+        no_gain.bytes = 1;
+        let mut files = vec![no_gain; 11];
+        files.push(media);
+        let mut params = crate::state::AppState::default().est_params();
+        params.preserve_quality = false;
+        params.backend = shrinkr_core::pipeline::VideoBackend::CpuX264;
+        params.cq = 18;
+        params.opus_bps = None;
+        params.film_grain = false;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = futures_channel::mpsc::unbounded();
+        start_exec(
+            tx,
+            files,
+            params,
+            false,
+            1,
+            false,
+            0.0,
+            ThresholdPolicy::Warn,
+            vec![],
+            cancel.clone(),
+            Arc::new(Mutex::new(HashSet::new())),
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let mut discarded = 0;
+        let mut completed = vec![];
+        let mut errors = vec![];
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "batch did not finish: {errors:?}"
+            );
+            match rx.try_recv() {
+                Ok(JobMsg::ExecNoGain { .. }) => discarded += 1,
+                Ok(JobMsg::ExecFileDone { job, .. }) => completed.push(job),
+                Ok(JobMsg::ExecError { msg, .. }) => errors.push(msg),
+                Ok(JobMsg::ExecDone { .. }) => break,
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(discarded, 11);
+        assert_eq!(completed, [11]);
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(source.exists());
     }
 }

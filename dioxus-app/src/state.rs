@@ -102,10 +102,10 @@ impl Goal {
         backend == b && preset == p && cq == c
     }
 
-    /// [`Goal::matches`] for a Lossless batch: the quality value is pinned
+    /// [`Goal::matches`] for a Preserve quality batch: the quality value is pinned
     /// by the checkbox, so segments match on encoder + preset alone and the
     /// axis keeps working as the speed↔size control it is there.
-    pub fn matches_lossless(
+    pub fn matches_preserve_quality(
         &self,
         backend: VideoBackend,
         preset: NvencPreset,
@@ -116,14 +116,11 @@ impl Goal {
     }
 }
 
-/// Quality value the video encodes at while the Lossless box is checked:
-/// the visually-lossless end of the shared slider. CRF/CQ 18 is the range
-/// where the encode is indistinguishable from the source; below it, files
-/// mostly grow with nothing visible to show for it.
-pub const LOSSLESS_CQ: u32 = 18;
+/// Conservative starting quality; measured verification decides what is kept.
+pub const PRESERVE_QUALITY_CQ: u32 = shrinkr_core::quality::VIDEO_CQ;
 
 /// Measured-fps table for wall-time estimates. Shared by the batch
-/// estimate and the per-goal segment estimates.
+/// estimate, the per-goal segment estimates and the live queue ETA.
 fn backend_fps(backend: VideoBackend) -> f64 {
     match backend {
         VideoBackend::CpuX264 => 90.0,
@@ -133,6 +130,42 @@ fn backend_fps(backend: VideoBackend) -> f64 {
         // the other families' HEVC is NVENC-class on their own machines.
         VideoBackend::Av1Nvenc | VideoBackend::QsvAv1 | VideoBackend::AmfAv1 => 500.0,
         _ => 600.0,
+    }
+}
+
+/// Encoder work for one still image. Stills encode in well under a
+/// second; the frames-per-second table doesn't apply to a single frame.
+/// Shared by the plan estimate and the live queue ETA.
+const IMAGE_WORK_SECS: f64 = 0.35;
+
+/// Encoder seconds one file costs under `backend`, before dividing by
+/// the worker count: videos use the shared fps table, stills the flat
+/// per-image cost.
+fn file_work_secs(f: &MediaFile, backend: VideoBackend) -> f64 {
+    if shrinkr_core::images::is_shrinkable_image(&f.path) {
+        IMAGE_WORK_SECS
+    } else {
+        f.total_frames() / backend_fps(backend)
+    }
+}
+
+/// Estimated `(source_bytes, output_bytes)` for one file under `params`.
+/// Exactly the model behind the plan's `50 GB → 38 GB` headline — video
+/// through [`estimate_file`], stills through the image estimator — so the
+/// run panel's live queue numbers stay consistent with the plan.
+fn file_size_estimate(f: &MediaFile, p: &EstParams) -> (u64, u64) {
+    if shrinkr_core::images::is_shrinkable_image(&f.path) {
+        (
+            f.bytes,
+            shrinkr_core::images::estimate_image_bytes(
+                f,
+                p.image_cq,
+                p.image_scale,
+                p.image_preserve_format,
+            ),
+        )
+    } else {
+        (f.bytes, estimate_file(f, p).new_bytes)
     }
 }
 
@@ -155,7 +188,7 @@ pub struct GoalEstimate {
     /// segment line.
     pub warned: usize,
     /// Warn sizes, so tests can still compare a capped run's estimates
-    /// against a released one (Lossless pins CQ away).
+    /// against a released one (Preserve quality pins CQ away).
     pub warned_total_b: u64,
     pub warned_new_b: u64,
 }
@@ -238,6 +271,7 @@ pub struct ExecItem {
     pub res: String,
     pub frac: f64,
     pub fps: f64,
+    pub checking_quality: bool,
     pub done: bool,
     pub failed: bool,
     /// Deleted from the queue before its turn: the row is hidden from
@@ -255,6 +289,7 @@ impl ExecItem {
             res,
             frac: 0.0,
             fps: 0.0,
+            checking_quality: false,
             done: false,
             failed: false,
             removed: false,
@@ -266,6 +301,8 @@ impl ExecItem {
             "failed".to_string()
         } else if self.done {
             "done".to_string()
+        } else if self.checking_quality {
+            "checking quality".to_string()
         } else if self.frac > 0.0 {
             format!("{:.0}%", self.frac * 100.0)
         } else {
@@ -298,13 +335,14 @@ pub struct AppState {
     pub probing: bool,
     pub probe_done: usize,
     pub probe_total: usize,
-    /// Checked by default: keeps perceived audio/video quality intact by
-    /// pinning quality to the visually-lossless end of the slider
-    /// ([`LOSSLESS_CQ`]), resolution to Preserve, and audio to Off (stream
-    /// copy, never re-encoded). Backend and preset stay user-controlled —
-    /// they trade speed for size, not quality. The raw knobs keep their
-    /// values, so unchecking restores the user's settings exactly.
-    pub lossless: bool,
+    /// Monotonic token stamped onto every scan/probe job message. Clear
+    /// bumps it so results from a scan that was already walking the disk
+    /// land nowhere — the selection stays cleared instead of refilling.
+    pub scan_gen: u64,
+    /// Checked by default: conservative video quality, no synthetic grain,
+    /// all audio/subtitle tracks kept, audio bitrate reduction capped at 10%.
+    /// Resolution stays user-controlled. Only smaller, verified results land.
+    pub preserve_quality: bool,
     pub backend: VideoBackend,
     /// Backend to restore when Audio-only is switched off (checked state
     /// is derived from `backend == CopyVideo`).
@@ -397,6 +435,15 @@ pub struct AppState {
     pub convert_replace: bool,
     pub convert_cancel: Option<Arc<AtomicBool>>,
     pub convert_done: usize,
+    // ── Optimize tab ──
+    pub optimize_files: Vec<OptimizeItem>,
+    pub optimize_scanning: bool,
+    pub optimize_executing: bool,
+    pub optimize_replace: bool,
+    pub optimize_cancel: Option<Arc<AtomicBool>>,
+    pub optimize_done: usize,
+    pub optimize_pdf_preset: shrinkr_core::pdf::PdfPreset,
+    pub optimize_image_level: shrinkr_core::optimize::OptimizeLevel,
     // ── Self-update (GitHub Releases) ──
     pub update_checking: bool,
     pub update_available: Option<shrinkr_core::update::AvailableUpdate>,
@@ -519,6 +566,80 @@ impl ConvertItem {
     }
 }
 
+/// One file in the Optimize tab: a PDF or a losslessly optimizable image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptimizeKind {
+    Pdf,
+    Image,
+}
+
+#[derive(Clone, Debug)]
+pub struct OptimizeItem {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub kind: OptimizeKind,
+    pub frac: f64,
+    pub done: bool,
+    pub failed: bool,
+    /// Finished with no size win; original kept.
+    pub no_gain: bool,
+    /// Placed output size (0 until a file finishes with a gain).
+    pub output_bytes: u64,
+}
+
+impl OptimizeItem {
+    pub fn new(path: PathBuf, bytes: u64, kind: OptimizeKind) -> Self {
+        Self {
+            path,
+            bytes,
+            kind,
+            frac: 0.0,
+            done: false,
+            failed: false,
+            no_gain: false,
+            output_bytes: 0,
+        }
+    }
+
+    pub fn name(&self) -> String {
+        self.path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string()
+    }
+
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind {
+            OptimizeKind::Pdf => "PDF",
+            OptimizeKind::Image => match shrinkr_core::optimize::ext_of(&self.path).as_str() {
+                "png" => "PNG",
+                _ => "JPEG",
+            },
+        }
+    }
+
+    pub fn runnable(&self) -> bool {
+        !self.done && !self.failed
+    }
+
+    pub fn status_text(&self) -> String {
+        if self.failed {
+            "failed".to_string()
+        } else if self.done {
+            if self.no_gain {
+                "no gain".to_string()
+            } else {
+                "done".to_string()
+            }
+        } else if self.frac > 0.0 {
+            "working".to_string()
+        } else {
+            "queued".to_string()
+        }
+    }
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
@@ -529,7 +650,8 @@ impl Default for AppState {
             probing: false,
             probe_done: 0,
             probe_total: 0,
-            lossless: true,
+            scan_gen: 0,
+            preserve_quality: true,
             backend: VideoBackend::Auto,
             last_video_backend: VideoBackend::Auto,
             nvenc_preset: NvencPreset::P5,
@@ -562,7 +684,9 @@ impl Default for AppState {
             staged: vec![],
             exec_cfg: None,
             job_tx: None,
-            log: vec![LogEntry::new("Add folders and/or files, then Scan.".into())],
+            log: vec![LogEntry::new(
+                "Add folders and/or files — they scan automatically.".into(),
+            )],
             log_filter: LevelFilter::all(),
             bench_running: false,
             bench_rows: vec![],
@@ -577,6 +701,14 @@ impl Default for AppState {
             convert_replace: false,
             convert_cancel: None,
             convert_done: 0,
+            optimize_files: vec![],
+            optimize_scanning: false,
+            optimize_executing: false,
+            optimize_replace: false,
+            optimize_cancel: None,
+            optimize_done: 0,
+            optimize_pdf_preset: shrinkr_core::pdf::PdfPreset::Balanced,
+            optimize_image_level: shrinkr_core::optimize::OptimizeLevel::Balanced,
             update_checking: false,
             update_available: None,
             update_installing: false,
@@ -633,24 +765,42 @@ impl AppState {
         counts
     }
 
-    /// Settings that keep perceived quality intact, applied on top of the
-    /// raw knobs while Lossless is checked. Only the three knobs that can
-    /// visibly degrade the result are pinned: quality value, resolution
-    /// and audio (re-encoding audio to Opus is the loudest quality loss a
-    /// default batch could inflict).
-    fn apply_lossless(&self, p: &mut EstParams) {
-        if !self.lossless {
-            return;
-        }
-        p.cq = LOSSLESS_CQ;
-        p.scale = ScalePolicy::Preserve;
-        p.opus_bps = None;
+    /// Clear the library selection: every added file leaves the view, and
+    /// any scan still walking the disk is invalidated so its results do
+    /// not refill the cleared list. The running batch and its waiting
+    /// queue are independent snapshots — Clear governs only what this
+    /// selection would add next, so they keep going. Settings are not
+    /// touched. Returns how many probed files were dropped.
+    pub fn clear_selection(&mut self) -> usize {
+        let dropped = self.files.len();
+        self.scan_gen = self.scan_gen.wrapping_add(1);
+        self.targets.clear();
+        self.files.clear();
+        self.staged.clear();
+        self.bench_rows.clear();
+        self.bench_note.clear();
+        self.scanning = false;
+        self.probing = false;
+        self.probe_done = 0;
+        self.probe_total = 0;
+        dropped
     }
 
-    /// The CQ/CRF the video actually encodes at (Lossless pins it).
+    /// Quality protection leaves resolution and the requested audio target
+    /// editable. The target is checked per file by EstParams::for_media.
+    fn apply_preserve_quality(&self, p: &mut EstParams) {
+        if !self.preserve_quality {
+            return;
+        }
+        p.cq = PRESERVE_QUALITY_CQ;
+        p.all_audio = true;
+        p.film_grain = false;
+    }
+
+    /// The CQ/CRF the video actually encodes at (Preserve quality pins it).
     pub fn effective_cq(&self) -> u32 {
-        if self.lossless {
-            LOSSLESS_CQ
+        if self.preserve_quality {
+            PRESERVE_QUALITY_CQ
         } else {
             self.cq
         }
@@ -658,24 +808,29 @@ impl AppState {
 
     /// The resolution policy the video actually runs with.
     pub fn effective_scale(&self) -> ScalePolicy {
-        if self.lossless {
-            ScalePolicy::Preserve
-        } else {
-            self.scale
-        }
+        self.scale
     }
 
     /// The audio target the video actually runs with (`None` = Off).
     pub fn effective_opus(&self) -> Option<u32> {
-        if self.lossless {
-            None
+        self.opus_bps
+    }
+
+    pub fn effective_keep_subs(&self) -> bool {
+        self.preserve_quality || self.keep_subs
+    }
+
+    pub fn effective_extra_args(&self) -> &str {
+        if self.preserve_quality {
+            ""
         } else {
-            self.opus_bps
+            &self.extra_args
         }
     }
 
     pub fn est_params(&self) -> EstParams {
         let mut p = EstParams {
+            preserve_quality: self.preserve_quality,
             backend: self.backend,
             preset: self.nvenc_preset,
             cq: self.cq,
@@ -687,7 +842,7 @@ impl AppState {
             image_preserve_format: self.image_preserve_format,
             film_grain: self.film_grain,
         };
-        self.apply_lossless(&mut p);
+        self.apply_preserve_quality(&mut p);
         p
     }
 
@@ -775,12 +930,7 @@ impl AppState {
         for &i in &idx {
             let f = &self.files[i];
             if shrinkr_core::images::is_shrinkable_image(&f.path) {
-                new_b += shrinkr_core::images::estimate_image_bytes(
-                    f,
-                    p.image_cq,
-                    p.image_scale,
-                    p.image_preserve_format,
-                );
+                new_b += file_size_estimate(f, &p).1;
                 image_count += 1;
             } else {
                 new_b += estimate_file(f, &p).new_bytes;
@@ -791,7 +941,7 @@ impl AppState {
         let saved = new_b as i64 - total_b as i64;
         let fps = backend_fps(self.backend);
         let video_secs = total_frames / fps / (self.parallel.max(1) as f64);
-        let image_secs = image_count as f64 * 0.35 / (self.parallel.max(1) as f64);
+        let image_secs = image_count as f64 * IMAGE_WORK_SECS / (self.parallel.max(1) as f64);
         (total_b, new_b, saved, video_secs + image_secs)
     }
 
@@ -799,7 +949,7 @@ impl AppState {
     /// quality substituted into the current settings, everything else
     /// (resolution, audio, images) as configured. These numbers are what
     /// the Goal segments display, so the speed↔size trade-off is stated
-    /// in the batch's own bytes and minutes. Under Lossless the goal's CQ
+    /// in the batch's own bytes and minutes. Under Preserve quality the goal's CQ
     /// is overridden right back — all three segments share the pinned
     /// quality and differ only in encoder speed and efficiency.
     ///
@@ -814,7 +964,7 @@ impl AppState {
         p.backend = backend;
         p.preset = preset;
         p.cq = cq;
-        self.apply_lossless(&mut p);
+        self.apply_preserve_quality(&mut p);
         let t = self.threshold();
         let policy = self.threshold_policy();
         let mut est = GoalEstimate::default();
@@ -907,6 +1057,114 @@ impl AppState {
         }
     }
 
+    /// Estimated wall seconds left before the whole queue drains: the
+    /// running batch's unfinished work plus every file waiting in
+    /// `pending`, with each segment costed under the settings it will run
+    /// with. Recomputed on every render, so a mid-run Queue / Add to
+    /// queue click raises it immediately and progress lowers the current
+    /// batch's share. Rows already done, failed, removed or skipped
+    /// contribute nothing. `None` when no batch is running.
+    pub fn queue_remaining_secs(&self) -> Option<f64> {
+        if !self.executing {
+            return None;
+        }
+        let cfg = self.exec_cfg.as_ref();
+        let backend = cfg.map(|c| c.params.backend).unwrap_or(self.backend);
+        let parallel = cfg.map(|c| c.parallel).unwrap_or(self.parallel).max(1) as f64;
+        // Skip/delete decisions beat the queue: a skipped row stays
+        // visible (it proves the choice), but it will not encode, so it
+        // must not inflate the time left.
+        let skips = self.exec_skips.as_ref().and_then(|m| m.lock().ok());
+        let skipped = |p: &std::path::Path| skips.as_ref().is_some_and(|g| g.contains(p));
+        let mut work = 0.0;
+        let mut longest = 0.0f64;
+        for (i, item) in self.exec_items.iter().enumerate() {
+            if item.done || item.failed || item.removed || skipped(&item.path) {
+                continue;
+            }
+            let Some(f) = self.exec_files.get(i) else {
+                continue;
+            };
+            let frac = item.frac.clamp(0.0, 1.0);
+            // Started videos report the encoder's real rate; use it
+            // instead of the static table so the ETA follows this
+            // machine. Unstarted rows keep the table that produced the
+            // plan's own time estimate.
+            let secs = if shrinkr_core::images::is_shrinkable_image(&f.path) {
+                IMAGE_WORK_SECS * (1.0 - frac)
+            } else if frac > 0.0 && item.fps > 0.5 {
+                f.total_frames() * (1.0 - frac) / item.fps
+            } else {
+                file_work_secs(f, backend) * (1.0 - frac)
+            };
+            work += secs;
+            // A started file already occupies a worker slot: when it is
+            // the only work left, dividing by the worker count would
+            // predict a finish before the encode can actually end.
+            longest = longest.max(secs);
+        }
+        let mut eta = (work / parallel).max(longest);
+        // Waiting segments run one after another, each with its own
+        // frozen settings (parallelism included), so their wall time is
+        // added per segment rather than mixed into the current batch.
+        for seg in &self.pending {
+            let seg_parallel = seg.cfg.parallel.max(1) as f64;
+            let seg_work: f64 = seg
+                .files
+                .iter()
+                .filter(|f| !skipped(&f.path))
+                .map(|f| file_work_secs(f, seg.cfg.params.backend))
+                .sum();
+            eta += seg_work / seg_parallel;
+        }
+        Some(eta)
+    }
+
+    /// Estimated `(source_bytes, output_bytes)` for the whole queue:
+    /// every file in the running batch plus each waiting segment, costed
+    /// under the settings it runs with. The run panel renders this as
+    /// `50 GB → 38 GB (-24%)`. Recomputed on every render like the ETA,
+    /// so a mid-run Queue / Add to queue click raises both totals
+    /// immediately. Rows that failed, were removed or were skipped are
+    /// excluded — they place nothing — while done rows stay in, so the
+    /// pair describes the batch's whole shrink rather than only the part
+    /// still to run. `None` when no batch is running.
+    pub fn queue_size_estimate(&self) -> Option<(u64, u64)> {
+        if !self.executing {
+            return None;
+        }
+        let skips = self.exec_skips.as_ref().and_then(|m| m.lock().ok());
+        let skipped = |p: &std::path::Path| skips.as_ref().is_some_and(|g| g.contains(p));
+        let mut src = 0u64;
+        let mut out = 0u64;
+        if let Some(cfg) = self.exec_cfg.as_ref() {
+            for (i, f) in self.exec_files.iter().enumerate() {
+                if skipped(&f.path)
+                    || self
+                        .exec_items
+                        .get(i)
+                        .is_some_and(|item| item.failed || item.removed)
+                {
+                    continue;
+                }
+                let (s, o) = file_size_estimate(f, &cfg.params);
+                src += s;
+                out += o;
+            }
+        }
+        for seg in &self.pending {
+            for f in &seg.files {
+                if skipped(&f.path) {
+                    continue;
+                }
+                let (s, o) = file_size_estimate(f, &seg.cfg.params);
+                src += s;
+                out += o;
+            }
+        }
+        Some((src, out))
+    }
+
     pub fn push_log(&mut self, line: String) {
         self.log.push(LogEntry::new(line));
         if self.log.len() > 300 {
@@ -934,7 +1192,7 @@ mod tests {
     use shrinkr_core::media::AudioTrack;
 
     fn app() -> AppState {
-        // Defaults are lossless; give the raw knobs non-pinned values so
+        // Quality protection is on by default; use non-pinned raw knobs so
         // the tests prove the override (and that the knobs survive it).
         AppState {
             cq: 32,
@@ -978,12 +1236,18 @@ mod tests {
     }
 
     #[test]
-    fn lossless_is_on_by_default_and_pins_the_quality_knobs() {
+    fn preserve_quality_pins_quality_but_allows_resolution_and_safe_audio() {
         let s = app();
         let p = s.est_params();
-        assert_eq!(p.cq, LOSSLESS_CQ);
-        assert_eq!(p.scale, ScalePolicy::Preserve);
-        assert_eq!(p.opus_bps, None);
+        assert_eq!(p.cq, PRESERVE_QUALITY_CQ);
+        assert!(p.preserve_quality);
+        assert_eq!(p.scale, ScalePolicy::Force720p);
+        assert_eq!(p.opus_bps, Some(96_000));
+        assert!(p.all_audio);
+        assert!(!p.film_grain);
+        assert!(s.effective_keep_subs());
+        assert_eq!(s.effective_scale(), ScalePolicy::Force720p);
+        assert_eq!(p.for_media(&video()).opus_bps, None);
         // The raw knobs survive, so unchecking restores them exactly.
         assert_eq!(s.cq, 32);
         assert_eq!(s.scale, ScalePolicy::Force720p);
@@ -991,9 +1255,9 @@ mod tests {
     }
 
     #[test]
-    fn unchecking_lossless_releases_the_pins() {
+    fn unchecking_preserve_quality_releases_the_pins() {
         let mut s = app();
-        s.lossless = false;
+        s.preserve_quality = false;
         let p = s.est_params();
         assert_eq!(p.cq, 32);
         assert_eq!(p.scale, ScalePolicy::Force720p);
@@ -1001,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn lossless_goal_estimates_share_the_pinned_quality() {
+    fn preserve_quality_goal_estimates_share_the_pinned_quality() {
         // goal_estimate substitutes the goal's own CQ after est_params —
         // it must re-apply the pin, or the segments would silently
         // estimate (and the axis promise) quality the run won't deliver.
@@ -1009,12 +1273,13 @@ mod tests {
         // the default skip policy would drop the file from the estimate
         // before the two plans could be compared.
         let mut s = app();
+        s.scale = ScalePolicy::Preserve;
         s.min_saving_pct = 0.0;
         s.skip_efficient = false;
         s.files.push(video());
         let pinned = s.goal_estimate(Goal::Fastest);
         let released = {
-            s.lossless = false;
+            s.preserve_quality = false;
             s.goal_estimate(Goal::Fastest)
         };
         // Growth estimates surface in the warn bucket, not the shrink
@@ -1027,7 +1292,7 @@ mod tests {
         assert!(
             pinned.warned_new_b > released.new_b,
             "cq{} estimate {} should exceed the cq28 plan {}",
-            LOSSLESS_CQ,
+            PRESERVE_QUALITY_CQ,
             pinned.warned_new_b,
             released.new_b
         );
@@ -1040,6 +1305,7 @@ mod tests {
         // can never reach the displayed percentage (the run would discard
         // those results and keep the originals anyway).
         let mut s = app();
+        s.scale = ScalePolicy::Preserve;
         s.min_saving_pct = 0.0;
         s.skip_efficient = false;
         s.files.push(video());
@@ -1050,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn lossless_goal_matching_ignores_the_pinned_cq() {
+    fn preserve_quality_goal_matching_ignores_the_pinned_cq() {
         let caps = shrinkr_core::hw::HwCaps {
             cuda_hwaccel: true,
             hevc_nvenc: true,
@@ -1073,13 +1339,26 @@ mod tests {
             gpu_label: "test".into(),
             hwaccels: vec![],
         };
-        // Full matches() demands the goal's CQ (28), which Lossless pins
-        // away — the segment would never highlight. matches_lossless
+        // Full matches() demands the goal's CQ (28), which Preserve quality pins
+        // away — the segment would never highlight. matches_preserve_quality
         // compares encoder + preset only.
-        assert!(!Goal::Fastest.matches(VideoBackend::Auto, NvencPreset::P4, LOSSLESS_CQ, &caps));
-        assert!(Goal::Fastest.matches_lossless(VideoBackend::Auto, NvencPreset::P4, &caps));
-        assert!(!Goal::Balanced.matches_lossless(VideoBackend::Auto, NvencPreset::P4, &caps));
-        assert!(!Goal::Fastest.matches_lossless(VideoBackend::CpuAv1, NvencPreset::P4, &caps));
+        assert!(!Goal::Fastest.matches(
+            VideoBackend::Auto,
+            NvencPreset::P4,
+            PRESERVE_QUALITY_CQ,
+            &caps
+        ));
+        assert!(Goal::Fastest.matches_preserve_quality(VideoBackend::Auto, NvencPreset::P4, &caps));
+        assert!(!Goal::Balanced.matches_preserve_quality(
+            VideoBackend::Auto,
+            NvencPreset::P4,
+            &caps
+        ));
+        assert!(!Goal::Fastest.matches_preserve_quality(
+            VideoBackend::CpuAv1,
+            NvencPreset::P4,
+            &caps
+        ));
     }
 
     #[test]
@@ -1163,18 +1442,14 @@ mod tests {
     }
 
     #[test]
-    fn lossless_batch_cannot_become_audio_only() {
-        // Audio-only re-encodes the soundtrack — exactly what Lossless
-        // forbids — so the effective audio target stays Off even with the
-        // Copy-video backend picked.
+    fn preserve_quality_protects_audio_only_runs_too() {
         let mut s = app();
         s.backend = VideoBackend::CopyVideo;
         s.opus_bps = Some(192_000);
-        assert_eq!(s.effective_opus(), None);
-        assert!(!shrinkr_core::pipeline::forces_audio_reencode(
-            s.backend,
-            s.effective_opus()
-        ));
+        assert_eq!(s.effective_opus(), Some(192_000));
+        let p = s.est_params().for_media(&video());
+        assert_eq!(p.opus_bps, None, "50% audio cut must become a copy");
+        assert!(p.preserve_quality, "size and quality gates still apply");
     }
 
     #[test]
@@ -1183,7 +1458,7 @@ mod tests {
         // below it: the skip policy drops it from a run, but the mid-run
         // Queue button is a deliberate click, so warn policy counts it.
         let mut s = app();
-        s.lossless = false;
+        s.preserve_quality = false;
         s.min_saving_pct = 99.0;
         s.files.push(video());
         assert!(s.eligible().is_empty());
@@ -1198,7 +1473,7 @@ mod tests {
         // and the Goal segments. The plan row says "muted", not the
         // threshold verdict — the file isn't queued at all.
         let mut s = app();
-        s.lossless = false;
+        s.preserve_quality = false;
         s.min_saving_pct = 0.0;
         s.skip_efficient = false;
         let mut hevc = video();
@@ -1231,7 +1506,7 @@ mod tests {
     #[test]
     fn queueable_excludes_pending_and_running_files() {
         let mut s = app();
-        s.lossless = false;
+        s.preserve_quality = false;
         s.min_saving_pct = 99.0;
         let mut second = video();
         second.path = std::path::PathBuf::from("t2.mp4");
@@ -1276,7 +1551,7 @@ mod tests {
         // them via the Queue button would double up — the Add to queue
         // click is their commit gate, so the excluded block covers it.
         let mut s = app();
-        s.lossless = false;
+        s.preserve_quality = false;
         s.min_saving_pct = 99.0;
         let mut second = video();
         second.path = std::path::PathBuf::from("t2.mp4");
@@ -1321,6 +1596,198 @@ mod tests {
         s.pending.push(seg(vec![video()]));
         s.pending.push(seg(vec![video(), video()]));
         assert_eq!(s.pending_len(), 3);
+    }
+
+    #[test]
+    fn clear_selection_drops_library_and_invalidates_inflight_scan_but_keeps_the_queue() {
+        // Clear is a selection action: it removes probed rows, waiting
+        // targets and mid-run staging, and bumps the scan token so an
+        // in-flight probe cannot refill the list. The running batch and
+        // its pending queue are independent snapshots and keep going;
+        // settings survive untouched.
+        let mut s = app();
+        s.executing = true;
+        s.files = vec![video(), video()];
+        s.targets = vec![PathBuf::from("picked-folder")];
+        s.staged = vec![video()];
+        s.scanning = true;
+        s.probing = true;
+        s.probe_done = 1;
+        s.probe_total = 3;
+        s.bench_note = "measured".into();
+        let cfg = ExecCfg {
+            params: s.est_params(),
+            keep_subs: true,
+            parallel: 2,
+            replace: true,
+            threshold: 10.0,
+            threshold_policy: ThresholdPolicy::Warn,
+            extra_args: vec![],
+        };
+        s.exec_cfg = Some(cfg.clone());
+        s.exec_files = vec![video()];
+        s.pending.push(PendingSegment {
+            files: vec![video()],
+            cfg,
+            warn: true,
+        });
+        let gen_before = s.scan_gen;
+        let cq_before = s.cq;
+
+        let dropped = s.clear_selection();
+
+        assert_eq!(dropped, 2);
+        assert!(s.files.is_empty());
+        assert!(s.targets.is_empty());
+        assert!(s.staged.is_empty());
+        assert!(s.bench_note.is_empty());
+        assert!(!s.scanning && !s.probing);
+        assert_eq!((s.probe_done, s.probe_total), (0, 0));
+        assert_eq!(s.scan_gen, gen_before + 1);
+        // The run and everything queued behind it are untouched.
+        assert_eq!(s.exec_files.len(), 1);
+        assert_eq!(s.pending_len(), 1);
+        // Settings are not part of the selection.
+        assert_eq!(s.cq, cq_before);
+    }
+
+    #[test]
+    fn queue_eta_covers_running_and_waiting_files_and_grows_with_queue_additions() {
+        // The run panel's "left in the queue" number: unfinished rows of
+        // the running batch plus each pending segment's wall time, under
+        // the settings that segment will run with. Adding a segment
+        // mid-run must raise the ETA on the next render.
+        let mut s = app();
+        s.preserve_quality = false;
+        s.executing = true;
+        let cfg = ExecCfg {
+            params: s.est_params(),
+            keep_subs: true,
+            parallel: 2,
+            replace: true,
+            threshold: 10.0,
+            threshold_policy: ThresholdPolicy::Warn,
+            extra_args: vec![],
+        };
+        s.exec_cfg = Some(cfg.clone());
+        // 600 s at 30 fps = 18 000 frames; Auto's table runs at 600 fps,
+        // so each video costs 30 encoder-seconds and a two-worker batch
+        // takes 15 wall-seconds per file.
+        let mut files = Vec::new();
+        for name in ["a.mp4", "b.mp4", "c.mp4", "d.mp4"] {
+            let mut f = video();
+            f.path = PathBuf::from(name);
+            files.push(f);
+        }
+        s.exec_items = files
+            .iter()
+            .map(|f| {
+                ExecItem::new(
+                    f.path.file_name().unwrap().to_string_lossy().into_owned(),
+                    f.path.clone(),
+                    "1920x1080".into(),
+                )
+            })
+            .collect();
+        s.exec_files = files;
+        s.exec_total = 4;
+        // Four unstarted videos over two workers: 120 encoder-seconds
+        // divided by two = 60 wall-seconds.
+        let batch_only = s.queue_remaining_secs().expect("batch is running");
+        assert!((batch_only - 60.0).abs() < 0.01, "{batch_only}");
+        // Each queued-behind-batch video adds its own 15 wall-seconds.
+        let mut queued_one = video();
+        queued_one.path = PathBuf::from("q1.mp4");
+        s.pending.push(PendingSegment {
+            files: vec![queued_one],
+            cfg: cfg.clone(),
+            warn: true,
+        });
+        let with_one = s.queue_remaining_secs().unwrap();
+        assert!((with_one - 75.0).abs() < 0.01, "{with_one}");
+        // A second addition raises it again — the update the UI promises.
+        let mut queued_two = video();
+        queued_two.path = PathBuf::from("q2.mp4");
+        s.pending.push(PendingSegment {
+            files: vec![queued_two],
+            cfg,
+            warn: true,
+        });
+        let with_two = s.queue_remaining_secs().unwrap();
+        assert!((with_two - 90.0).abs() < 0.01, "{with_two}");
+        assert!(with_two > with_one);
+        // Two current files finishing leaves the remaining 60
+        // encoder-seconds across two workers: 30 s, plus the 30 s of
+        // waiting files.
+        s.exec_items[0].done = true;
+        s.exec_items[0].frac = 1.0;
+        s.exec_items[1].done = true;
+        s.exec_items[1].frac = 1.0;
+        let after_progress = s.queue_remaining_secs().unwrap();
+        assert!((after_progress - 60.0).abs() < 0.01, "{after_progress}");
+        // Skipping a waiting file takes it back out of the estimate while
+        // its row stays in the segment.
+        let skipped_path = s.pending[0].files[0].path.clone();
+        s.exec_skips = Some(Arc::new(Mutex::new(HashSet::from([skipped_path]))));
+        let after_skip = s.queue_remaining_secs().unwrap();
+        assert!((after_skip - 45.0).abs() < 0.01, "{after_skip}");
+        // Nothing runs when the batch ends.
+        s.executing = false;
+        assert_eq!(s.queue_remaining_secs(), None);
+    }
+
+    #[test]
+    fn queue_size_estimate_covers_running_and_waiting_files_and_grows_with_queue_additions() {
+        // The run panel's source → estimated-output line uses the same
+        // model as the plan: the running batch's files plus every waiting
+        // segment, each under its own settings. A queue addition must
+        // raise both totals on the next render.
+        let mut s = app();
+        s.preserve_quality = false;
+        s.executing = true;
+        let cfg = ExecCfg {
+            params: s.est_params(),
+            keep_subs: true,
+            parallel: 2,
+            replace: true,
+            threshold: 10.0,
+            threshold_policy: ThresholdPolicy::Warn,
+            extra_args: vec![],
+        };
+        s.exec_cfg = Some(cfg.clone());
+        let a = video();
+        let mut b = video();
+        b.path = PathBuf::from("b.mp4");
+        s.exec_items = vec![
+            ExecItem::new("t.mp4".into(), a.path.clone(), "1920x1080".into()),
+            ExecItem::new("b.mp4".into(), b.path.clone(), "1920x1080".into()),
+        ];
+        s.exec_files = vec![a.clone(), b.clone()];
+        let (src, out) = s.queue_size_estimate().expect("batch is running");
+        assert_eq!(src, a.bytes + b.bytes);
+        let expected_out =
+            file_size_estimate(&a, &cfg.params).1 + file_size_estimate(&b, &cfg.params).1;
+        assert_eq!(out, expected_out);
+        // A queued-behind-batch file joins both totals immediately.
+        let mut queued = video();
+        queued.path = PathBuf::from("q.mp4");
+        let queued_out = file_size_estimate(&queued, &cfg.params).1;
+        s.pending.push(PendingSegment {
+            files: vec![queued.clone()],
+            cfg,
+            warn: true,
+        });
+        let (src2, out2) = s.queue_size_estimate().unwrap();
+        assert_eq!(src2, src + queued.bytes);
+        assert_eq!(out2, out + queued_out);
+        assert!(src2 > src && out2 > out);
+        // Skipping a waiting file takes it back out of the totals (the
+        // row stays visible, but nothing will be written for it).
+        s.exec_skips = Some(Arc::new(Mutex::new(HashSet::from([queued.path.clone()]))));
+        assert_eq!(s.queue_size_estimate().unwrap(), (src, out));
+        // Nothing runs when the batch ends.
+        s.executing = false;
+        assert_eq!(s.queue_size_estimate(), None);
     }
 
     #[test]

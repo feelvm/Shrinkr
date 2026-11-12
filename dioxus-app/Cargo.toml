@@ -16,3 +16,6 @@ tw_merge = { version = "0.1", features = ["debug"] }
 icons = { version = "0.18", features = ["dioxus"] }
 futures-channel = "0.3"
 futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"

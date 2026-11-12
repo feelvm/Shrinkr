@@ -434,11 +434,15 @@ fn Sidebar() -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let parent = crate::dialog::DialogParent::capture(&dioxus::desktop::use_window());
     let s = state.read();
-    let can_scan = !s.targets.is_empty() && !s.scanning && !s.probing;
     let has_targets = !s.targets.is_empty();
     let targets: Vec<std::path::PathBuf> = s.targets.clone();
     let scanning = s.scanning;
     let probing = s.probing;
+    let scan_busy = scanning || probing;
+    // Clear works on everything the selection owns: probed files, paths
+    // still waiting behind a running scan, mid-run staging, and a scan
+    // that has not produced its first result yet.
+    let has_selection = !s.files.is_empty() || has_targets || !s.staged.is_empty() || scan_busy;
     let probe_done = s.probe_done;
     let probe_total = s.probe_total;
     let files_summary = crate::sidebar_summary(&s);
@@ -453,6 +457,11 @@ fn Sidebar() -> Element {
     let exec_total = s.exec_total;
     let exec_overall = s.exec_overall();
     let exec_items = s.exec_items.clone();
+    // Live queue ETA + size estimate: the running batch plus every
+    // waiting segment. Both grow when files are queued mid-run, since
+    // these reads happen on the render that applies the addition.
+    let queue_eta = s.queue_remaining_secs();
+    let queue_size = s.queue_size_estimate();
     // The run's skip set (paths the user skipped or deleted from the
     // queue): rows read their "skipped" badge from it, so a click shows
     // on the next frame without waiting for the worker's confirmation
@@ -602,56 +611,18 @@ fn Sidebar() -> Element {
                             },
                             "Add files…"
                         }
-                        div { class: "flex gap-2",
-                            Button {
-                                variant: ButtonVariant::Default,
-                                class: "flex-1",
-                                disabled: !can_scan,
-                                onclick: move |_| {
-                                    let tx = pump_tx();
-                                    let targets = state.read().targets.clone();
-                                    {
-                                        let mut w = state.write();
-                                        // Mid-run scans append (queued behind
-                                        // the batch); only a fresh scan
-                                        // replaces the library.
-                                        if !w.executing {
-                                            w.files.clear();
-                                            w.bench_rows.clear();
-                                            w.bench_note.clear();
-                                        }
-                                        // Scan consumes the targets: scanned
-                                        // paths leave the Sources list so
-                                        // they never need manual removal.
-                                        w.targets.clear();
-                                        w.scanning = true;
-                                        w.push_log(format!(
-                                            "Scanning {} selected item(s) …",
-                                            targets.len()
-                                        ));
-                                    }
-                                    crate::jobs::start_scan(tx, targets);
-                                },
-                                "Scan"
-                            }
-                            Button {
-                                variant: ButtonVariant::Ghost,
-                                disabled: !has_targets,
-                                onclick: move |_| {
-                                    let mut w = state.write();
-                                    w.targets.clear();
-                                    // The running batch owns its snapshot;
-                                    // the library view stays intact mid-run.
-                                    if !w.executing {
-                                        w.files.clear();
-                                    }
-                                },
-                                "Clear"
-                            }
+                        Button {
+                            variant: ButtonVariant::Ghost,
+                            class: "w-full",
+                            disabled: !has_selection,
+                            title: "Remove every added file from the selection",
+                            onclick: move |_| crate::clear_clicked(state),
+                            "Clear"
                         }
                     }
                     if has_targets {
-                        div { class: "mt-3 max-h-32 overflow-y-auto rounded-md border border-border p-2",
+                        p { class: "mt-3 text-xs text-muted-foreground", "Waiting to scan:" }
+                        div { class: "mt-1 max-h-32 overflow-y-auto rounded-md border border-border p-2",
                             for (i , t) in targets.iter().enumerate() {
                                 div { class: "flex items-center justify-between gap-2 py-0.5",
                                     span { class: "truncate text-xs text-muted-foreground",
@@ -659,11 +630,11 @@ fn Sidebar() -> Element {
                                     }
                                     button {
                                         class: "shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                                        title: "Remove from the waiting list",
                                         onclick: move |_| {
                                             let mut w = state.write();
                                             if i < w.targets.len() {
                                                 w.targets.remove(i);
-                                                w.files.clear();
                                             }
                                         },
                                         "✕"
@@ -733,6 +704,10 @@ fn Sidebar() -> Element {
                     Button {
                         variant: ButtonVariant::Default,
                         class: "w-full",
+                        // Auto-scan is part of adding now: let the selection
+                        // finish probing before a batch snapshots it.
+                        disabled: scan_busy,
+                        title: if scan_busy { Some("Waiting for the scan to finish".to_string()) } else { None },
                         onclick: move |_| crate::process_clicked(state, pump_tx()),
                         "{process_label}"
                     }
@@ -747,6 +722,16 @@ fn Sidebar() -> Element {
                 } else {
                     Progress { value: exec_overall * 100.0 }
                     p { class: "text-xs text-muted-foreground", "{progress_label}" }
+                    if let Some(secs) = queue_eta {
+                        p { class: "text-xs text-muted-foreground",
+                            "About {fmt_secs(secs)} left in the queue"
+                        }
+                    }
+                    if let Some((src, out)) = queue_size {
+                        p { class: "text-xs text-muted-foreground",
+                            "{human_bytes(src)} → {human_bytes(out)} ({fmt_size_change(src, out)})"
+                        }
+                    }
                     p { class: "text-xs font-semibold", "Per-file progress ({exec_done}/{exec_total})" }
                     div { class: "flex max-h-40 flex-col gap-2 overflow-y-auto",
                         for item in exec_items {
@@ -962,6 +947,7 @@ fn Main() -> Element {
                     TabsList {
                         TabsTrigger { value: "shrink", "Shrink" }
                         TabsTrigger { value: "convert", "Convert" }
+                        TabsTrigger { value: "optimize", "Optimize" }
                     }
                     TabsContent { value: "shrink",
                         div { class: "flex flex-col gap-4",
@@ -978,6 +964,9 @@ fn Main() -> Element {
                     }
                     TabsContent { value: "convert",
                         ConvertCard {}
+                    }
+                    TabsContent { value: "optimize",
+                        OptimizeCard {}
                     }
                 }
                 LogCard {}
@@ -1018,7 +1007,7 @@ fn ShrinkEmpty() -> Element {
                     Empty {
                         EmptyTitle { "No files yet" }
                         EmptyDescription {
-                            "Add folders or files (videos and images) on the left, press Scan — or drag & drop them here."
+                            "Add folders or files (videos and images) on the left, or drag & drop them here — scanning starts automatically."
                         }
                     }
                 }
@@ -1031,19 +1020,19 @@ fn ShrinkEmpty() -> Element {
 fn PipelineCard() -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let s = state.read();
-    let lossless = s.lossless;
+    let preserve_quality = s.preserve_quality;
     let backend = s.backend;
     let preset = s.nvenc_preset;
-    // Effective values: Lossless pins quality/resolution/audio, so the
-    // controls display what a run will actually use, not the raw knobs.
+    // Protection pins video quality and preserves tracks; resolution and
+    // audio targets remain editable and resolve separately for each file.
     let scale = s.effective_scale();
     let cq = s.effective_cq();
     let image_cq = s.image_cq;
     let image_scale = s.image_scale;
     let image_preserve_format = s.image_preserve_format;
-    let keep_subs = s.keep_subs;
-    let all_audio = s.all_audio;
-    let film_grain = s.film_grain;
+    let keep_subs = s.effective_keep_subs();
+    let all_audio = preserve_quality || s.all_audio;
+    let film_grain = !preserve_quality && s.film_grain;
     let skip_efficient = s.skip_efficient;
     let replace = s.replace;
     let min_saving = s.min_saving_pct;
@@ -1082,14 +1071,14 @@ fn PipelineCard() -> Element {
                 div { class: "flex flex-col gap-4",
                     if has_video {
                         GoalPicker {}
-                    }
-                    div { class: "flex flex-col gap-1",
-                        label { class: "flex items-center gap-2 text-sm",
-                            Checkbox {
-                                checked: lossless,
-                                on_checked_change: move |v| state.write().lossless = v,
+                        div { class: "flex flex-col gap-1",
+                            label { class: "flex items-center gap-2 text-sm",
+                                Checkbox {
+                                    checked: preserve_quality,
+                                    on_checked_change: move |v| state.write().preserve_quality = v,
+                                }
+                                "Preserve quality"
                             }
-                            "Lossless (no perceptible quality loss)"
                         }
                     }
                     div { class: "grid grid-cols-1 gap-3 md:grid-cols-3",
@@ -1174,7 +1163,6 @@ fn PipelineCard() -> Element {
                             Label { "Resolution" }
                             ScalePicker {
                                 value: scale,
-                                disabled: lossless,
                                 on_change: move |v| state.write().scale = v,
                             }
                         }
@@ -1185,7 +1173,6 @@ fn PipelineCard() -> Element {
                         }
                         select {
                             class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm disabled:opacity-50 disabled:cursor-not-allowed",
-                            disabled: lossless,
                             onchange: move |e: FormEvent| {
                                 state.write().opus_bps = match e.value().as_str() {
                                     "off" => None,
@@ -1219,7 +1206,6 @@ fn PipelineCard() -> Element {
                         label { class: "flex items-center gap-2 text-sm",
                             Checkbox {
                                 checked: backend == VideoBackend::CopyVideo,
-                                disabled: lossless,
                                 on_checked_change: move |v| {
                                     let mut w = state.write();
                                     if v {
@@ -1279,7 +1265,7 @@ fn PipelineCard() -> Element {
                                 max: 40.0,
                                 step: 1.0,
                                 value: cq as f64,
-                                disabled: lossless,
+                                disabled: preserve_quality,
                                 oninput: move |e: FormEvent| {
                                     if let Ok(v) = e.value().parse::<f64>() {
                                         state.write().cq = v.clamp(18.0, 40.0) as u32;
@@ -1295,6 +1281,7 @@ fn PipelineCard() -> Element {
                         label { class: "flex items-center gap-2 text-sm",
                             Checkbox {
                                 checked: keep_subs,
+                                disabled: preserve_quality,
                                 on_checked_change: move |v| state.write().keep_subs = v,
                             }
                             "Keep subtitles"
@@ -1302,6 +1289,7 @@ fn PipelineCard() -> Element {
                         label { class: "flex items-center gap-2 text-sm",
                             Checkbox {
                                 checked: all_audio,
+                                disabled: preserve_quality,
                                 on_checked_change: move |v| state.write().all_audio = v,
                             }
                             "Keep all audio tracks (dual-audio)"
@@ -1313,6 +1301,7 @@ fn PipelineCard() -> Element {
                             label { class: "flex items-center gap-2 text-sm",
                                 Checkbox {
                                     checked: film_grain,
+                                    disabled: preserve_quality,
                                     on_checked_change: move |v| state.write().film_grain = v,
                                 }
                                 "AV1 film-grain synthesis (grainy sources)"
@@ -1325,13 +1314,18 @@ fn PipelineCard() -> Element {
                             class: "w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs",
                             r#type: "text",
                             placeholder: "-tune grain -maxrate 8M",
+                            disabled: preserve_quality,
                             value: "{extra_args}",
                             oninput: move |e: FormEvent| {
                                 state.write().extra_args = e.value();
                             },
                         }
                         p { class: "text-xs text-muted-foreground",
-                            "Appended as output options (can override quality flags). Estimates ignore them. Blocked: -i -map -ss -t -f -y -c:s and other structural flags."
+                            if preserve_quality {
+                                "Extra flags are inactive while Preserve quality is on."
+                            } else {
+                                "Appended as output options (can override quality flags). Estimates ignore them. Blocked: -i -map -ss -t -f -y -c:s and other structural flags."
+                            }
                         }
                     }
                     if has_image {
@@ -1467,6 +1461,21 @@ fn fmt_secs(secs: f64) -> String {
     }
 }
 
+/// Signed percentage for a source → estimated-output pair: `-24%` for a
+/// shrink, `+12%` for growth. `<1%` when rounding would hide a real
+/// change; exact equality says `0%`.
+fn fmt_size_change(src: u64, out: u64) -> String {
+    if src == out {
+        return "0%".to_string();
+    }
+    let pct = (out as f64 - src as f64) / src.max(1) as f64 * 100.0;
+    if pct.abs() < 0.5 {
+        "<1%".to_string()
+    } else {
+        format!("{pct:+.0}%")
+    }
+}
+
 /// The Goal control: one speed↔size axis rendered as a segmented control —
 /// position on the axis *is* the trade-off, and the caption labels the two
 /// ends. With videos loaded, each segment carries the batch's own numbers
@@ -1496,15 +1505,15 @@ fn GoalPicker() -> Element {
     let backend = s.backend;
     let preset = s.nvenc_preset;
     let cq = s.cq;
-    // Under Lossless the quality value is pinned, so segments match on
+    // Under Preserve quality the quality value is pinned, so segments match on
     // encoder + preset alone — the axis stays a working speed↔size
     // control instead of never highlighting.
-    let lossless = s.lossless;
+    let preserve_quality = s.preserve_quality;
     let segs: Vec<(Goal, bool, Option<GoalSub>)> = Goal::ALL
         .iter()
         .map(|&goal| {
-            let active = if lossless {
-                goal.matches_lossless(backend, preset, caps)
+            let active = if preserve_quality {
+                goal.matches_preserve_quality(backend, preset, caps)
             } else {
                 goal.matches(backend, preset, cq, caps)
             };
@@ -1546,7 +1555,7 @@ fn GoalPicker() -> Element {
                         }
                     }
                     None => GoalSub {
-                        main: format!("no gain{}", if lossless { " at CQ 18" } else { "" }),
+                        main: format!("no gain{}", if preserve_quality { " at CQ 18" } else { "" }),
                         // Not a size value — inherits the line's tone.
                         main_cls: "",
                         rest: format!(
@@ -1804,6 +1813,7 @@ fn EstimateCard() -> Element {
         .collect();
     let target_text = s.target_text.clone();
     let target_solving = s.target_solving;
+    let preserve_quality = s.preserve_quality;
     // Target solving is video-only (images don't take a CRF), so the
     // solve row follows the library like the Benchmark card — the
     // estimates and plan rows above stay for image-only batches.
@@ -1817,6 +1827,11 @@ fn EstimateCard() -> Element {
             CardContent {
                 p { class: "text-sm font-semibold", "{headline}" }
                 p { class: "text-xs text-muted-foreground", "{subline}" }
+                if preserve_quality && has_video {
+                    p { class: "text-xs text-muted-foreground",
+                        "Time estimates exclude the final quality check. Any result that fails it is discarded."
+                    }
+                }
                 div { class: "mt-2 max-h-36 overflow-y-auto rounded-md border border-border p-2",
                     for (mark , prefix , reason , cls) in rows {
                         p { class: "{cls}",
@@ -1834,13 +1849,18 @@ fn EstimateCard() -> Element {
                 if has_video {
                     div { class: "mt-2",
                         p { class: "text-xs text-muted-foreground",
-                            "Want a specific size? Enter it (400MB) or how much smaller (2x) — the quality setting is picked automatically to hit it."
+                            if preserve_quality {
+                                "Preserve quality takes priority over a target size. Turn it off to fit a specific size."
+                            } else {
+                                "Want a specific size? Enter it (400MB) or how much smaller (2x) — the quality setting is picked automatically to hit it."
+                            }
                         }
                         div { class: "mt-1 flex items-center gap-2",
                             input {
                                 class: "w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs",
                                 r#type: "text",
                                 placeholder: "400MB or 2x",
+                                disabled: preserve_quality,
                                 value: "{target_text}",
                                 oninput: move |e: FormEvent| {
                                     state.write().target_text = e.value();
@@ -1848,7 +1868,7 @@ fn EstimateCard() -> Element {
                             }
                             Button {
                                 variant: ButtonVariant::Outline,
-                                disabled: target_solving,
+                                disabled: target_solving || preserve_quality,
                                 onclick: move |_| crate::solve_clicked(state, pump_tx()),
                                 if target_solving { "Fitting…" } else { "Fit to size" }
                             }
@@ -1863,6 +1883,24 @@ fn EstimateCard() -> Element {
             }
         }
     }
+}
+
+/// Clear removes every file added to the selection: probed library rows,
+/// paths still waiting behind a running scan, and mid-run staging. The
+/// running batch and its waiting queue are snapshots of their own, so
+/// they keep going, and the settings stay exactly as picked.
+fn clear_clicked(mut state: Signal<AppState>) {
+    let mut w = state.write();
+    let dropped = w.clear_selection();
+    let mut line = if dropped == 0 {
+        "Selection cleared.".to_string()
+    } else {
+        format!("Cleared {dropped} file(s) from the selection.")
+    };
+    if w.executing {
+        line.push_str(" The running batch and its queue keep going.");
+    }
+    w.push_log(line);
 }
 
 /// Mid-run manual queue: move the still-queueable library files behind
@@ -1910,7 +1948,7 @@ fn add_staged_clicked(mut state: Signal<AppState>) {
     if !s.executing || s.staged.is_empty() {
         return;
     }
-    let extra_args = match shrinkr_core::ffmpeg::parse_extra_args(&s.extra_args) {
+    let extra_args = match shrinkr_core::ffmpeg::parse_extra_args(s.effective_extra_args()) {
         Ok(v) => v,
         Err(e) => {
             drop(s);
@@ -1922,7 +1960,7 @@ fn add_staged_clicked(mut state: Signal<AppState>) {
     };
     let cfg = crate::state::ExecCfg {
         params: s.est_params(),
-        keep_subs: s.keep_subs,
+        keep_subs: s.effective_keep_subs(),
         parallel: s.parallel.clamp(1, 8),
         replace: s.replace,
         threshold: s.threshold(),
@@ -1946,6 +1984,15 @@ fn add_staged_clicked(mut state: Signal<AppState>) {
 
 fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     let s = state.read();
+    // Adding files auto-scans; a batch must not snapshot a half-probed
+    // selection (files still arriving would land in staging afterwards).
+    if s.scanning || s.probing {
+        drop(s);
+        state
+            .write()
+            .push_log("Scan still running — wait for it to finish, then press Process.".into());
+        return;
+    }
     let idx = s.eligible();
     if idx.is_empty() {
         let files = s.files.clone();
@@ -1963,7 +2010,7 @@ fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         let mut w = state.write();
         w.push_log("Process pressed but 0 files eligible — reasons:".into());
         if files.is_empty() {
-            w.push_log("  (no probed files — Scan first)".into());
+            w.push_log("  (no probed files — add files first; they scan automatically)".into());
         }
         // Muted-codec files are not part of the run at all: their
         // threshold verdicts would just be noise here.
@@ -2048,14 +2095,14 @@ fn start_batch(
     }
     let s = state.read();
     let params = s.est_params();
-    let keep_subs = s.keep_subs;
+    let keep_subs = s.effective_keep_subs();
     let parallel = s.parallel.clamp(1, 8);
     let replace = s.replace;
     let threshold = s.threshold();
     let threshold_policy = s.threshold_policy();
     // Parse the advanced flags now so typos fail fast with a log line,
     // not halfway through a batch.
-    let extra_args = match shrinkr_core::ffmpeg::parse_extra_args(&s.extra_args) {
+    let extra_args = match shrinkr_core::ffmpeg::parse_extra_args(s.effective_extra_args()) {
         Ok(v) => v,
         Err(e) => {
             drop(s);
@@ -2066,18 +2113,23 @@ fn start_batch(
         }
     };
     let first_cmd = files.first().and_then(|f0| {
+        let params = params.for_media(f0);
         if shrinkr_core::images::is_shrinkable_image(&f0.path) {
             // Image jobs echo the image command; target ext comes from the plan.
             shrinkr_core::images::plan_image(f0, params.image_preserve_format)
                 .ok()
                 .map(|plan| {
-                    command_line(&shrinkr_core::images::build_image_args(
-                        f0,
-                        &plan,
-                        params.image_cq,
-                        params.image_scale,
-                        std::path::Path::new(&format!("<tmp>.{}", plan.target_ext)),
-                    ))
+                    if plan.encoder == "jpegtran" {
+                        "jpegtran --optimize --progressive (lossless)".to_string()
+                    } else {
+                        command_line(&shrinkr_core::images::build_image_args(
+                            f0,
+                            &plan,
+                            params.image_cq,
+                            params.image_scale,
+                            std::path::Path::new(&format!("<tmp>.{}", plan.target_ext)),
+                        ))
+                    }
                 })
         } else {
             let levels = select_levels_for_media(params.backend, caps(), f0);
@@ -2182,6 +2234,13 @@ fn start_batch(
 fn solve_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     use shrinkr_core::target::parse_target;
     let s = state.read();
+    if s.preserve_quality {
+        drop(s);
+        state
+            .write()
+            .push_log("Turn off Preserve quality to fit a target size.".into());
+        return;
+    }
     let spec = match parse_target(&s.target_text) {
         Ok(v) => v,
         Err(e) => {
@@ -2213,8 +2272,8 @@ fn solve_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         .unwrap_or("?")
         .to_string();
     let params = s.est_params();
-    let keep_subs = s.keep_subs;
-    let extra_args = match shrinkr_core::ffmpeg::parse_extra_args(&s.extra_args) {
+    let keep_subs = s.effective_keep_subs();
+    let extra_args = match shrinkr_core::ffmpeg::parse_extra_args(s.effective_extra_args()) {
         Ok(v) => v,
         Err(e) => {
             drop(s);
@@ -2318,7 +2377,7 @@ fn BenchCard() -> Element {
                                     drop(s);
                                     state
                                         .write()
-                                        .push_log("Benchmark: scan files first.".into());
+                                        .push_log("Benchmark: add files first — they scan automatically.".into());
                                     return;
                                 }
                                 // The matrix is the video encoder ladder;
@@ -2762,6 +2821,264 @@ fn convert_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         w.push_log(format!("Converting {} file(s)…", ready.len()));
     }
     crate::jobs::start_convert_exec(tx, files, ready, replace, cancel);
+}
+
+#[component]
+fn OptimizeCard() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let parent = crate::dialog::DialogParent::capture(&dioxus::desktop::use_window());
+    let s = state.read();
+    let files = s.optimize_files.clone();
+    let scanning = s.optimize_scanning;
+    let executing = s.optimize_executing;
+    let replace = s.optimize_replace;
+    let done = s.optimize_done;
+    let pdf_preset = s.optimize_pdf_preset;
+    let image_level = s.optimize_image_level;
+    let total = files.len();
+    let ready = files.iter().filter(|f| f.runnable()).count();
+    drop(s);
+    let mut drag_over = use_signal(|| false);
+    let drag_cls = if drag_over() {
+        "border-primary"
+    } else {
+        "border-border"
+    };
+    let run_label = format!("Optimize {ready} file(s)");
+    rsx! {
+        Card {
+            CardHeader {
+                CardTitle { "Optimize - PDF and lossless images" }
+            }
+            CardContent {
+                div { class: "flex flex-col gap-3",
+                    div {
+                        class: "rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground {drag_cls}",
+                        ondragenter: move |_| drag_over.set(true),
+                        ondragleave: move |_| drag_over.set(false),
+                        ondragover: move |evt| {
+                            evt.prevent_default();
+                            drag_over.set(true);
+                        },
+                        ondrop: move |evt| {
+                            evt.prevent_default();
+                            drag_over.set(false);
+                            let paths = dropped_paths(&evt);
+                            if !paths.is_empty() {
+                                crate::jobs::start_optimize_scan(pump_tx(), paths);
+                            }
+                        },
+                        "Drop PDFs, PNGs or JPEGs here."
+                    }
+                    div { class: "flex gap-2",
+                        Button {
+                            variant: ButtonVariant::Outline,
+                            class: "flex-1",
+                            disabled: executing,
+                            onclick: move |_| {
+                                let tx = pump_tx();
+                                std::thread::spawn(move || {
+                                    let mut dlg = rfd::FileDialog::new();
+                                    if let Some(p) = &parent {
+                                        dlg = dlg.set_parent(p);
+                                    }
+                                    if let Some(paths) = dlg
+                                        .add_filter("optimize", &["pdf", "png", "jpg", "jpeg"])
+                                        .pick_files()
+                                    {
+                                        crate::jobs::start_optimize_scan(tx, paths);
+                                    }
+                                });
+                            },
+                            "Add files."
+                        }
+                        Button {
+                            variant: ButtonVariant::Ghost,
+                            disabled: files.is_empty() || executing,
+                            onclick: move |_| {
+                                let mut w = state.write();
+                                if !w.optimize_executing {
+                                    w.optimize_files.clear();
+                                    w.optimize_done = 0;
+                                }
+                            },
+                            "Clear"
+                        }
+                    }
+                    div { class: "grid grid-cols-1 gap-3 md:grid-cols-3",
+                        div { class: "flex flex-col gap-1",
+                            Label { "PDF level" }
+                            select {
+                                class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
+                                disabled: executing,
+                                onchange: move |e: FormEvent| {
+                                    if let Some(p) = shrinkr_core::pdf::PdfPreset::parse(&e.value()) {
+                                        state.write().optimize_pdf_preset = p;
+                                    }
+                                },
+                                option {
+                                    value: "lossless",
+                                    selected: pdf_preset == shrinkr_core::pdf::PdfPreset::Lossless,
+                                    "Lossless"
+                                }
+                                option {
+                                    value: "balanced",
+                                    selected: pdf_preset == shrinkr_core::pdf::PdfPreset::Balanced,
+                                    "Balanced"
+                                }
+                                option {
+                                    value: "small",
+                                    selected: pdf_preset == shrinkr_core::pdf::PdfPreset::Small,
+                                    "Small"
+                                }
+                            }
+                        }
+                        div { class: "flex flex-col gap-1",
+                            Label { "Image effort" }
+                            select {
+                                class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
+                                disabled: executing,
+                                onchange: move |e: FormEvent| {
+                                    if let Some(p) = shrinkr_core::optimize::OptimizeLevel::parse(&e.value()) {
+                                        state.write().optimize_image_level = p;
+                                    }
+                                },
+                                option {
+                                    value: "balanced",
+                                    selected: image_level == shrinkr_core::optimize::OptimizeLevel::Balanced,
+                                    "Balanced"
+                                }
+                                option {
+                                    value: "max",
+                                    selected: image_level == shrinkr_core::optimize::OptimizeLevel::Max,
+                                    "Maximum"
+                                }
+                            }
+                        }
+                        div { class: "flex flex-col justify-end gap-1 pb-1.5",
+                            label { class: "flex items-center gap-2 text-sm",
+                                Checkbox {
+                                    checked: replace,
+                                    disabled: executing,
+                                    on_checked_change: move |v| state.write().optimize_replace = v,
+                                }
+                                "Replace originals"
+                            }
+                        }
+                    }
+                    if scanning {
+                        div { class: "flex items-center gap-2 text-xs text-muted-foreground",
+                            Spinner {}
+                            "Scanning."
+                        }
+                    }
+                    if !files.is_empty() {
+                        div { class: "flex max-h-64 flex-col gap-2 overflow-y-auto",
+                            for (i , f) in files.iter().enumerate() {
+                                {
+                                    let name = f.name();
+                                    let kind = f.kind_label();
+                                    let status = f.status_text();
+                                    let src = human_bytes(f.bytes);
+                                    let change = if f.done && f.output_bytes > 0 {
+                                        fmt_size_change(f.bytes, f.output_bytes)
+                                    } else {
+                                        String::new()
+                                    };
+                                    let failed = f.failed;
+                                    rsx! {
+                                        div { class: "flex items-center gap-2 rounded-md border border-border p-2",
+                                            span { class: "min-w-0 flex-1 truncate font-mono text-xs", "{name}" }
+                                            Badge { variant: BadgeVariant::Secondary, "{kind}" }
+                                            span { class: "shrink-0 text-xs text-muted-foreground", "{src}" }
+                                            if !change.is_empty() {
+                                                Badge { variant: BadgeVariant::Secondary, "{change}" }
+                                            }
+                                            span {
+                                                class: if failed { "shrink-0 text-xs text-red-500" } else { "shrink-0 text-xs text-muted-foreground" },
+                                                "{status}"
+                                            }
+                                            button {
+                                                class: "shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                                                disabled: executing,
+                                                onclick: move |_| {
+                                                    let mut w = state.write();
+                                                    if !w.optimize_executing && i < w.optimize_files.len() {
+                                                        w.optimize_files.remove(i);
+                                                    }
+                                                },
+                                                "×"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !executing {
+                            Button {
+                                variant: ButtonVariant::Default,
+                                class: "w-full",
+                                disabled: ready == 0,
+                                onclick: move |_| optimize_clicked(state, pump_tx()),
+                                "{run_label}"
+                            }
+                        } else {
+                            p { class: "text-xs text-muted-foreground", "Optimizing {done}/{total}." }
+                            Button {
+                                variant: ButtonVariant::Destructive,
+                                onclick: move |_| {
+                                    if let Some(c) = state.read().optimize_cancel.clone() {
+                                        c.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                },
+                                "Cancel"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// UI-thread part of Optimize: collect runnable rows, snapshot the preset
+/// choices, then hand the queue to the worker.
+fn optimize_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
+    let s = state.read();
+    let ready: Vec<usize> = s
+        .optimize_files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.runnable())
+        .map(|(i, _)| i)
+        .collect();
+    if ready.is_empty() {
+        drop(s);
+        state
+            .write()
+            .push_log("Optimize pressed but no files are runnable.".into());
+        return;
+    }
+    let files = s.optimize_files.clone();
+    let replace = s.optimize_replace;
+    let pdf_preset = s.optimize_pdf_preset;
+    let level = s.optimize_image_level;
+    drop(s);
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut w = state.write();
+        w.optimize_executing = true;
+        w.optimize_done = 0;
+        w.optimize_cancel = Some(cancel.clone());
+        for &i in &ready {
+            if let Some(f) = w.optimize_files.get_mut(i) {
+                f.frac = 0.0;
+                f.no_gain = false;
+            }
+        }
+        w.push_log(format!("Optimizing {} file(s).", ready.len()));
+    }
+    crate::jobs::start_optimize_exec(tx, files, ready, replace, pdf_preset, level, cancel);
 }
 
 #[component]

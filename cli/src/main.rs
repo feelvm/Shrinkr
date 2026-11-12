@@ -33,6 +33,9 @@ fn cli_help() -> String {
     "shrinkr-cli — headless media shrinker\n\
      \n\
      --shrink <file|dir>       run the real shrink pipeline headlessly\n\
+     --optimize <file|dir>     shrink PDFs and losslessly optimize PNG/JPEG\n\
+     --pdf-level <lossless|balanced|small>  PDF preset (default balanced)\n\
+     --opt-level <balanced|max>  PNG/JPEG effort (default balanced)\n\
      --replace                 delete originals after verified encode\n\
      \u{20}                      (default: keep both, <stem>.mkv alongside)\n\
      --images / --no-images   shrink still images too — jpg/webp re-encode,\n\
@@ -75,6 +78,9 @@ fn parse_cli() -> i32 {
     }
     let mut bench: Option<String> = None;
     let mut shrink: Option<String> = None;
+    let mut optimize: Option<String> = None;
+    let mut pdf_level = shrinkr_core::pdf::PdfPreset::Balanced;
+    let mut opt_level = shrinkr_core::optimize::OptimizeLevel::Balanced;
     let mut replace_cli = false;
     let mut images_cli = true;
     let mut backend_cli = VideoBackend::Auto;
@@ -107,6 +113,39 @@ fn parse_cli() -> i32 {
                 i += 1;
                 if i < args.len() {
                     shrink = Some(args[i].clone());
+                }
+            }
+            "--optimize" => {
+                i += 1;
+                if i < args.len() {
+                    optimize = Some(args[i].clone());
+                }
+            }
+            "--pdf-level" => {
+                i += 1;
+                if i < args.len() {
+                    match shrinkr_core::pdf::PdfPreset::parse(&args[i]) {
+                        Some(p) => pdf_level = p,
+                        None => {
+                            eprintln!(
+                                "--pdf-level rejected: {:?} - use lossless, balanced or small",
+                                args[i]
+                            );
+                            return 2;
+                        }
+                    }
+                }
+            }
+            "--opt-level" => {
+                i += 1;
+                if i < args.len() {
+                    match shrinkr_core::optimize::OptimizeLevel::parse(&args[i]) {
+                        Some(p) => opt_level = p,
+                        None => {
+                            eprintln!("--opt-level rejected: {:?} - use balanced or max", args[i]);
+                            return 2;
+                        }
+                    }
                 }
             }
             "--replace" => replace_cli = true,
@@ -268,6 +307,9 @@ fn parse_cli() -> i32 {
             dry_run,
         );
     }
+    if let Some(o) = optimize {
+        return cli_optimize(Path::new(&o), replace_cli, pdf_level, opt_level, dry_run);
+    }
     if let Some(s) = shrink {
         let extra_args = match ffmpeg::parse_extra_args(&extra_args_raw) {
             Ok(v) => v,
@@ -394,6 +436,7 @@ fn cli_shrink(
     let mut skipped_no_gain = 0;
     // CLI shrink uses the P5 default like the GUI default.
     let wp = pipeline::EstParams {
+        preserve_quality: false,
         backend,
         preset: NvencPreset::P5,
         cq,
@@ -444,8 +487,12 @@ fn cli_shrink(
             };
             let tmp_out = tmp_root.join(format!("{stem}-cli-{n}.{}", plan.target_ext));
             let _ = std::fs::remove_file(&tmp_out);
-            let args = build_image_args(&m, &plan, image_cq, image_scale, &tmp_out);
-            println!("  cmd: {}", ffmpeg::command_line(&args));
+            if plan.encoder == "jpegtran" {
+                println!("  cmd: jpegtran --optimize --progressive (lossless)");
+            } else {
+                let args = build_image_args(&m, &plan, image_cq, image_scale, &tmp_out);
+                println!("  cmd: {}", ffmpeg::command_line(&args));
+            }
             if dry_run {
                 continue;
             }
@@ -649,6 +696,154 @@ fn cli_shrink(
     }
     if failed > 0 {
         eprintln!("{failed} file(s) failed/skipped-by-error.");
+        1
+    } else {
+        0
+    }
+}
+
+/// Headless PDF shrink + lossless image optimization. Mirrors the GUI
+/// Optimize tab: same core calls, same placement policy, one file at a
+/// time with loud per-file output.
+fn cli_optimize(
+    input: &Path,
+    replace: bool,
+    pdf_preset: shrinkr_core::pdf::PdfPreset,
+    level: shrinkr_core::optimize::OptimizeLevel,
+    dry_run: bool,
+) -> i32 {
+    use shrinkr_core::{optimize, pdf};
+    let mut inputs: Vec<PathBuf> = Vec::new();
+    if input.is_file() {
+        let ext = pdf::ext_of(input);
+        if ext == "pdf" || optimize::is_optimizable_image(input) {
+            inputs.push(input.to_path_buf());
+        }
+    } else {
+        inputs.extend(pdf::collect_pdf_inputs(input));
+        inputs.extend(optimize::collect_optimize_inputs(input));
+        inputs.sort();
+        inputs.dedup();
+    }
+    if inputs.is_empty() {
+        eprintln!("no PDFs or PNG/JPEG images under {}", input.display());
+        return 1;
+    }
+    println!(
+        "optimize {} file(s): pdf={} image={} replace={}",
+        inputs.len(),
+        pdf_preset.label().to_lowercase(),
+        level.label(),
+        replace
+    );
+    if dry_run {
+        for p in &inputs {
+            let kind = if pdf::is_pdf(p) { "pdf" } else { "image" };
+            println!("  {} ({kind})", p.display());
+        }
+        return 0;
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let tmp_root = match ffmpeg::work_root() {
+        Ok(d) => d.join("optimize"),
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let mut failed = 0;
+    let mut no_gain = 0;
+    let mut saved = 0i64;
+    for (i, p) in inputs.iter().enumerate() {
+        let ext = pdf::ext_of(p);
+        let tmp = tmp_root.join(format!("opt-{i}.{ext}"));
+        if let Err(e) = ffmpeg::ensure_output_dir(&tmp) {
+            eprintln!("{}: {e}", p.display());
+            failed += 1;
+            continue;
+        }
+        let _ = std::fs::remove_file(&tmp);
+        println!("{}", p.display());
+        let result: Result<(u64, String), String> = if ext == "pdf" {
+            match pdf::compress_pdf(p, pdf_preset, &tmp, &cancel) {
+                Ok(pdf::PdfOutcome::Done(r)) => Ok((
+                    r.output_bytes,
+                    format!(
+                        "{} page(s), {}/{} image(s) re-encoded ({} downscaled), {} stream(s), {:.0}% smaller, {:.1}s",
+                        r.pages,
+                        r.images_recompressed,
+                        r.images,
+                        r.images_downscaled,
+                        r.streams_recompressed,
+                        (1.0 - r.ratio) * 100.0,
+                        r.elapsed_s
+                    ),
+                )),
+                Ok(pdf::PdfOutcome::NoGain { output_bytes }) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(format!(
+                        "no gain (rewritten {output_bytes} B, source {} B) - original kept",
+                        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+                    ))
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            match optimize::optimize_image(p, &tmp, level, &cancel) {
+                Ok(optimize::OptimizeOutcome::Done(r)) => Ok((
+                    r.output_bytes,
+                    format!(
+                        "{} ({}) {:.0}% smaller, {:.1}s",
+                        r.method,
+                        r.note,
+                        (1.0 - r.ratio) * 100.0,
+                        r.elapsed_s
+                    ),
+                )),
+                Ok(optimize::OptimizeOutcome::NoGain { output_bytes }) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(format!(
+                        "no gain (rewritten {output_bytes} B) - original kept"
+                    ))
+                }
+                Err(e) => Err(e),
+            }
+        };
+        match result {
+            Ok((bytes, note)) => match ffmpeg::place_output(p, &tmp, replace, &ext) {
+                Ok((delta, dest)) => {
+                    saved += delta;
+                    println!("  -> {} ({bytes} B): {note}", dest.display());
+                }
+                Err(e) => {
+                    eprintln!("  place failed: {e}");
+                    let _ = std::fs::remove_file(&tmp);
+                    failed += 1;
+                }
+            },
+            Err(e) if e.starts_with("no gain") => {
+                no_gain += 1;
+                println!("  skip: {e}");
+            }
+            Err(e) if e == "cancelled" => {
+                eprintln!("cancelled");
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("  failed: {e}");
+                let _ = std::fs::remove_file(&tmp);
+                failed += 1;
+            }
+        }
+    }
+    if saved > 0 {
+        println!("reclaimed {}", human_bytes(saved as u64));
+    }
+    if no_gain > 0 {
+        println!("{no_gain} file(s) already optimal - originals kept.");
+    }
+    if failed > 0 {
+        eprintln!("{failed} file(s) failed.");
         1
     } else {
         0

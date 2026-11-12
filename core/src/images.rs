@@ -612,18 +612,38 @@ pub fn plan_image(m: &MediaFile, preserve: bool) -> Result<ImageEncode, String> 
             ""
         };
         match ext.as_str() {
-            "jpg" | "jpeg" => ImageEncode {
-                target_ext: "jpg",
-                encoder: "mjpeg",
-                note: "re-encode jpeg".into(),
-                base_ratio: 0.75,
-                orientation: 1,
-                single_frame: true,
-                scalable: true,
-                palette: false,
-                ignore_quality: false,
-                out_pix: None,
-            },
+            "jpg" | "jpeg" => {
+                if preserve {
+                    // "Preserve format" means preserve pixels too: the
+                    // coefficient-domain rewrite is the only lossless way
+                    // to keep a JPEG a JPEG. No scaling, no quality slider.
+                    ImageEncode {
+                        target_ext: "jpg",
+                        encoder: "jpegtran",
+                        note: "jpeg lossless".into(),
+                        base_ratio: 0.88,
+                        orientation: 1,
+                        single_frame: true,
+                        scalable: false,
+                        palette: false,
+                        ignore_quality: true,
+                        out_pix: None,
+                    }
+                } else {
+                    ImageEncode {
+                        target_ext: "jpg",
+                        encoder: "mjpeg",
+                        note: "re-encode jpeg".into(),
+                        base_ratio: 0.75,
+                        orientation: 1,
+                        single_frame: true,
+                        scalable: true,
+                        palette: false,
+                        ignore_quality: false,
+                        out_pix: None,
+                    }
+                }
+            }
             "webp" => {
                 // WebP keeps alpha on re-encode, so no transparency check.
                 if !crate::convert::caps().has_encoder("libwebp") {
@@ -997,6 +1017,7 @@ fn quality_label(plan: &ImageEncode, cq: u32) -> String {
         "png" if plan.palette => "256c palette".into(),
         "png" => "lossless".into(),
         "tiff" => "deflate".into(),
+        "jpegtran" => "lossless".into(),
         _ => format!("q:v{}", jpeg_q_for(cq)),
     }
 }
@@ -1013,6 +1034,30 @@ pub fn encode_image(
     out_path: &Path,
     cancel: &AtomicBool,
 ) -> Result<ImageOutcome, String> {
+    // The lossless JPEG plan never reaches ffmpeg: the coefficient-domain
+    // rewrite writes the output and verifies it itself.
+    if plan.encoder == "jpegtran" {
+        let t0 = Instant::now();
+        match crate::optimize::optimize_image(
+            &m.path,
+            out_path,
+            crate::optimize::OptimizeLevel::Balanced,
+            cancel,
+        )? {
+            crate::optimize::OptimizeOutcome::Done(r) => {
+                return Ok(ImageOutcome::Done(ImageResult {
+                    encoder: "jpegtran".into(),
+                    quality: quality_label(plan, cq),
+                    output_bytes: r.output_bytes,
+                    elapsed_s: t0.elapsed().as_secs_f64().max(0.001),
+                    ratio: r.ratio,
+                }));
+            }
+            crate::optimize::OptimizeOutcome::NoGain { output_bytes } => {
+                return Ok(ImageOutcome::NoGain { output_bytes });
+            }
+        }
+    }
     let args = build_image_args(m, plan, cq, scale, out_path);
     crate::ffmpeg::ensure_output_dir(out_path)?;
     crate::ffmpeg::log::debug_log(&format!(
@@ -1324,6 +1369,9 @@ mod tests {
         let jpg = img("p.jpg", "yuvj420p", 800, 600, 1_000_000);
         let p = plan_image(&jpg, true).unwrap();
         assert_eq!(p.target_ext, "jpg");
+        assert_eq!(p.encoder, "jpegtran");
+        assert!(p.ignore_quality, "lossless JPEG ignores the slider");
+        assert!(!p.scalable, "lossless JPEG is not resampled");
         // Opaque rgb24 png: plain lossless re-encode prediction (~5%).
         let png = img("shot.png", "rgb24", 1920, 1080, 3_000_000);
         let p = plan_image(&png, true).unwrap();

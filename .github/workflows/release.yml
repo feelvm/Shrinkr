@@ -118,6 +118,27 @@ jobs:
           ) -DestinationPath "${{ env.ARCHIVE }}" -Force
           Get-ChildItem ${{ env.ARCHIVE }}
 
+      # Separate download from the zip: the zip stays the self-update
+      # asset (matched by target triple), while the setup exe is the
+      # user-facing Windows install. Its name deliberately omits the
+      # triple so the updater can never select it by mistake.
+      - name: Install Inno Setup (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          ./installer/windows/build-installer.ps1 `
+            -Version $version `
+            -SkipBuild `
+            -TargetTriple "${{ matrix.target }}" `
+            -FfmpegDir sidecars `
+            -OutputDir .
+
       # User-facing drag-to-install image. The zip above stays the
       # self-update asset (matched by target triple); the DMG is an
       # additional download. Sidecars live in Contents/MacOS/ next to
@@ -191,3 +212,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ github.ref_name }}" "shrinkr-${{ matrix.target }}.dmg" --clobber
+
+      - name: Publish installer (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release upload "${{ github.ref_name }}" "Shrinkr-Setup-${VERSION}-x64.exe" --clobber
