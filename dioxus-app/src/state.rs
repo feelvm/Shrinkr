@@ -1832,4 +1832,22 @@ mod tests {
         assert!(none.is_none());
         assert_eq!(dropped, 0);
     }
+
+    #[test]
+    fn optimize_item_status_tracks_work_and_no_gain() {
+        let mut item = OptimizeItem::new(
+            std::path::PathBuf::from("report.pdf"),
+            4096,
+            OptimizeKind::Pdf,
+        );
+        assert_eq!(item.status_text(), "queued");
+        assert!(item.runnable());
+        item.frac = 0.05;
+        assert_eq!(item.status_text(), "working");
+        item.done = true;
+        item.frac = 1.0;
+        item.no_gain = true;
+        assert_eq!(item.status_text(), "no gain");
+        assert!(!item.runnable());
+    }
 }
