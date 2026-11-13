@@ -361,11 +361,15 @@ pub struct AppState {
     /// similar synthetic grain is the trade for much smaller files on
     /// exactly the sources nothing else helps.
     pub film_grain: bool,
+    /// Keep subtitle tracks. Default true; Preserve quality forces it.
     pub keep_subs: bool,
     pub min_saving_pct: f64,
     pub skip_efficient: bool,
+    /// Keep every audio track. Default true; Preserve quality forces it.
     pub all_audio: bool,
     pub parallel: usize,
+    /// Replace originals after a verified encode. Default false: outputs
+    /// land beside the source, matching the README's safe-by-default rule.
     pub replace: bool,
     /// Opus target in bps for re-encoded audio (`None` = Off: keep all
     /// audio tracks as-is). Drives plan, estimate and encode together.
@@ -661,13 +665,13 @@ impl Default for AppState {
             image_scale: ScalePolicy::Preserve,
             image_preserve_format: true,
             film_grain: true,
-            keep_subs: false,
-            all_audio: false,
+            keep_subs: true,
+            all_audio: true,
             opus_bps: None,
             min_saving_pct: 10.0,
             skip_efficient: true,
             parallel: 2,
-            replace: true,
+            replace: false,
             extra_args: String::new(),
             target_text: "2x".into(),
             target_solving: false,
@@ -1831,6 +1835,21 @@ mod tests {
         let (none, dropped) = pop_next_segment(&mut s.pending, &skips);
         assert!(none.is_none());
         assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn default_settings_are_safe_and_match_the_readme() {
+        let s = AppState::default();
+        // Preserve quality is the GUI default...
+        assert!(s.preserve_quality);
+        // ...and the stored defaults already keep every track, so turning
+        // the mode off does not silently drop subtitles or extra audio.
+        assert!(s.keep_subs);
+        assert!(s.all_audio);
+        // Originals are kept unless the user explicitly opts into replace.
+        assert!(!s.replace);
+        assert!(!s.convert_replace);
+        assert!(!s.optimize_replace);
     }
 
     #[test]

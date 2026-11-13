@@ -597,8 +597,8 @@ pub struct EstParams {
     /// Opus target in bps (`Some(64000)` default). `None` = Off: keep
     /// every audio track as-is (stream copy, never re-encoded).
     pub opus_bps: Option<u32>,
-    /// Keep every audio track (dual-audio releases). Default false:
-    /// primary track only, the rest dropped.
+    /// Keep every audio track (dual-audio releases). Callers choose the
+    /// default; the GUI and CLI start with every track kept.
     pub all_audio: bool,
     /// Still-image quality on the same 18–40 CQ scale, kept separate from
     /// the video slider: an image batch has no use for NVENC CQ, and a

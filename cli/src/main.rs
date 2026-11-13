@@ -57,7 +57,9 @@ fn cli_help() -> String {
      \u{20}                      drop, near-lossless 256-color palettes), tiff→tiff\n\
      \u{20}                      (deflate); conversions off (default: off)\n\
      --keep-subs / --no-subs  subtitle copy (default keep)\n\
-     --all-audio              keep every audio track (default: primary only)\n\
+     --all-audio / --primary-audio\n\
+     \u{20}                      keep every audio track (default) or only the\n\
+     \u{20}                      primary one\n\
      --audio <off|8-512>       Opus kbps, off keeps as-is (default 64, max 512)\n\
      --film-grain / --no-film-grain\n\
      \u{20}                      AV1 film-grain synthesis on grainy sources\n\
@@ -92,7 +94,7 @@ fn parse_cli() -> i32 {
     let mut image_scale: Option<ScalePolicy> = None;
     let mut image_preserve = false;
     let mut keep_subs = true;
-    let mut all_audio = false;
+    let mut all_audio = true;
     let mut opus_bps: Option<u32> = Some(pipeline::DEFAULT_OPUS_BPS);
     let mut film_grain = true;
     let mut extra_args_raw = String::new();
@@ -229,6 +231,7 @@ fn parse_cli() -> i32 {
             "--keep-subs" => keep_subs = true,
             "--no-subs" => keep_subs = false,
             "--all-audio" => all_audio = true,
+            "--primary-audio" => all_audio = false,
             "--film-grain" => film_grain = true,
             "--no-film-grain" => film_grain = false,
             "--audio" => {
