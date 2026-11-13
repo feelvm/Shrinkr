@@ -1047,6 +1047,9 @@ fn PipelineCard() -> Element {
     // for a folder of photos.
     let has_video = s.has_videos();
     let has_image = s.has_images();
+    // Same total the Estimate card reports, lifted into the header so the
+    // source → output number stays visible while tuning the pipeline.
+    let (est_in, est_out, _, _) = s.estimate();
     drop(s);
     let cq_label = if preserve_quality {
         "Auto".to_string()
@@ -1061,6 +1064,14 @@ fn PipelineCard() -> Element {
     );
     let saving_label = format!("{min_saving:.0}");
     let parallel_label = format!("{parallel}");
+    let estimate_label = (est_in > 0).then(|| {
+        format!(
+            "{} → {} • {}",
+            human_bytes(est_in),
+            human_bytes(est_out),
+            size_change_label(est_in, est_out)
+        )
+    });
     // Capability gating: hardware backends this machine can't run are
     // absent from the dropdown entirely (detection trials the AV1
     // variants with the real flag set) — the menu never offers an option
@@ -1069,7 +1080,14 @@ fn PipelineCard() -> Element {
     rsx! {
         Card {
             CardHeader {
-                CardTitle { "Pipeline" }
+                div { class: "flex w-full items-center justify-between gap-3",
+                    CardTitle { "Pipeline" }
+                    if let Some(label) = estimate_label {
+                        span { class: "text-right text-xs text-muted-foreground tabular-nums",
+                            "{label}"
+                        }
+                    }
+                }
             }
             CardContent {
                 div { class: "flex flex-col gap-4",
