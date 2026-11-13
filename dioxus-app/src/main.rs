@@ -1048,7 +1048,11 @@ fn PipelineCard() -> Element {
     let has_video = s.has_videos();
     let has_image = s.has_images();
     drop(s);
-    let cq_label = format!("{cq}");
+    let cq_label = if preserve_quality {
+        "Auto".to_string()
+    } else {
+        format!("{cq}")
+    };
     let image_cq_label = format!("{image_cq}");
     let image_quality_note = format!(
         "Maps to JPEG q{} / WebP q{} — lower = smaller files.",
@@ -1087,7 +1091,8 @@ fn PipelineCard() -> Element {
                             select {
                                 class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
                                 onchange: move |e: FormEvent| {
-                                    state.write().backend = match e.value().as_str() {
+                                    let mut w = state.write();
+                                    w.backend = match e.value().as_str() {
                                         "av1-nvenc" => VideoBackend::Av1Nvenc,
                                         "hevc" => VideoBackend::HevcNvenc,
                                         "h264" => VideoBackend::H264Nvenc,
@@ -1102,6 +1107,17 @@ fn PipelineCard() -> Element {
                                         "copy" => VideoBackend::CopyVideo,
                                         _ => VideoBackend::Auto,
                                     };
+                                    // P7–P9 are SVT-only effort steps. Leaving
+                                    // one selected on a hardware encoder would
+                                    // show the wrong option and clamp silently.
+                                    if w.backend != VideoBackend::CpuAv1
+                                        && matches!(
+                                            w.nvenc_preset,
+                                            NvencPreset::P7 | NvencPreset::P8 | NvencPreset::P9
+                                        )
+                                    {
+                                        w.nvenc_preset = NvencPreset::P6;
+                                    }
                                 },
                                 // Hardware backends appear only when this
                                 // machine can actually run them (detection
@@ -1150,6 +1166,9 @@ fn PipelineCard() -> Element {
                                         "p3" => NvencPreset::P3,
                                         "p4" => NvencPreset::P4,
                                         "p6" => NvencPreset::P6,
+                                        "p7" => NvencPreset::P7,
+                                        "p8" => NvencPreset::P8,
+                                        "p9" => NvencPreset::P9,
                                         _ => NvencPreset::P5,
                                     };
                                 },
@@ -1157,6 +1176,14 @@ fn PipelineCard() -> Element {
                                 option { value: "p4", selected: preset == NvencPreset::P4, "P4 (medium)" }
                                 option { value: "p5", selected: preset == NvencPreset::P5, "P5 (slow)" }
                                 option { value: "p6", selected: preset == NvencPreset::P6, "P6 (slower)" }
+                                // SVT-only effort steps: presets 6/5/4 are
+                                // minutes-per-minute encodes, so they appear
+                                // only on the backend that honours them.
+                                if backend == VideoBackend::CpuAv1 {
+                                    option { value: "p7", selected: preset == NvencPreset::P7, "P7 (SVT 6)" }
+                                    option { value: "p8", selected: preset == NvencPreset::P8, "P8 (SVT 5)" }
+                                    option { value: "p9", selected: preset == NvencPreset::P9, "P9 (SVT 4)" }
+                                }
                             }
                         }
                         div { class: "flex flex-col gap-1",
@@ -1555,7 +1582,7 @@ fn GoalPicker() -> Element {
                         }
                     }
                     None => GoalSub {
-                        main: format!("no gain{}", if preserve_quality { " at CQ 18" } else { "" }),
+                        main: "no gain".to_string(),
                         // Not a size value — inherits the line's tone.
                         main_cls: "",
                         rest: format!(

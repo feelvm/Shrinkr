@@ -1,7 +1,7 @@
 //! Real encoder checks; run explicitly with FFmpeg installed:
 //! cargo test -p shrinkr-core --test preserve_quality -- --ignored
 
-use shrinkr_core::{media::probe_file, process::cmd, quality};
+use shrinkr_core::{media::probe_file, pipeline::ScalePolicy, process::cmd, quality};
 use std::path::Path;
 use std::sync::{atomic::AtomicBool, Arc};
 
@@ -99,4 +99,47 @@ fn accepts_clean_downscaling_and_rejects_damage_growth_and_audio_loss() {
     assert!(quality::verify(&media, &output, &cancel)
         .unwrap_err()
         .contains("not smaller"));
+}
+
+#[test]
+#[ignore = "requires FFmpeg; cuts samples and encodes real candidates"]
+fn auto_quality_finds_a_passing_cq_from_real_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("search.mkv");
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x240:rate=24:duration=12",
+        "-c:v",
+        "ffv1",
+        source.to_str().unwrap(),
+    ]);
+    let media = probe_file(&source).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let found = quality::auto_cq(
+        &media,
+        shrinkr_core::pipeline::VideoBackend::CpuX264,
+        shrinkr_core::pipeline::NvencPreset::P5,
+        ScalePolicy::Preserve,
+        false,
+        shrinkr_core::hw::caps(),
+        dir.path(),
+        &cancel,
+    )
+    .expect("a passing candidate exists");
+    assert!(
+        (quality::VIDEO_CQ + 1..=quality::MAX_SEARCH_CQ).contains(&found.cq),
+        "{}",
+        found.cq
+    );
+    assert!(found.sample_ssim >= 0.992, "{}", found.sample_ssim);
+    assert!(found.probes > 0);
+    // Search cleaned up its staging folder.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("auto-quality-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }

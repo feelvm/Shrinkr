@@ -489,11 +489,14 @@ pub fn build_args(
             // SVT-AV1 software encode (the Ryzen path on RTX 30 boxes —
             // Ampere has no AV1 NVENC). The shared P knob maps to SVT's
             // preset scale (P5 = 8, the sweet spot; each step trades
-            // speed for size). CRF comes from the shared CQ slider
-            // (28 ≈ high quality, 32–38 = shrink territory). 10-bit
-            // sources stay 10-bit. Dense/grainy sources get film-grain
-            // synthesis: denoise, encode the clean picture, regenerate
-            // statistically-similar grain at decode time.
+            // speed for size; P7–P9 reach presets 6–4). CRF comes from
+            // the shared CQ slider (28 ≈ high quality, 32–38 = shrink
+            // territory). Always encode 10-bit: the extra precision
+            // costs almost nothing, avoids banding in gradients, and
+            // lets the search spend fewer bits for the same SSIM. Dense/
+            // grainy sources get film-grain synthesis: denoise, encode
+            // the clean picture, regenerate statistically-similar grain
+            // at decode time.
             a.push("-c:v".into());
             a.push("libsvtav1".into());
             a.push("-crf".into());
@@ -504,10 +507,8 @@ pub fn build_args(
                 a.push("-svtav1-params".into());
                 a.push("film-grain=8:film-grain-denoise=1".into());
             }
-            if media.bit_depth >= 10 {
-                a.push("-pix_fmt".into());
-                a.push("yuv420p10le".into());
-            }
+            a.push("-pix_fmt".into());
+            a.push("yuv420p10le".into());
         }
         Level::CopyVideo => {
             // Audio-only pass: video bytes untouched. No encoder flags at
@@ -764,17 +765,25 @@ pub fn sweep_stale_work_roots() {
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
-            if !meta.is_file() {
-                continue;
-            }
             let stale = meta
                 .modified()
                 .ok()
                 .and_then(|m| m.elapsed().ok())
                 .map(|age| age.as_secs() > 24 * 60 * 60)
                 .unwrap_or(false);
-            if stale {
+            if !stale {
+                continue;
+            }
+            if meta.is_file() {
                 let _ = std::fs::remove_file(entry.path());
+            } else if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("auto-quality-")
+            {
+                // A crashed quality search leaves its sample folder behind;
+                // these are staging-only and safe to delete after a day.
+                let _ = std::fs::remove_dir_all(entry.path());
             }
         }
     }
@@ -950,6 +959,119 @@ pub fn run_with_fallback(
         .collect::<Vec<_>>()
         .join("  âŸ¶  ");
     Err(format!("all backends failed: {chain}"))
+}
+
+/// Copy one contiguous video segment into a reference file for the
+/// automatic-quality search. Stream copy keeps the sample bit-identical to
+/// the source (no generation loss in the reference) and avoids decoding the
+/// whole file just to cut a few seconds out of it.
+pub fn extract_video_sample(
+    media: &MediaFile,
+    start: f64,
+    duration: f64,
+    out_path: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    ensure_output_dir(out_path)?;
+    let args = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-nostats".into(),
+        "-ss".into(),
+        format!("{start:.3}"),
+        "-t".into(),
+        format!("{duration:.3}"),
+        "-i".into(),
+        media.path.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-an".into(),
+        "-sn".into(),
+        "-dn".into(),
+        "-c:v".into(),
+        "copy".into(),
+        "-map_metadata".into(),
+        "-1".into(),
+        out_path.to_string_lossy().into_owned(),
+    ];
+    let outcome = crate::process::run_with_progress(
+        crate::process::cmd("ffmpeg").args(&args),
+        cancel,
+        true,
+        |_| {},
+    )?;
+    if !outcome.status.success() {
+        let _ = std::fs::remove_file(out_path);
+        return Err(format!(
+            "sample extraction failed: {}",
+            error_snippet(&outcome.stderr_tail, outcome.status)
+        ));
+    }
+    Ok(())
+}
+
+/// Encode one sample with the same encoder/preset/scale/film-grain flags as
+/// the real job. The search only needs a relative quality reading, so audio
+/// and subtitles are omitted; the full encode still goes through the
+/// ordinary backend fallback ladder.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_sample(
+    media: &MediaFile,
+    out_path: &Path,
+    backend: VideoBackend,
+    preset: NvencPreset,
+    cq: u32,
+    scale: ScalePolicy,
+    film_grain: bool,
+    caps: &HwCaps,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let level = crate::pipeline::select_levels_for_media(backend, caps, media)
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no backend levels available".to_string())?;
+    let plan = StreamPlan {
+        has_audio: false,
+        copy_subs: false,
+        audio_copy_eligible: false,
+        audio_codec: crate::pipeline::AudioCodec::Copy,
+        opus_bps: None,
+        all_audio: false,
+        force_aac: false,
+        force_audio: false,
+        audio_layout_note: "",
+    };
+    ensure_output_dir(out_path)?;
+    let args = build_args(
+        media,
+        level,
+        preset,
+        cq,
+        scale,
+        false,
+        out_path,
+        &plan,
+        &[],
+        caps,
+        film_grain,
+    );
+    let outcome = crate::process::run_with_progress(
+        crate::process::cmd("ffmpeg").args(&args),
+        cancel,
+        true,
+        |_| {},
+    )?;
+    if !outcome.status.success() {
+        let _ = std::fs::remove_file(out_path);
+        return Err(format!(
+            "sample encode failed: {}",
+            error_snippet(&outcome.stderr_tail, outcome.status)
+        ));
+    }
+    Ok(())
 }
 
 /// True when libopus choked on the channel layout (exotic surround the
@@ -2099,6 +2221,14 @@ mod tests {
         };
         assert!(mk(&lean, NvencPreset::P5, true).contains("-preset 8"));
         assert!(mk(&lean, NvencPreset::P3, true).contains("-preset 10"));
+        assert!(mk(&lean, NvencPreset::P9, false).contains("-preset 4"));
+        // 8-bit sources are encoded 10-bit on purpose: cleaner gradients,
+        // fewer bits for the same SSIM, and the quality gate accepts the
+        // higher output depth.
+        let mut eight_bit = lean.clone();
+        eight_bit.bit_depth = 8;
+        let up = mk(&eight_bit, NvencPreset::P5, false);
+        assert!(up.contains("-pix_fmt yuv420p10le"), "{up}");
         // Dense 30 Mbps 4K source with FGS on: parameters present.
         let args = mk(&test_media(), NvencPreset::P5, true);
         assert!(args.contains("film-grain=8:film-grain-denoise=1"), "{args}");

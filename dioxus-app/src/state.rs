@@ -52,9 +52,9 @@ impl Goal {
     /// bigger). Balanced rides AV1 NVENC where the trial encode passed
     /// (RTX 40/50): same speed class as HEVC NVENC, meaningfully smaller —
     /// free savings for the default goal, HEVC anywhere else for playback
-    /// compatibility. Smallest means smallest output, period: SVT-AV1 is
-    /// the most compression-efficient encoder in the toolbox (software,
-    /// so slow — that's the cost the name admits), falling back through
+    /// compatibility. Smallest means smallest output, period: SVT-AV1 preset
+    /// 6 is the most compression-efficient encoder in the toolbox (software,
+    /// so very slow — that's the cost the name admits), falling back through
     /// the hardware AV1/HEVC encoders to whatever this machine has.
     pub fn resolve(&self, caps: &HwCaps) -> (VideoBackend, NvencPreset, u32) {
         match self {
@@ -68,7 +68,7 @@ impl Goal {
             }
             Goal::Smallest => {
                 if caps.svt_av1 {
-                    (VideoBackend::CpuAv1, NvencPreset::P5, 32)
+                    (VideoBackend::CpuAv1, NvencPreset::P7, 32)
                 } else if caps.av1_nvenc_usable {
                     (VideoBackend::Av1Nvenc, NvencPreset::P6, 32)
                 } else if caps.hevc_nvenc {
@@ -116,7 +116,9 @@ impl Goal {
     }
 }
 
-/// Conservative starting quality; measured verification decides what is kept.
+/// Conservative fallback quality for a Preserve quality batch. The job
+/// samples stronger settings per file and uses this only when the search
+/// cannot run or its choice misses the full-file gate.
 pub const PRESERVE_QUALITY_CQ: u32 = shrinkr_core::quality::VIDEO_CQ;
 
 /// Measured-fps table for wall-time estimates. Shared by the batch
@@ -792,6 +794,8 @@ impl AppState {
 
     /// Quality protection leaves resolution and the requested audio target
     /// editable. The target is checked per file by EstParams::for_media.
+    /// The pinned CQ is the estimator baseline and the full-encode retry
+    /// value; the job searches stronger settings from short samples.
     fn apply_preserve_quality(&self, p: &mut EstParams) {
         if !self.preserve_quality {
             return;
@@ -1397,7 +1401,7 @@ mod tests {
         );
         assert_eq!(
             Goal::Smallest.resolve(&nv40),
-            (VideoBackend::CpuAv1, NvencPreset::P5, 32)
+            (VideoBackend::CpuAv1, NvencPreset::P7, 32)
         );
         // Same box without SVT in the build: Smallest takes AV1 NVENC.
         nv40.svt_av1 = false;
@@ -1441,7 +1445,7 @@ mod tests {
         mac.svt_av1 = true;
         assert_eq!(
             Goal::Smallest.resolve(&mac),
-            (VideoBackend::CpuAv1, NvencPreset::P5, 32)
+            (VideoBackend::CpuAv1, NvencPreset::P7, 32)
         );
     }
 

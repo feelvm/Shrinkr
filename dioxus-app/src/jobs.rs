@@ -40,7 +40,18 @@ pub enum JobMsg {
         frac: f64,
         fps: f64,
     },
+    /// A retry (or the first real encode after quality sampling) starts
+    /// from zero; progress fractions otherwise only move forward.
+    ExecRestart {
+        job: usize,
+    },
     ExecCheckingQuality {
+        job: usize,
+        name: String,
+    },
+    /// Preserve-quality mode measured short sample encodes before the real
+    /// one; the row keeps its place and the log says what is happening.
+    ExecSearchingQuality {
         job: usize,
         name: String,
     },
@@ -332,54 +343,93 @@ fn run_one_job(
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string();
-    let r = be.encode(
-        &f,
-        &tmp_out,
-        params.backend,
-        params.preset,
-        params.cq,
-        params.scale,
-        keep_subs,
-        &extra_args,
-        params.opus_bps,
-        params.all_audio,
-        params.film_grain,
-        &|p| {
-            // frac>=0 carries position; fps-only lines (frac<0) refresh
-            // the rate while keeping the last position.
-            send(
-                tx,
-                JobMsg::ExecProgress {
-                    job: job_idx,
-                    frac: p.frac,
-                    fps: p.fps,
-                },
-            );
-        },
-        cancel,
-    );
-    let er = r?;
-    // The preflight estimate is only a prediction. Never replace a source
-    // with a file that isn't actually smaller — warn mode deliberately
-    // queues below-threshold files, and the no-gain guard keeps that safe.
-    // Unprotected audio-only passes are the exception: video is copied untouched
-    // and the audio was re-encoded on request, so a larger file is the
-    // intended result, not a failed encode.
-    if (params.preserve_quality
-        || params.backend != shrinkr_core::pipeline::VideoBackend::CopyVideo)
-        && er.output_bytes >= f.bytes
-    {
-        let _ = std::fs::remove_file(&tmp_out);
-        return Ok(JobOutcome::NoGain {
-            detail: format!(
-                "skip {fname}: no gain — encoded {} but the source is {}; original kept. \
-                 Re-encoding already-compressed video usually grows it.",
-                human_bytes(er.output_bytes),
-                human_bytes(f.bytes)
-            ),
-        });
-    }
-    let quality_note = if params.preserve_quality {
+    // Preserve quality no longer fixes CRF 18 for everyone. Encode a few
+    // short windows at increasing CQ and keep the strongest one that still
+    // clears a slightly stricter sample gate; the complete video is then
+    // verified exactly as before. Anything unsupported or too short falls
+    // back to the conservative fixed value.
+    let searched = params.preserve_quality
+        && params.backend != shrinkr_core::pipeline::VideoBackend::CopyVideo;
+    let auto = if searched {
+        send(
+            tx,
+            JobMsg::ExecSearchingQuality {
+                job: job_idx,
+                name: fname.clone(),
+            },
+        );
+        let found = shrinkr_core::quality::auto_cq(
+            &f,
+            params.backend,
+            params.preset,
+            params.scale,
+            params.film_grain,
+            shrinkr_core::hw::caps(),
+            tmp_root,
+            cancel,
+        );
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        found
+    } else {
+        None
+    };
+    let mut cq = auto.map_or(params.cq, |a| a.cq);
+    send(tx, JobMsg::ExecRestart { job: job_idx });
+    let mut retried = false;
+    let (er, score) = loop {
+        let r = be.encode(
+            &f,
+            &tmp_out,
+            params.backend,
+            params.preset,
+            cq,
+            params.scale,
+            keep_subs,
+            &extra_args,
+            params.opus_bps,
+            params.all_audio,
+            params.film_grain,
+            &|p| {
+                // frac>=0 carries position; fps-only lines (frac<0) refresh
+                // the rate while keeping the last position.
+                send(
+                    tx,
+                    JobMsg::ExecProgress {
+                        job: job_idx,
+                        frac: p.frac,
+                        fps: p.fps,
+                    },
+                );
+            },
+            cancel,
+        );
+        let er = r?;
+        // The preflight estimate is only a prediction. Never replace a
+        // source with a file that isn't actually smaller — warn mode
+        // deliberately queues below-threshold files, and the no-gain guard
+        // keeps that safe. Unprotected audio-only passes are the exception:
+        // video is copied untouched and the audio was re-encoded on
+        // request, so a larger file is the intended result, not a failed
+        // encode.
+        if (params.preserve_quality
+            || params.backend != shrinkr_core::pipeline::VideoBackend::CopyVideo)
+            && er.output_bytes >= f.bytes
+        {
+            let _ = std::fs::remove_file(&tmp_out);
+            return Ok(JobOutcome::NoGain {
+                detail: format!(
+                    "skip {fname}: no gain — encoded {} but the source is {}; original kept. \
+                     Re-encoding already-compressed video usually grows it.",
+                    human_bytes(er.output_bytes),
+                    human_bytes(f.bytes)
+                ),
+            });
+        }
+        if !params.preserve_quality {
+            break (er, None);
+        }
         send(
             tx,
             JobMsg::ExecCheckingQuality {
@@ -388,19 +438,48 @@ fn run_one_job(
             },
         );
         match shrinkr_core::quality::verify(&f, &tmp_out, cancel) {
-            Ok(score) => format!(", quality checked (SSIM {score:.4})"),
+            Ok(score) => break (er, Some(score)),
             Err(reason) => {
                 let _ = std::fs::remove_file(&tmp_out);
                 if cancel.load(Ordering::Relaxed) {
                     return Err("cancelled".into());
+                }
+                // The sample gate sits above the full-file gate, but a
+                // whole film can still fail where three windows passed.
+                // Retry once at the old conservative baseline instead of
+                // discarding a file the user asked to protect.
+                if !retried
+                    && cq > shrinkr_core::quality::VIDEO_CQ
+                    && reason.contains("video differs too much")
+                    && params.backend != shrinkr_core::pipeline::VideoBackend::CopyVideo
+                {
+                    retried = true;
+                    send(
+                        tx,
+                        JobMsg::ExecWarn {
+                            msg: format!(
+                                "warn {fname}: auto CRF {cq} missed the full-file gate ({reason}); \
+                                 retrying at CRF {}",
+                                shrinkr_core::quality::VIDEO_CQ
+                            ),
+                        },
+                    );
+                    cq = shrinkr_core::quality::VIDEO_CQ;
+                    send(tx, JobMsg::ExecRestart { job: job_idx });
+                    continue;
                 }
                 return Ok(JobOutcome::Skipped {
                     detail: format!("skip {fname}: quality protection — {reason}; original kept"),
                 });
             }
         }
-    } else {
-        String::new()
+    };
+    let quality_note = match score {
+        Some(score) if auto.is_some_and(|a| a.cq == cq) => {
+            format!(", quality checked (SSIM {score:.4}, auto CRF {cq})")
+        }
+        Some(score) => format!(", quality checked (SSIM {score:.4})"),
+        None => String::new(),
     };
     if cancel.load(Ordering::Relaxed) {
         let _ = std::fs::remove_file(&tmp_out);
@@ -1633,6 +1712,22 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             start_pending_scan(&mut s);
         }
         JobMsg::ExecWarn { msg } => s.push_log(msg),
+        JobMsg::ExecSearchingQuality { job, name } => {
+            if let Some(item) = s.exec_items.get_mut(job) {
+                item.checking_quality = true;
+                item.fps = 0.0;
+            }
+            s.push_log(format!(
+                "Finding the smallest encode that keeps {name}'s quality…"
+            ));
+        }
+        JobMsg::ExecRestart { job } => {
+            if let Some(item) = s.exec_items.get_mut(job) {
+                item.frac = 0.0;
+                item.fps = 0.0;
+                item.checking_quality = false;
+            }
+        }
         JobMsg::ExecProgress { job, frac, fps } => {
             // Path cloned before the item borrows, so the skip-set fixup
             // below the borrows can get to it.
@@ -2235,5 +2330,79 @@ mod regression_tests {
         assert_eq!(completed, [11]);
         assert!(!cancel.load(Ordering::Relaxed));
         assert!(source.exists());
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg; runs the preserve-quality search end to end"]
+    fn preserve_quality_search_encodes_and_places_a_checked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("auto-quality-source.mkv");
+        let output = shrinkr_core::process::cmd("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=24:duration=12",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let media = probe_file(&source).unwrap();
+        let mut params = crate::state::AppState::default().est_params();
+        params.backend = shrinkr_core::pipeline::VideoBackend::CpuX264;
+        params.preset = shrinkr_core::pipeline::NvencPreset::P5;
+        params.opus_bps = None;
+        params.film_grain = false;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = futures_channel::mpsc::unbounded();
+        let outcome = run_one_job(
+            &tx,
+            media,
+            params,
+            false,
+            0.0,
+            ThresholdPolicy::Warn,
+            dir.path(),
+            0,
+            false,
+            vec![],
+            &cancel,
+        )
+        .unwrap();
+        let mut searched = false;
+        let mut restarted = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                JobMsg::ExecSearchingQuality { .. } => searched = true,
+                JobMsg::ExecRestart { .. } => restarted = true,
+                _ => {}
+            }
+        }
+        assert!(searched && restarted);
+        match outcome {
+            JobOutcome::Placed { detail, .. } => {
+                assert!(detail.contains("auto CRF"), "{detail}");
+                assert!(detail.contains("quality checked"), "{detail}");
+            }
+            JobOutcome::NoGain { detail } | JobOutcome::Skipped { detail } => {
+                panic!("expected a placed file: {detail}")
+            }
+        }
+        let placed: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "mkv"))
+            .filter(|e| e.path() != source)
+            .collect();
+        assert_eq!(placed.len(), 1, "{placed:?}");
     }
 }

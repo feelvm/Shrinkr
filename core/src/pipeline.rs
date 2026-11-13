@@ -99,14 +99,20 @@ impl VideoBackend {
     }
 }
 
-/// NVENC P-series presets. P3–P6 are the benchmark matrix; P1/P2/P7 are
-/// accepted for completeness but not benchmarked by default.
+/// Shared encoder-preset knob. P3–P6 are the benchmark matrix. P7–P9
+/// exist for SVT-AV1's slower presets (6/5/4): the software encoder keeps
+/// buying a few percent at each step, which is exactly what the Smallest
+/// goal is for. Hardware encoders clamp P8/P9 to NVENC's own P7, the
+/// slowest preset their API accepts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NvencPreset {
     P3,
     P4,
     P5,
     P6,
+    P7,
+    P8,
+    P9,
 }
 
 impl NvencPreset {
@@ -124,6 +130,7 @@ impl NvencPreset {
             NvencPreset::P4 => "p4",
             NvencPreset::P5 => "p5",
             NvencPreset::P6 => "p6",
+            NvencPreset::P7 | NvencPreset::P8 | NvencPreset::P9 => "p7",
         }
     }
     pub fn label(&self) -> &'static str {
@@ -132,6 +139,9 @@ impl NvencPreset {
             NvencPreset::P4 => "P4 (medium, NVENC default)",
             NvencPreset::P5 => "P5 (slow, good quality)",
             NvencPreset::P6 => "P6 (slower, better quality)",
+            NvencPreset::P7 => "P7 (SVT 6, much slower)",
+            NvencPreset::P8 => "P8 (SVT 5, very slow)",
+            NvencPreset::P9 => "P9 (SVT 4, overnight)",
         }
     }
 
@@ -145,6 +155,9 @@ impl NvencPreset {
             NvencPreset::P4 => 9,
             NvencPreset::P5 => 8,
             NvencPreset::P6 => 7,
+            NvencPreset::P7 => 6,
+            NvencPreset::P8 => 5,
+            NvencPreset::P9 => 4,
         }
     }
 
@@ -155,6 +168,7 @@ impl NvencPreset {
             NvencPreset::P4 => "faster",
             NvencPreset::P5 => "medium",
             NvencPreset::P6 => "slow",
+            NvencPreset::P7 | NvencPreset::P8 | NvencPreset::P9 => "slower",
         }
     }
 
@@ -163,7 +177,11 @@ impl NvencPreset {
         match self {
             NvencPreset::P3 => "speed",
             NvencPreset::P4 => "balanced",
-            NvencPreset::P5 | NvencPreset::P6 => "quality",
+            NvencPreset::P5
+            | NvencPreset::P6
+            | NvencPreset::P7
+            | NvencPreset::P8
+            | NvencPreset::P9 => "quality",
         }
     }
 }
@@ -588,7 +606,8 @@ pub fn x264_ratio_for(vcodec: &str) -> f64 {
 #[derive(Clone, Copy, Debug)]
 pub struct EstParams {
     /// Conservative video encode, protected audio, and a measured quality
-    /// check before placement. Still-image settings remain independent.
+    /// check before placement. The GUI searches stronger settings from
+    /// samples and uses `cq` only as the fallback estimate/retry value.
     pub preserve_quality: bool,
     pub backend: VideoBackend,
     pub preset: NvencPreset,
@@ -746,6 +765,10 @@ pub fn preset_factor(backend: VideoBackend, preset: NvencPreset) -> f64 {
             NvencPreset::P4 => 1.04,
             NvencPreset::P5 => 1.0,
             NvencPreset::P6 => 0.96,
+            // Hardware clamps the SVT-only settings to its slowest preset;
+            // the estimate follows the filename, not a knob the encoder
+            // cannot honour.
+            NvencPreset::P7 | NvencPreset::P8 | NvencPreset::P9 => 0.94,
         },
     }
 }
@@ -2444,10 +2467,16 @@ mod tests {
         let presets = NvencPreset::all_bench().map(|p| p.svt());
         assert_eq!(presets, [10, 9, 8, 7]);
         assert!(presets.windows(2).all(|pair| pair[0] > pair[1]));
+        // The SVT-only effort steps: each is one preset slower and smaller.
+        assert_eq!(NvencPreset::P7.svt(), 6);
+        assert_eq!(NvencPreset::P8.svt(), 5);
+        assert_eq!(NvencPreset::P9.svt(), 4);
+        assert_eq!(NvencPreset::P8.as_str(), "p7");
         assert_eq!(NvencPreset::P5.qsv(), "medium");
         assert_eq!(NvencPreset::P3.qsv(), "veryfast");
         assert_eq!(NvencPreset::P4.amf(), "balanced");
         assert_eq!(NvencPreset::P6.amf(), "quality");
+        assert_eq!(NvencPreset::P9.qsv(), "slower");
     }
 
     #[test]
