@@ -1599,10 +1599,13 @@ fn GoalPicker() -> Element {
     rsx! {
         div { class: "flex flex-col gap-1",
             p { class: "text-xs font-semibold text-muted-foreground", "Goal" }
-            div { class: "inline-flex w-fit divide-x divide-border overflow-hidden rounded-md border border-input",
+            // Equal grid tracks, not content-sized flex items: the
+            // estimate line changes with every setting, and the control
+            // must not breathe in and out as it does.
+            div { class: "grid w-full grid-cols-3 divide-x divide-border overflow-hidden rounded-md border border-input",
                 for (goal, active, line) in segs {
                     {
-                        let base = "flex min-w-32 flex-col items-center gap-0.5 px-4 py-2 text-sm transition-colors";
+                        let base = "flex min-w-0 flex-col items-center gap-0.5 px-3 py-2 text-center text-sm transition-colors";
                         let seg_cls = if active {
                             format!("{base} bg-primary text-primary-foreground")
                         } else {
