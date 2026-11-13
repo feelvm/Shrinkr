@@ -648,50 +648,72 @@ fn cli_shrink(
         if dry_run {
             continue;
         }
-        // NOTE: benchmark matrix varies the preset; shrink uses P5.
-        let r = be.encode(
-            &m,
-            &tmp_out,
-            backend,
-            NvencPreset::P5,
-            file_cq,
-            scale,
-            keep_subs,
-            &extra_args,
-            opus_bps,
-            all_audio,
-            grain_strength,
-            &|_| {},
-            &cancel,
-        );
-        let er = match r {
-            Ok(er) => er,
-            Err(e) => {
-                println!("  FAIL: {e}");
-                failed += 1;
-                continue;
-            }
-        };
-        // Same rule as the GUI: never place — or with --replace overwrite —
-        // a source with a result that isn't actually smaller. Re-encoding an
-        // already-encoded file usually grows it. Audio-only passes are the
-        // exception: the video is copied and the audio re-encoded on
-        // request, so a bigger file is the intended outcome.
-        if backend != VideoBackend::CopyVideo && er.output_bytes >= m.bytes {
-            let _ = std::fs::remove_file(&tmp_out);
-            println!(
-                "  SKIP: encoded result is {} but the source is {} — original kept \
-                 (re-encoding an already-efficient file usually grows it)",
-                human_bytes(er.output_bytes),
-                human_bytes(m.bytes)
+        // Max-shrink SVT gets stronger CRFs when the chosen one grows the
+        // file; every other backend reports no gain and keeps the original.
+        let mut gain_retries = 0u32;
+        let encoded = loop {
+            // NOTE: benchmark matrix varies the preset; shrink uses P5.
+            let r = be.encode(
+                &m,
+                &tmp_out,
+                backend,
+                NvencPreset::P5,
+                file_cq,
+                scale,
+                keep_subs,
+                &extra_args,
+                opus_bps,
+                all_audio,
+                grain_strength,
+                &|_| {},
+                &cancel,
             );
-            skipped_no_gain += 1;
-            continue;
-        }
+            let er = match r {
+                Ok(er) => er,
+                Err(e) => {
+                    println!("  FAIL: {e}");
+                    failed += 1;
+                    break None;
+                }
+            };
+            // Same rule as the GUI: never place — or with --replace overwrite —
+            // a source with a result that isn't actually smaller. Re-encoding an
+            // already-encoded file usually grows it. Audio-only passes are the
+            // exception: the video is copied and the audio re-encoded on
+            // request, so a bigger file is the intended outcome.
+            if backend != VideoBackend::CopyVideo && er.output_bytes >= m.bytes {
+                let _ = std::fs::remove_file(&tmp_out);
+                if let Some(next) = pipeline::gain_retry_cq(backend, file_cq, false, gain_retries) {
+                    println!(
+                        "  no gain at CRF {file_cq} ({} vs {}); retrying at CRF {next}",
+                        human_bytes(er.output_bytes),
+                        human_bytes(m.bytes)
+                    );
+                    file_cq = next;
+                    gain_retries += 1;
+                    continue;
+                }
+                println!(
+                    "  SKIP: encoded result is {} but the source is {} — original kept \
+                     (re-encoding an already-efficient file usually grows it)",
+                    human_bytes(er.output_bytes),
+                    human_bytes(m.bytes)
+                );
+                skipped_no_gain += 1;
+                break None;
+            }
+            break Some(er);
+        };
+        let Some(er) = encoded else { continue };
+        let gain_note = if gain_retries > 0 {
+            format!(" (raised to CRF {file_cq} after a no-gain attempt)")
+        } else {
+            String::new()
+        };
         match ffmpeg::place_output(&m.path, &tmp_out, replace, "mkv") {
             Ok((saved, dest)) => match probe_file(&dest) {
                 Ok(vf) => println!(
-                    "  DONE: {} → {} ({:.0}%) in {:.0}s, {:.0} fps, {:.2}x [{} {} hwdec={} audio={}] saved={} orig={} | verify: {}/{} {}, VLC-playable container mkv",
+                    "  DONE: {} → {} ({:.0}%) in {:.0}s, {:.0} fps, {:.2}x [{} {} hwdec={} audio={}] saved={} orig={} | verify: {}/{} {}, VLC-playable container mkv{gain_note}",
                     human_bytes(m.bytes),
                     human_bytes(er.output_bytes),
                     er.ratio * 100.0,

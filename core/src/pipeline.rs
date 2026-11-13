@@ -748,6 +748,42 @@ pub fn cq_factor(cq: u32) -> f64 {
     0.93f64.powf(cq as f64 - 28.0)
 }
 
+/// CRF steps a max-shrink SVT encode climbs when its first result is not
+/// smaller than the source. Only [`VideoBackend::CpuAv1`] retries: the
+/// other presets describe a user-chosen quality and must keep it rather
+/// than silently degrade the picture.
+pub const GAIN_RETRY_STEP: u32 = 4;
+/// Highest CRF/quality value the slider (and therefore a gain retry)
+/// may reach. Kept equal to the UI ceiling so a retry never lands on a
+/// setting the user could not pick by hand.
+pub const MAX_GAIN_CQ: u32 = 40;
+/// At most this many no-gain retries per file (CRF 32 → 36 → 40 on the
+/// Smallest preset). Each retry is a full encode, so the cap matters.
+pub const MAX_GAIN_RETRIES: u32 = 3;
+/// Reference SVT CRF for a source that is already efficient in a modern
+/// codec. SVT's CRF scale is stricter than the hardware CQ scale: a lean
+/// HEVC source the app itself wrote (NVENC CQ28) sits near SVT CRF 36.
+/// Estimating below that quality promises savings a second-generation
+/// encode cannot deliver — the source is already at the efficient frontier.
+const LEAN_REENCODE_REFERENCE_CQ: u32 = 36;
+
+/// Next CRF to try after an encode failed to beat its source, or `None`
+/// when this backend should report no gain instead. Only the max-shrink
+/// SVT path retries; preserve-quality owns its own retry policy, and
+/// every other backend keeps the quality the user selected.
+pub fn gain_retry_cq(
+    backend: VideoBackend,
+    cq: u32,
+    preserve_quality: bool,
+    retries: u32,
+) -> Option<u32> {
+    if preserve_quality || backend != VideoBackend::CpuAv1 || retries >= MAX_GAIN_RETRIES {
+        return None;
+    }
+    let next = cq.saturating_add(GAIN_RETRY_STEP).min(MAX_GAIN_CQ);
+    (next > cq).then_some(next)
+}
+
 /// Preset multiplier relative to P5 (the default). Fast presets spend
 /// more bits for the same CQ; P6 squeezes a little more. Applies to the
 /// NVENC P-series and (via the mapped named presets) Quick Sync; the
@@ -831,7 +867,15 @@ pub fn estimate_file(m: &MediaFile, p: &EstParams) -> FileEstimate {
     let cf = cq_factor(p.cq);
     let pf = preset_factor(p.backend, p.preset);
     let sf = scale_factor(m, p.scale);
-    let video_factor = base * cf * pf * sf;
+    let mut video_factor = base * cf * pf * sf;
+    // A lean modern-codec source is already at the efficient frontier:
+    // re-encoding it at a CRF below its own quality level grows the file.
+    // Model that floor, or the plan promises a saving the encode cannot
+    // deliver (a 0.9 Mbps 720p HEVC file promised 154 → 83 MB and grew).
+    if lean_reencode_floor_applies(m, p, density, sf) {
+        let floor = cf / cq_factor(LEAN_REENCODE_REFERENCE_CQ);
+        video_factor = video_factor.max(floor);
+    }
     let scaled_to = effective_scale_target(m, p.scale);
     let plan = plan_streams_with(
         m,
@@ -958,6 +1002,23 @@ fn source_density(m: &MediaFile) -> f64 {
         _ => 0.07,
     };
     (typical / bpp).clamp(0.35, 1.15)
+}
+
+/// True when the estimate must assume the source has no cheap quality
+/// headroom left: SVT-AV1 is re-encoding a lean HEVC/AV1/VP9 file at its
+/// native resolution. Older codecs still collapse even when lean (their
+/// encoders were less efficient), and downscaling creates real savings,
+/// so neither gets the floor.
+fn lean_reencode_floor_applies(m: &MediaFile, p: &EstParams, density: f64, scale: f64) -> bool {
+    p.backend == VideoBackend::CpuAv1
+        && !p.preserve_quality
+        && matches!(m.vcodec.as_str(), "hevc" | "av1" | "vp9")
+        && density >= 1.0
+        // `density` defaults to 1.0 when the bitrate is unknown; that is
+        // not evidence of leanness, so only floor a measured source.
+        && m.fps > 0.1
+        && effective_vbitrate(m).is_some()
+        && scale >= 0.999
 }
 
 /// True when the source models as dense/grainy — the files the density
@@ -2342,6 +2403,82 @@ mod tests {
             "fat ratio {} vs lean {}",
             e_fat.ratio,
             e_lean.ratio
+        );
+    }
+
+    #[test]
+    fn lean_modern_source_has_no_small_crf_headroom() {
+        // The real report: an already-shrunk 720p HEVC episode (0.9 Mbps,
+        // 154 MB) was estimated at 83 MB for SVT CRF 32 but encoded to
+        // 184 MB. A lean modern source has no same-quality headroom; only
+        // a materially higher CRF can beat it.
+        let mut m = file("hevc", 1280, 720, 161_813_503, Some(851_574));
+        m.fps = 23.976;
+        m.duration_s = 1321.5;
+        let mut p = params();
+        p.backend = VideoBackend::CpuAv1;
+        p.preset = NvencPreset::P7;
+        p.cq = 32;
+        let at32 = estimate_file(&m, &p);
+        assert!(
+            at32.new_bytes >= m.bytes,
+            "a same-quality re-encode must not promise a shrink: {} -> {}",
+            m.bytes,
+            at32.new_bytes
+        );
+        p.cq = 40;
+        let at40 = estimate_file(&m, &p);
+        assert!(
+            at40.new_bytes < m.bytes,
+            "a stronger CRF must still unlock savings: {} vs {}",
+            at40.new_bytes,
+            m.bytes
+        );
+    }
+
+    #[test]
+    fn reencode_floor_skips_old_codecs_and_downscales() {
+        let mut lean = file("hevc", 1920, 1080, 150_000_000, Some(2_000_000));
+        lean.fps = 24.0;
+        let mut p = params();
+        p.backend = VideoBackend::CpuAv1;
+        p.cq = 32;
+        // Downscaling creates real headroom, so the floor must not apply.
+        p.scale = ScalePolicy::Force720p;
+        let scaled = estimate_file(&lean, &p);
+        assert!(
+            scaled.new_bytes < lean.bytes,
+            "a 720p output from a lean 1080p source still shrinks: {} vs {}",
+            scaled.new_bytes,
+            lean.bytes
+        );
+        // A lean H.264 source is still old-encoder material: no floor.
+        lean.vcodec = "h264".into();
+        p.scale = ScalePolicy::Preserve;
+        let old = estimate_file(&lean, &p);
+        assert!(
+            old.new_bytes < lean.bytes,
+            "lean H.264 still has codec headroom: {} vs {}",
+            old.new_bytes,
+            lean.bytes
+        );
+    }
+
+    #[test]
+    fn gain_retries_climb_only_the_max_shrink_svt_path() {
+        assert_eq!(gain_retry_cq(VideoBackend::CpuAv1, 32, false, 0), Some(36));
+        assert_eq!(gain_retry_cq(VideoBackend::CpuAv1, 36, false, 1), Some(40));
+        assert_eq!(gain_retry_cq(VideoBackend::CpuAv1, 40, false, 2), None);
+        assert_eq!(
+            gain_retry_cq(VideoBackend::CpuAv1, 28, false, 0),
+            Some(32),
+            "a manual lower CRF still gets a real retry"
+        );
+        assert_eq!(gain_retry_cq(VideoBackend::CpuAv1, 32, true, 0), None);
+        assert_eq!(gain_retry_cq(VideoBackend::Auto, 32, false, 0), None);
+        assert_eq!(
+            gain_retry_cq(VideoBackend::CpuAv1, 32, false, MAX_GAIN_RETRIES),
+            None
         );
     }
 

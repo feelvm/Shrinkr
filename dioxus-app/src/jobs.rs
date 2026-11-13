@@ -413,6 +413,7 @@ fn run_one_job(
     let mut cq = auto.map_or(params.cq, |a| a.cq);
     send(tx, JobMsg::ExecRestart { job: job_idx });
     let mut retried = false;
+    let mut gain_retries = 0u32;
     let (er, score) = loop {
         let r = be.encode(
             &f,
@@ -453,6 +454,30 @@ fn run_one_job(
             && er.output_bytes >= f.bytes
         {
             let _ = std::fs::remove_file(&tmp_out);
+            // Max-shrink SVT runs ask for the smallest output, so a result
+            // that loses to the source earns a stronger CRF instead of a
+            // silent discard. Other presets keep their chosen quality.
+            if let Some(next) = shrinkr_core::pipeline::gain_retry_cq(
+                params.backend,
+                cq,
+                params.preserve_quality,
+                gain_retries,
+            ) {
+                send(
+                    tx,
+                    JobMsg::ExecWarn {
+                        msg: format!(
+                            "warn {fname}: CRF {cq} encoded {} but the source is {}; retrying at CRF {next}",
+                            human_bytes(er.output_bytes),
+                            human_bytes(f.bytes)
+                        ),
+                    },
+                );
+                cq = next;
+                gain_retries += 1;
+                send(tx, JobMsg::ExecRestart { job: job_idx });
+                continue;
+            }
             return Ok(JobOutcome::NoGain {
                 detail: format!(
                     "skip {fname}: no gain — encoded {} but the source is {}; original kept. \
@@ -547,6 +572,9 @@ fn run_one_job(
         }
     );
     detail.push_str(&quality_note);
+    if gain_retries > 0 {
+        detail.push_str(&format!(", raised to CRF {cq} after a no-gain attempt"));
+    }
     if params.film_grain
         && params.backend == shrinkr_core::pipeline::VideoBackend::CpuAv1
         && !params.preserve_quality

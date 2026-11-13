@@ -109,6 +109,20 @@ Film-grain synthesis raises the effective density floor to 0.8 because the
 denoiser removes much of that cost. Audio is added separately, using the
 planned copy/Opus/AAC decision.
 
+A lean modern source — HEVC, AV1 or VP9 at or below typical bits per pixel —
+re-encoded by SVT-AV1 at its native resolution gets a floor:
+
+```text
+video_factor >= cq_factor(cq) / cq_factor(36)
+```
+
+SVT's CRF scale is stricter than the hardware CQ scale, so an already-efficient
+file from an earlier pass sits near CRF 36 equivalent. Estimating below that
+quality promises savings the second-generation encode cannot deliver (a
+0.9 Mbps 720p HEVC file estimated at 83 MB encoded to 184 MB). Above CRF 36 the
+usual curve applies. Older codecs and downscaling are exempt: both create real
+headroom.
+
 Preflight classifies each file:
 
 - **Skip** — the estimate is above the source size or below the minimum-saving
@@ -119,7 +133,14 @@ Preflight classifies each file:
 
 For already-efficient codecs (AV1/HEVC/VP9), a bitrate tier check can short-
 circuit obvious no-gain files, but the estimator is allowed to overrule it
-when recoding at a lower resolution or with SVT-AV1 could still pay off.
+where real headroom exists (a lower resolution or a materially higher quality
+setting). A lean modern source at native resolution is left as a skip instead
+of being promised a saving it cannot deliver.
+
+A max-shrink SVT-AV1 encode that comes out no smaller than its source retries
+at CRF +4, up to three attempts and capped at CRF 40; every retry is logged and
+the final report names the CRF that won. Other backends keep the quality the
+user selected and report no gain instead of silently degrading the picture.
 
 ### Stream planning
 
@@ -280,6 +301,10 @@ batch: predicted shrink percentage and wall time from the size model. Editing
 any knob clears the highlighted segment, so the presets never fight manual
 settings. Under Preserve quality, the CQ value is pinned by the mode, so
 segments match on encoder and preset only.
+
+Smallest has a second safety net: when its first full encode is not smaller
+than the source, it retries at CRF +4 (up to three attempts, capped at 40)
+before discarding the result. The run report names the final CRF.
 
 ### Preserve quality
 
