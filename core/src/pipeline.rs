@@ -700,10 +700,10 @@ pub fn forces_audio_reencode(backend: VideoBackend, opus_bps: Option<u32>) -> bo
     backend == VideoBackend::CopyVideo && opus_bps.is_some()
 }
 
-/// Human label for an estimated size change: direction, byte delta and
-/// percentage in one phrase. Growing estimates read `250 MB larger (+25%)`
-/// instead of a confusing negative "saving"; shrinking ones read
-/// `250 MB smaller (−25%)`.
+/// Human label for an estimated size change: byte delta and a signed
+/// percentage with the direction in words. Growing estimates read
+/// `250 MB (+25% larger)` instead of a confusing negative "saving";
+/// shrinking ones read `250 MB (−25% smaller)`.
 pub fn size_change_label(input_bytes: u64, output_bytes: u64) -> String {
     if output_bytes == input_bytes {
         return "no size change".to_string();
@@ -717,9 +717,9 @@ pub fn size_change_label(input_bytes: u64, output_bytes: u64) -> String {
         format!("{pct:.0}%")
     };
     if output_bytes > input_bytes {
-        format!("{} larger (+{pct})", crate::media::human_bytes(delta))
+        format!("{} (+{pct} larger)", crate::media::human_bytes(delta))
     } else {
-        format!("{} smaller (−{pct})", crate::media::human_bytes(delta))
+        format!("{} (−{pct} smaller)", crate::media::human_bytes(delta))
     }
 }
 
