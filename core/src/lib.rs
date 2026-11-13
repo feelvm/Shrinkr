@@ -7,6 +7,7 @@ pub mod calib;
 pub mod convert;
 pub mod ffmpeg;
 pub mod ffmpeg_fetch;
+pub mod grain;
 pub mod hw;
 pub mod images;
 pub mod log;

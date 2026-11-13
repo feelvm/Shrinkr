@@ -66,7 +66,9 @@ pub trait EncodeBackend {
         extra_args: &[String],
         opus_bps: Option<u32>,
         all_audio: bool,
-        film_grain: bool,
+        // SVT-AV1 film-grain denoise/synthesis strength (0 = off,
+        // 1–50 = SVT's level). The caller decides it per source.
+        grain_strength: u8,
         progress: &dyn Fn(Progress),
         cancel: &Arc<AtomicBool>,
     ) -> Result<EncodeResult, String>;
@@ -88,7 +90,7 @@ impl EncodeBackend for FfmpegBackend {
         extra_args: &[String],
         opus_bps: Option<u32>,
         all_audio: bool,
-        film_grain: bool,
+        grain_strength: u8,
         progress: &dyn Fn(Progress),
         cancel: &Arc<AtomicBool>,
     ) -> Result<EncodeResult, String> {
@@ -103,7 +105,7 @@ impl EncodeBackend for FfmpegBackend {
             extra_args,
             opus_bps,
             all_audio,
-            film_grain,
+            grain_strength,
             progress,
             cancel,
             crate::hw::caps(),
@@ -238,7 +240,7 @@ pub fn build_args(
     plan: &StreamPlan,
     extra_args: &[String],
     caps: &HwCaps,
-    film_grain: bool,
+    grain_strength: u8,
 ) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "-y".into(),
@@ -493,19 +495,24 @@ pub fn build_args(
             // the shared CQ slider (28 ≈ high quality, 32–38 = shrink
             // territory). Always encode 10-bit: the extra precision
             // costs almost nothing, avoids banding in gradients, and
-            // lets the search spend fewer bits for the same SSIM. Dense/
-            // grainy sources get film-grain synthesis: denoise, encode
+            // lets the search spend fewer bits for the same SSIM.
+            // Grainy sources get film-grain synthesis: denoise, encode
             // the clean picture, regenerate statistically-similar grain
-            // at decode time.
+            // at decode time. The caller measures the source and picks
+            // the strength; 0 means the analysis found no grain (or the
+            // strength test rejected it).
             a.push("-c:v".into());
             a.push("libsvtav1".into());
             a.push("-crf".into());
             a.push(format!("{cq}"));
             a.push("-preset".into());
             a.push(format!("{}", preset.svt()));
-            if crate::pipeline::fgs_applies(media, VideoBackend::CpuAv1, film_grain) {
+            if grain_strength > 0 {
                 a.push("-svtav1-params".into());
-                a.push("film-grain=8:film-grain-denoise=1".into());
+                a.push(format!(
+                    "film-grain={}:film-grain-denoise=1",
+                    grain_strength.min(50)
+                ));
             }
             a.push("-pix_fmt".into());
             a.push("yuv420p10le".into());
@@ -776,14 +783,14 @@ pub fn sweep_stale_work_roots() {
             }
             if meta.is_file() {
                 let _ = std::fs::remove_file(entry.path());
-            } else if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("auto-quality-")
-            {
-                // A crashed quality search leaves its sample folder behind;
-                // these are staging-only and safe to delete after a day.
-                let _ = std::fs::remove_dir_all(entry.path());
+            } else {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("auto-quality-") || name.starts_with("grain-") {
+                    // A crashed quality/grain probe leaves its sample folder
+                    // behind; staging-only, safe to delete after a day.
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
             }
         }
     }
@@ -801,7 +808,7 @@ pub fn run_with_fallback(
     extra_args: &[String],
     opus_bps: Option<u32>,
     all_audio: bool,
-    film_grain: bool,
+    grain_strength: u8,
     progress: &dyn Fn(Progress),
     cancel: &Arc<AtomicBool>,
     caps: &HwCaps,
@@ -832,8 +839,17 @@ pub fn run_with_fallback(
         // misleading "No such file or directory" on the output.
         ensure_output_dir(out_path)?;
         let args = build_args(
-            media, level, preset, cq, scale, keep_subs, out_path, &plan, extra_args, caps,
-            film_grain,
+            media,
+            level,
+            preset,
+            cq,
+            scale,
+            keep_subs,
+            out_path,
+            &plan,
+            extra_args,
+            caps,
+            grain_strength,
         );
         log::debug_log(&format!(
             "[{}] {} ({})",
@@ -862,8 +878,17 @@ pub fn run_with_fallback(
                         level
                     ));
                     let args = build_args(
-                        media, level, preset, cq, scale, keep_subs, out_path, &plan, extra_args,
-                        caps, film_grain,
+                        media,
+                        level,
+                        preset,
+                        cq,
+                        scale,
+                        keep_subs,
+                        out_path,
+                        &plan,
+                        extra_args,
+                        caps,
+                        grain_strength,
                     );
                     match run_once(
                         media, &args, level, preset, cq, scale, &plan, progress, cancel,
@@ -896,8 +921,17 @@ pub fn run_with_fallback(
                         level
                     ));
                     let args = build_args(
-                        media, level, preset, cq, scale, keep_subs, out_path, &plan, extra_args,
-                        caps, film_grain,
+                        media,
+                        level,
+                        preset,
+                        cq,
+                        scale,
+                        keep_subs,
+                        out_path,
+                        &plan,
+                        extra_args,
+                        caps,
+                        grain_strength,
                     );
                     match run_once(
                         media, &args, level, preset, cq, scale, &plan, progress, cancel,
@@ -1025,7 +1059,7 @@ pub fn encode_sample(
     preset: NvencPreset,
     cq: u32,
     scale: ScalePolicy,
-    film_grain: bool,
+    grain_strength: u8,
     caps: &HwCaps,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -1056,7 +1090,7 @@ pub fn encode_sample(
         &plan,
         &[],
         caps,
-        film_grain,
+        grain_strength,
     );
     let outcome = crate::process::run_with_progress(
         crate::process::cmd("ffmpeg").args(&args),
@@ -1904,7 +1938,7 @@ mod tests {
             &plan,
             &[],
             &caps(),
-            false,
+            0,
         )
     }
 
@@ -2037,7 +2071,7 @@ mod tests {
             &plan,
             &extra,
             &caps(),
-            false,
+            0,
         );
         let tail = args[args.len() - 5..].join(" ");
         assert_eq!(tail, "-tune grain -maxrate 8M out.mkv", "{args:?}");
@@ -2069,7 +2103,7 @@ mod tests {
                 &plan,
                 &[],
                 caps,
-                false,
+                0,
             )
             .join(" ")
         };
@@ -2095,7 +2129,7 @@ mod tests {
             &plan,
             &[],
             &caps(),
-            false,
+            0,
         )
         .join(" ");
         assert!(!copy.contains("-hwaccel"), "{copy}");
@@ -2153,7 +2187,7 @@ mod tests {
                 &plan,
                 &[],
                 &caps(),
-                false,
+                0,
             )
             .join(" ")
         };
@@ -2186,9 +2220,7 @@ mod tests {
     }
 
     #[test]
-    fn svt_preset_and_film_grain_flow_into_args() {
-        // Lean source (3 Mbps 1080p): no film-grain even when enabled —
-        // there is nothing to synthesise.
+    fn svt_preset_and_grain_strength_flow_into_args() {
         let mut lean = test_media();
         lean.vbitrate = Some(3_000_000);
         lean.bytes = 225_000_000;
@@ -2203,7 +2235,7 @@ mod tests {
             force_audio: false,
             audio_layout_note: "",
         };
-        let mk = |m: &MediaFile, preset: NvencPreset, fgs: bool| {
+        let mk = |m: &MediaFile, preset: NvencPreset, grain: u8| {
             build_args(
                 m,
                 Level::CpuAv1,
@@ -2215,28 +2247,32 @@ mod tests {
                 &plan,
                 &[],
                 &caps(),
-                fgs,
+                grain,
             )
             .join(" ")
         };
-        assert!(mk(&lean, NvencPreset::P5, true).contains("-preset 8"));
-        assert!(mk(&lean, NvencPreset::P3, true).contains("-preset 10"));
-        assert!(mk(&lean, NvencPreset::P9, false).contains("-preset 4"));
+        assert!(mk(&lean, NvencPreset::P5, 0).contains("-preset 8"));
+        assert!(mk(&lean, NvencPreset::P3, 0).contains("-preset 10"));
+        assert!(mk(&lean, NvencPreset::P9, 0).contains("-preset 4"));
         // 8-bit sources are encoded 10-bit on purpose: cleaner gradients,
         // fewer bits for the same SSIM, and the quality gate accepts the
         // higher output depth.
         let mut eight_bit = lean.clone();
         eight_bit.bit_depth = 8;
-        let up = mk(&eight_bit, NvencPreset::P5, false);
+        let up = mk(&eight_bit, NvencPreset::P5, 0);
         assert!(up.contains("-pix_fmt yuv420p10le"), "{up}");
-        // Dense 30 Mbps 4K source with FGS on: parameters present.
-        let args = mk(&test_media(), NvencPreset::P5, true);
-        assert!(args.contains("film-grain=8:film-grain-denoise=1"), "{args}");
-        // Same dense source, switch off: plain encode.
-        let off = mk(&test_media(), NvencPreset::P5, false);
+        // The caller supplies the measured strength; 0 stays a plain encode.
+        let args = mk(&test_media(), NvencPreset::P5, 12);
+        assert!(
+            args.contains("-svtav1-params film-grain=12:film-grain-denoise=1"),
+            "{args}"
+        );
+        let off = mk(&test_media(), NvencPreset::P5, 0);
         assert!(!off.contains("film-grain"), "{off}");
-        // Lean source with FGS on: still plain (nothing to synthesise).
-        assert!(!mk(&lean, NvencPreset::P5, true).contains("film-grain"));
+        // Clamped to SVT's documented 0–50 range.
+        assert!(
+            mk(&test_media(), NvencPreset::P5, 60).contains("film-grain=50:film-grain-denoise=1")
+        );
     }
 
     /// `nvenc_args` at an arbitrary level/caps, for the per-family tests.
@@ -2263,7 +2299,7 @@ mod tests {
             &plan,
             &[],
             caps,
-            false,
+            0,
         )
     }
 
@@ -2305,7 +2341,7 @@ Conversion failed!\n";
             &plan,
             &[],
             &caps(),
-            false,
+            0,
         );
         let joined = args.join(" ");
         assert!(joined.contains("-c:a aac -b:a 128k"), "{joined}");
@@ -2344,7 +2380,7 @@ Conversion failed!\n";
             &plan,
             &[],
             &caps(),
-            false,
+            0,
         );
         let joined = args.join(" ");
         assert!(joined.contains("-map 0:a "), "{joined}");
@@ -2382,7 +2418,7 @@ Conversion failed!\n";
             &plan,
             &[],
             &caps(),
-            false,
+            0,
         );
         let joined = args.join(" ");
         assert!(joined.contains("-c:a libopus -b:a 512k"), "{joined}");
@@ -2417,7 +2453,7 @@ Conversion failed!\n";
             &plan,
             &[],
             &caps(),
-            false,
+            0,
         );
         let joined = args.join(" ");
         assert!(joined.contains("-c:a libopus -b:a 256k"), "{joined}");
@@ -2460,7 +2496,7 @@ Conversion failed!\n";
             &plan,
             &["-crf".into(), "32".into()],
             &caps(),
-            true,
+            0,
         );
         let joined = args.join(" ");
         assert!(joined.contains("-c:v copy"), "{joined}");
@@ -2514,7 +2550,7 @@ Conversion failed!\n";
             &plan,
             &[],
             &caps(),
-            false,
+            0,
         );
         let joined = args.join(" ");
         assert!(joined.contains("scale=320:240"), "{joined}");

@@ -632,11 +632,12 @@ pub struct EstParams {
     /// format conversions (png→jpeg, alpha→webp) are suppressed — a file
     /// that can't win as its own format skips instead of converting.
     pub image_preserve_format: bool,
-    /// SVT-AV1 film-grain synthesis: on dense/grainy sources (the density
-    /// model's flag) the encoder denoises, encodes the clean picture, and
-    /// the decoder regenerates statistically-similar grain — 30–50% smaller
-    /// on exactly the files the plain model predicts poorly. The grain is
-    /// synthetic, which is why this stays a visible switch.
+    /// SVT-AV1 film-grain synthesis: frame analysis measures actual grain in
+    /// flat areas (bitrate density alone is not evidence), then short trial
+    /// encodes choose a denoise strength whose regenerated grain still
+    /// matches the source's texture. Clean sources stay off. The grain is
+    /// statistically similar, not identical, which is why this stays a
+    /// visible switch.
     pub film_grain: bool,
 }
 
@@ -960,16 +961,16 @@ fn source_density(m: &MediaFile) -> f64 {
 }
 
 /// True when the source models as dense/grainy — the files the density
-/// correction punishes and the ones film-grain synthesis exists for.
-/// Shared by the estimator and the command builder so both agree.
+/// correction punishes. This is only the size-model hint; the actual encode
+/// analyzes frames and measures a grain strength (see `grain.rs`).
 pub(crate) fn is_dense_source(m: &MediaFile) -> bool {
     source_density(m) < 0.7
 }
 
-/// Film-grain synthesis engages on SVT-AV1 encodes when enabled and the
-/// source models as dense/grainy. Clean sources gain nothing from it
-/// (there is no grain to synthesise) and pay the denoise pass, so it
-/// stays off there.
+/// Size-model hint used by the estimate: the source is dense enough that
+/// film-grain synthesis *may* help. The encode still measures actual grain
+/// and the chosen strength before applying it, so a dense but clean source
+/// stays untouched.
 pub(crate) fn fgs_applies(m: &MediaFile, backend: VideoBackend, film_grain: bool) -> bool {
     film_grain && backend == VideoBackend::CpuAv1 && is_dense_source(m)
 }
@@ -1088,7 +1089,7 @@ pub fn preflight_with(
         }
     };
     let dense_note = if fgs_applies(m, p.backend, p.film_grain) {
-        "; grainy source — AV1 film-grain synthesis on"
+        "; dense source — film-grain strength measured at encode"
     } else if est.density < 0.7 {
         "; dense/grainy source"
     } else {

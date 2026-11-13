@@ -62,8 +62,8 @@ fn cli_help() -> String {
      \u{20}                      primary one\n\
      --audio <off|8-512>       Opus kbps, off keeps as-is (default 64, max 512)\n\
      --film-grain / --no-film-grain\n\
-     \u{20}                      AV1 film-grain synthesis on grainy sources\n\
-     \u{20}                      (default: on; SVT-AV1 backend only)\n\
+     \u{20}                      measure and synthesize AV1 film grain on\n\
+     \u{20}                      grainy sources (default: on; SVT-AV1 only)\n\
      --extra-args \"...\"      extra ffmpeg output flags, e.g. \"-tune grain\"\n\
      --dry-run                print ffmpeg commands without encoding\n\
      --probe <file>           dump media inspection\n\
@@ -585,6 +585,38 @@ fn cli_shrink(
                 }
             }
         }
+        // Frame analysis picks the SVT grain strength; dry runs just show
+        // the historical default so the echoed command stays representative.
+        let mut grain_strength = if film_grain { 8 } else { 0 };
+        if film_grain && backend == pipeline::VideoBackend::CpuAv1 && !dry_run {
+            let choice = shrinkr_core::grain::choose_strength(
+                &m,
+                file_cq,
+                NvencPreset::P5,
+                scale,
+                hw::caps(),
+                &tmp_root,
+                &cancel,
+            );
+            grain_strength = choice.strength;
+            println!(
+                "  grain: {}{}",
+                if grain_strength > 0 {
+                    format!("auto {grain_strength}")
+                } else {
+                    "off (source measures clean)".to_string()
+                },
+                match choice.profile {
+                    Some(p) => format!(
+                        " — sigma {:.2}, flat {:.0}%, {} frames",
+                        p.sigma,
+                        p.flat_fraction * 100.0,
+                        p.frames
+                    ),
+                    None => " — analysis unavailable".into(),
+                }
+            );
+        }
         // Echo exact command (same builder the GUI uses).
         {
             let caps = hw::caps();
@@ -608,7 +640,7 @@ fn cli_shrink(
                     &plan,
                     &extra_args,
                     caps,
-                    film_grain,
+                    grain_strength,
                 );
                 println!("  cmd: {}", ffmpeg::command_line(&args));
             }
@@ -628,7 +660,7 @@ fn cli_shrink(
             &extra_args,
             opus_bps,
             all_audio,
-            film_grain,
+            grain_strength,
             &|_| {},
             &cancel,
         );

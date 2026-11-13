@@ -122,7 +122,7 @@ fn auto_quality_finds_a_passing_cq_from_real_samples() {
         shrinkr_core::pipeline::VideoBackend::CpuX264,
         shrinkr_core::pipeline::NvencPreset::P5,
         ScalePolicy::Preserve,
-        false,
+        0,
         shrinkr_core::hw::caps(),
         dir.path(),
         &cancel,

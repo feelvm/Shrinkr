@@ -319,7 +319,7 @@ pub fn solve_crf_for_file(
                     extra_args,
                     opus_bps,
                     all_audio,
-                    film_grain,
+                    if film_grain { 8 } else { 0 },
                     &|_| {},
                     &cancel,
                 )

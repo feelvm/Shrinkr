@@ -250,7 +250,7 @@ fn search_cq(
 /// Representative windows for the search: up to three short clips from
 /// across the file (more windows multiply encode time; long files stay at
 /// three because scene variety matters more than another probe).
-fn sample_windows(duration: f64) -> Vec<(f64, f64)> {
+pub(crate) fn sample_windows(duration: f64) -> Vec<(f64, f64)> {
     if !duration.is_finite() || duration < 4.0 {
         return vec![];
     }
@@ -297,7 +297,7 @@ pub fn auto_cq(
     backend: VideoBackend,
     preset: NvencPreset,
     scale: ScalePolicy,
-    film_grain: bool,
+    grain_strength: u8,
     caps: &HwCaps,
     work_dir: &Path,
     cancel: &Arc<AtomicBool>,
@@ -314,7 +314,17 @@ pub fn auto_cq(
         return None;
     }
     let result = search_in(
-        media, backend, preset, scale, film_grain, caps, &dir, &windows, width, height, cancel,
+        media,
+        backend,
+        preset,
+        scale,
+        grain_strength,
+        caps,
+        &dir,
+        &windows,
+        width,
+        height,
+        cancel,
     );
     let _ = std::fs::remove_dir_all(&dir);
     match result {
@@ -336,7 +346,7 @@ fn search_in(
     backend: VideoBackend,
     preset: NvencPreset,
     scale: ScalePolicy,
-    film_grain: bool,
+    grain_strength: u8,
     caps: &HwCaps,
     dir: &Path,
     windows: &[(f64, f64)],
@@ -359,7 +369,15 @@ fn search_in(
         for (i, (sample, path)) in samples.iter().zip(&references).enumerate() {
             let out = dir.join(format!("cq{cq}-{i}.mkv"));
             let encoded = crate::ffmpeg::encode_sample(
-                sample, &out, backend, preset, cq, scale, film_grain, caps, cancel,
+                sample,
+                &out,
+                backend,
+                preset,
+                cq,
+                scale,
+                grain_strength,
+                caps,
+                cancel,
             );
             if let Err(e) = encoded {
                 let _ = std::fs::remove_file(&out);

@@ -2179,7 +2179,7 @@ fn start_batch(
                     &plan,
                     &extra_args,
                     caps(),
-                    params.film_grain,
+                    if params.film_grain { 8 } else { 0 },
                 );
                 command_line(&args)
             })

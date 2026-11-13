@@ -55,6 +55,11 @@ pub enum JobMsg {
         job: usize,
         name: String,
     },
+    /// Frame analysis + trial encodes are choosing an SVT grain strength.
+    ExecAnalyzingGrain {
+        job: usize,
+        name: String,
+    },
     /// A queued file is below the min-saving threshold but the user chose
     /// to run it anyway; surfaces the warning without failing the job.
     ExecWarn {
@@ -343,6 +348,36 @@ fn run_one_job(
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string();
+    // Frame analysis decides whether this source actually has grain and how
+    // hard SVT should denoise it. Density alone is a poor proxy: clean
+    // high-bitrate sources were getting synthetic grain they never had.
+    let grain_strength = if params.film_grain
+        && params.backend == shrinkr_core::pipeline::VideoBackend::CpuAv1
+        && !params.preserve_quality
+    {
+        send(
+            tx,
+            JobMsg::ExecAnalyzingGrain {
+                job: job_idx,
+                name: fname.clone(),
+            },
+        );
+        let choice = shrinkr_core::grain::choose_strength(
+            &f,
+            params.cq,
+            params.preset,
+            params.scale,
+            shrinkr_core::hw::caps(),
+            tmp_root,
+            cancel,
+        );
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        choice.strength
+    } else {
+        0
+    };
     // Preserve quality no longer fixes CRF 18 for everyone. Encode a few
     // short windows at increasing CQ and keep the strongest one that still
     // clears a slightly stricter sample gate; the complete video is then
@@ -363,7 +398,7 @@ fn run_one_job(
             params.backend,
             params.preset,
             params.scale,
-            params.film_grain,
+            0,
             shrinkr_core::hw::caps(),
             tmp_root,
             cancel,
@@ -390,7 +425,7 @@ fn run_one_job(
             &extra_args,
             params.opus_bps,
             params.all_audio,
-            params.film_grain,
+            grain_strength,
             &|p| {
                 // frac>=0 carries position; fps-only lines (frac<0) refresh
                 // the rate while keeping the last position.
@@ -512,6 +547,16 @@ fn run_one_job(
         }
     );
     detail.push_str(&quality_note);
+    if params.film_grain
+        && params.backend == shrinkr_core::pipeline::VideoBackend::CpuAv1
+        && !params.preserve_quality
+    {
+        if grain_strength > 0 {
+            detail.push_str(&format!(", grain auto {grain_strength}"));
+        } else {
+            detail.push_str(", grain off");
+        }
+    }
     Ok(JobOutcome::Placed { saved, detail })
 }
 
@@ -1721,6 +1766,13 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 "Finding the smallest encode that keeps {name}'s quality…"
             ));
         }
+        JobMsg::ExecAnalyzingGrain { job, name } => {
+            if let Some(item) = s.exec_items.get_mut(job) {
+                item.checking_quality = true;
+                item.fps = 0.0;
+            }
+            s.push_log(format!("Measuring grain for {name}…"));
+        }
         JobMsg::ExecRestart { job } => {
             if let Some(item) = s.exec_items.get_mut(job) {
                 item.frac = 0.0;
@@ -2404,5 +2456,65 @@ mod regression_tests {
             .filter(|e| e.path() != source)
             .collect();
         assert_eq!(placed.len(), 1, "{placed:?}");
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg; analyzes real frames and encodes SVT-AV1"]
+    fn adaptive_grain_picks_a_strength_and_encodes_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("grain-source.mkv");
+        let output = shrinkr_core::process::cmd("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "smptebars=size=640x360:rate=24:duration=6",
+                "-vf",
+                "noise=alls=24:allf=t+u",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let media = probe_file(&source).unwrap();
+        let mut params = crate::state::AppState::default().est_params();
+        params.preserve_quality = false;
+        params.backend = shrinkr_core::pipeline::VideoBackend::CpuAv1;
+        params.preset = shrinkr_core::pipeline::NvencPreset::P5;
+        params.cq = 32;
+        params.opus_bps = None;
+        params.film_grain = true;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, _rx) = futures_channel::mpsc::unbounded();
+        let outcome = run_one_job(
+            &tx,
+            media,
+            params,
+            false,
+            0.0,
+            ThresholdPolicy::Warn,
+            dir.path(),
+            0,
+            false,
+            vec![],
+            &cancel,
+        )
+        .unwrap();
+        match outcome {
+            JobOutcome::Placed { detail, .. } => {
+                assert!(detail.contains("grain auto"), "{detail}");
+            }
+            JobOutcome::NoGain { detail } | JobOutcome::Skipped { detail } => {
+                panic!("expected a placed grainy file: {detail}")
+            }
+        }
     }
 }

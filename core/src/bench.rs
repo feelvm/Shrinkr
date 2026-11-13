@@ -214,7 +214,7 @@ pub fn run_on_file(
                 &plan,
                 &[],
                 caps,
-                false,
+                0,
             );
             on_step(&format!(
                 "[dry-run {}] {}",
@@ -239,7 +239,7 @@ pub fn run_on_file(
             false,
             // Bench rows keep film-grain off: the matrix compares encoders,
             // and FGS would make the SVT row measure a different tool.
-            false,
+            0,
             &|_| {},
             &cancel,
         );

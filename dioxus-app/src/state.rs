@@ -359,9 +359,10 @@ pub struct AppState {
     pub image_scale: ScalePolicy,
     pub image_preserve_format: bool,
     /// SVT-AV1 film-grain synthesis (grainy sources only; the control is
-    /// shown when the ffmpeg build has SVT). Default on: statistically
-    /// similar synthetic grain is the trade for much smaller files on
-    /// exactly the sources nothing else helps.
+    /// shown when the ffmpeg build has SVT). Default on: actual-frame
+    /// analysis and trial encodes choose the strength, and only grainy
+    /// sources keep it. The regenerated grain is statistically similar, not
+    /// identical, which is why this remains a visible switch.
     pub film_grain: bool,
     /// Keep subtitle tracks. Default true; Preserve quality forces it.
     pub keep_subs: bool,
