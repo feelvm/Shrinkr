@@ -491,11 +491,13 @@ pub fn build_args(
             // SVT-AV1 software encode (the Ryzen path on RTX 30 boxes —
             // Ampere has no AV1 NVENC). The shared P knob maps to SVT's
             // preset scale (P5 = 8, the sweet spot; each step trades
-            // speed for size; P7–P9 reach presets 6–4). CRF comes from
-            // the shared CQ slider (28 ≈ high quality, 32–38 = shrink
-            // territory). Always encode 10-bit: the extra precision
-            // costs almost nothing, avoids banding in gradients, and
-            // lets the search spend fewer bits for the same SSIM.
+            // speed for size; P7–P9 reach presets 6–4). The shared CQ
+            // slider maps to SVT's stricter CRF scale with a +12 offset
+            // (CQ 28 ≈ CRF 40, CQ 32 = CRF 44), so the same slider number
+            // describes a comparable quality and size across encoders.
+            // Always encode 10-bit: the extra precision costs almost
+            // nothing, avoids banding in gradients, and lets the search
+            // spend fewer bits for the same SSIM.
             // Grainy sources get film-grain synthesis: denoise, encode
             // the clean picture, regenerate statistically-similar grain
             // at decode time. The caller measures the source and picks
@@ -504,7 +506,7 @@ pub fn build_args(
             a.push("-c:v".into());
             a.push("libsvtav1".into());
             a.push("-crf".into());
-            a.push(format!("{cq}"));
+            a.push(format!("{}", crate::pipeline::svt_crf(cq)));
             a.push("-preset".into());
             a.push(format!("{}", preset.svt()));
             if grain_strength > 0 {
@@ -1375,7 +1377,8 @@ fn run_once(
         | Level::CpuDecodeH264Nvenc
         | Level::HwAv1
         | Level::CpuDecodeAv1Nvenc => format!("cq{cq}"),
-        Level::CpuX264 | Level::CpuX265 | Level::CpuAv1 => format!("crf{cq}"),
+        Level::CpuX264 | Level::CpuX265 => format!("crf{cq}"),
+        Level::CpuAv1 => format!("crf{}", crate::pipeline::svt_crf(cq)),
         Level::VtHevc | Level::VtH264 => format!("q{}", vt_quality_for(cq)),
         Level::QsvHevc | Level::QsvH264 | Level::QsvAv1 => format!("icq{cq}"),
         Level::AmfHevc | Level::AmfH264 | Level::AmfAv1 => format!("qp{cq}"),
@@ -2254,6 +2257,8 @@ mod tests {
         assert!(mk(&lean, NvencPreset::P5, 0).contains("-preset 8"));
         assert!(mk(&lean, NvencPreset::P3, 0).contains("-preset 10"));
         assert!(mk(&lean, NvencPreset::P9, 0).contains("-preset 4"));
+        // The shared CQ 30 maps to SVT CRF 42 (+12 offset), not CRF 30.
+        assert!(mk(&lean, NvencPreset::P5, 0).contains("-crf 42"));
         // 8-bit sources are encoded 10-bit on purpose: cleaner gradients,
         // fewer bits for the same SSIM, and the quality gate accepts the
         // higher output depth.

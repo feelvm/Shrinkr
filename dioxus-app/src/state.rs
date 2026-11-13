@@ -45,42 +45,43 @@ impl Goal {
         }
     }
 
-    /// `(backend, nvenc preset, cq)` this goal runs as on this machine.
-    /// Fastest keeps Balanced's CQ so quality stays constant across the
-    /// fast half of the axis — the trade-off there is purely speed vs
-    /// size (P4 encodes quicker than P5 at the same CQ, files come out
-    /// bigger). Balanced rides AV1 NVENC where the trial encode passed
-    /// (RTX 40/50): same speed class as HEVC NVENC, meaningfully smaller —
-    /// free savings for the default goal, HEVC anywhere else for playback
-    /// compatibility. Smallest means smallest output, period: SVT-AV1 preset
-    /// 6 is the most compression-efficient encoder in the toolbox (software,
-    /// so very slow — that's the cost the name admits), falling back through
-    /// the hardware AV1/HEVC encoders to whatever this machine has.
+    /// `(backend, nvenc preset, shared CQ)` this goal runs as on this
+    /// machine. The values are calibrated against real encodes, not just
+    /// labels: Fastest is the quickest GPU path that still saves a
+    /// meaningful slice (P4 CQ 30); Balanced buys a smaller file with a
+    /// slower preset and/or a higher CQ — AV1 NVENC CQ 30 where the trial
+    /// encode passed (RTX 40/50: same speed class as HEVC NVENC, but
+    /// smaller), HEVC P5 CQ 32 anywhere else. Smallest means smallest
+    /// output, period: SVT-AV1 preset 6 at shared CQ 32, which maps to
+    /// CRF 44 on SVT's stricter scale and is the most compression-efficient
+    /// path in the toolbox (software, so much slower — that's the cost the
+    /// name admits). Without SVT, the hardware AV1/HEVC encoders take
+    /// CQ 34 so the ladder stays monotonic.
     pub fn resolve(&self, caps: &HwCaps) -> (VideoBackend, NvencPreset, u32) {
         match self {
-            Goal::Fastest => (VideoBackend::Auto, NvencPreset::P4, 28),
+            Goal::Fastest => (VideoBackend::Auto, NvencPreset::P4, 30),
             Goal::Balanced => {
                 if caps.av1_nvenc_usable {
-                    (VideoBackend::Av1Nvenc, NvencPreset::P5, 28)
+                    (VideoBackend::Av1Nvenc, NvencPreset::P5, 30)
                 } else {
-                    (VideoBackend::Auto, NvencPreset::P5, 28)
+                    (VideoBackend::Auto, NvencPreset::P5, 32)
                 }
             }
             Goal::Smallest => {
                 if caps.svt_av1 {
                     (VideoBackend::CpuAv1, NvencPreset::P7, 32)
                 } else if caps.av1_nvenc_usable {
-                    (VideoBackend::Av1Nvenc, NvencPreset::P6, 32)
+                    (VideoBackend::Av1Nvenc, NvencPreset::P6, 34)
                 } else if caps.hevc_nvenc {
-                    (VideoBackend::HevcNvenc, NvencPreset::P6, 32)
+                    (VideoBackend::HevcNvenc, NvencPreset::P6, 34)
                 } else if caps.vt_hevc {
-                    (VideoBackend::VtHevc, NvencPreset::P5, 32)
+                    (VideoBackend::VtHevc, NvencPreset::P5, 34)
                 } else if caps.qsv_hevc {
-                    (VideoBackend::QsvHevc, NvencPreset::P5, 32)
+                    (VideoBackend::QsvHevc, NvencPreset::P5, 34)
                 } else if caps.amf_hevc {
-                    (VideoBackend::AmfHevc, NvencPreset::P5, 32)
+                    (VideoBackend::AmfHevc, NvencPreset::P5, 34)
                 } else {
-                    (VideoBackend::Auto, NvencPreset::P6, 32)
+                    (VideoBackend::Auto, NvencPreset::P6, 34)
                 }
             }
         }
@@ -1292,7 +1293,7 @@ mod tests {
             s.goal_estimate(Goal::Fastest)
         };
         // Growth estimates surface in the warn bucket, not the shrink
-        // sum — the pinned run's file lands there; the released (cq28)
+        // sum — the pinned run's file lands there; the released (goal CQ)
         // run shrinks it. Compare the per-file output sizes to keep the
         // original inequality: cq18 must estimate bigger.
         assert_eq!(pinned.warned, 1);
@@ -1300,7 +1301,7 @@ mod tests {
         assert!(released.files == 1 && released.warned == 0);
         assert!(
             pinned.warned_new_b > released.new_b,
-            "cq{} estimate {} should exceed the cq28 plan {}",
+            "cq{} estimate {} should exceed the goal plan {}",
             PRESERVE_QUALITY_CQ,
             pinned.warned_new_b,
             released.new_b
@@ -1348,8 +1349,8 @@ mod tests {
             gpu_label: "test".into(),
             hwaccels: vec![],
         };
-        // Full matches() demands the goal's CQ (28), which Preserve quality pins
-        // away — the segment would never highlight. matches_preserve_quality
+        // Full matches() demands the goal's CQ (30), which Preserve quality
+        // pins away — the segment would never highlight. matches_preserve_quality
         // compares encoder + preset only.
         assert!(!Goal::Fastest.matches(
             VideoBackend::Auto,
@@ -1398,17 +1399,39 @@ mod tests {
         // stays CPU SVT (the name promises minimum bytes, not speed).
         assert_eq!(
             Goal::Balanced.resolve(&nv40),
-            (VideoBackend::Av1Nvenc, NvencPreset::P5, 28)
+            (VideoBackend::Av1Nvenc, NvencPreset::P5, 30)
         );
         assert_eq!(
             Goal::Smallest.resolve(&nv40),
             (VideoBackend::CpuAv1, NvencPreset::P7, 32)
         );
-        // Same box without SVT in the build: Smallest takes AV1 NVENC.
+        // The resolved values must actually produce a monotonic size
+        // ladder on the size model, not just look ordered as numbers.
+        let mut size_state = app();
+        size_state.preserve_quality = false;
+        size_state.scale = ScalePolicy::Preserve;
+        let sample = video();
+        let estimate = |goal: Goal| {
+            let (backend, preset, cq) = goal.resolve(&nv40);
+            let mut params = size_state.est_params();
+            params.backend = backend;
+            params.preset = preset;
+            params.cq = cq;
+            shrinkr_core::pipeline::estimate_file(&sample, &params).new_bytes
+        };
+        let fastest_b = estimate(Goal::Fastest);
+        let balanced_b = estimate(Goal::Balanced);
+        let smallest_b = estimate(Goal::Smallest);
+        assert!(
+            fastest_b > balanced_b && balanced_b > smallest_b,
+            "goal sizes must step down: fastest {fastest_b}, balanced {balanced_b}, smallest {smallest_b}"
+        );
+        // Same box without SVT in the build: Smallest takes AV1 NVENC at
+        // CQ 34, one rung above Balanced's CQ 30.
         nv40.svt_av1 = false;
         assert_eq!(
             Goal::Smallest.resolve(&nv40),
-            (VideoBackend::Av1Nvenc, NvencPreset::P6, 32)
+            (VideoBackend::Av1Nvenc, NvencPreset::P6, 34)
         );
         // A Mac: Balanced falls back to Auto (→ VideoToolbox HEVC inside
         // the ladder), Smallest resolves VideoToolbox when SVT is missing
@@ -1437,11 +1460,11 @@ mod tests {
         };
         assert_eq!(
             Goal::Balanced.resolve(&mac),
-            (VideoBackend::Auto, NvencPreset::P5, 28)
+            (VideoBackend::Auto, NvencPreset::P5, 32)
         );
         assert_eq!(
             Goal::Smallest.resolve(&mac),
-            (VideoBackend::VtHevc, NvencPreset::P5, 32)
+            (VideoBackend::VtHevc, NvencPreset::P5, 34)
         );
         mac.svt_av1 = true;
         assert_eq!(

@@ -748,24 +748,39 @@ pub fn cq_factor(cq: u32) -> f64 {
     0.93f64.powf(cq as f64 - 28.0)
 }
 
+/// SVT-AV1's CRF scale is stricter than the hardware/NVENC CQ scale: the
+/// same number buys more quality and a bigger file. Calibrated on 720p
+/// sources, NVENC HEVC CQ 32 lands near SVT CRF 44, so libsvtav1 gets the
+/// shared CQ plus this offset. The UI slider stays 18–40 and every
+/// estimate stays in shared-CQ units; only the AV1 encoder call (and the
+/// label it reports) carries the mapped CRF.
+pub const SVT_CRF_OFFSET: u32 = 12;
+
+/// Map the shared 18–40 quality slider to libsvtav1's CRF.
+pub fn svt_crf(cq: u32) -> u32 {
+    cq.saturating_add(SVT_CRF_OFFSET)
+}
+
 /// CRF steps a max-shrink SVT encode climbs when its first result is not
 /// smaller than the source. Only [`VideoBackend::CpuAv1`] retries: the
 /// other presets describe a user-chosen quality and must keep it rather
 /// than silently degrade the picture.
 pub const GAIN_RETRY_STEP: u32 = 4;
-/// Highest CRF/quality value the slider (and therefore a gain retry)
-/// may reach. Kept equal to the UI ceiling so a retry never lands on a
-/// setting the user could not pick by hand.
+/// Highest shared CQ the slider (and therefore a gain retry) may reach.
+/// Kept equal to the UI ceiling so a retry never lands on a setting the
+/// user could not pick by hand. On SVT that maps to CRF 52.
 pub const MAX_GAIN_CQ: u32 = 40;
-/// At most this many no-gain retries per file (CRF 32 → 36 → 40 on the
-/// Smallest preset). Each retry is a full encode, so the cap matters.
+/// At most this many no-gain retries per file (shared CQ 32 → 36 → 40,
+/// i.e. SVT CRF 44 → 48 → 52, on the Smallest preset). Each retry is a
+/// full encode, so the cap matters.
 pub const MAX_GAIN_RETRIES: u32 = 3;
 /// Reference SVT CRF for a source that is already efficient in a modern
-/// codec. SVT's CRF scale is stricter than the hardware CQ scale: a lean
-/// HEVC source the app itself wrote (NVENC CQ28) sits near SVT CRF 36.
-/// Estimating below that quality promises savings a second-generation
-/// encode cannot deliver — the source is already at the efficient frontier.
-const LEAN_REENCODE_REFERENCE_CQ: u32 = 36;
+/// codec. A lean HEVC source the app itself wrote (NVENC CQ 28) sits near
+/// SVT CRF 36. Estimating below that quality promises savings a
+/// second-generation encode cannot deliver — the source is already at the
+/// efficient frontier. The estimator works in shared-slider units, so the
+/// reference is stored there (CRF 36 = CQ 24 with [`SVT_CRF_OFFSET`]).
+const LEAN_REENCODE_REFERENCE_CQ: u32 = 36 - SVT_CRF_OFFSET;
 
 /// Next CRF to try after an encode failed to beat its source, or `None`
 /// when this backend should report no gain instead. Only the max-shrink
@@ -788,11 +803,22 @@ pub fn gain_retry_cq(
 /// more bits for the same CQ; P6 squeezes a little more. Applies to the
 /// NVENC P-series and (via the mapped named presets) Quick Sync; the
 /// VideoToolbox and AMF families have no preset axis of their own.
+/// SVT has its own preset axis, calibrated from 720p encodes: preset 8
+/// (P5) comes out ~12% larger than preset 6 (P7), which is the Smallest
+/// reference at 1.0.
 pub fn preset_factor(backend: VideoBackend, preset: NvencPreset) -> f64 {
     match backend {
+        VideoBackend::CpuAv1 => match preset {
+            NvencPreset::P3 => 1.22,
+            NvencPreset::P4 => 1.18,
+            NvencPreset::P5 => 1.12,
+            NvencPreset::P6 => 1.06,
+            NvencPreset::P7 => 1.0,
+            NvencPreset::P8 => 0.97,
+            NvencPreset::P9 => 0.94,
+        },
         VideoBackend::CpuX264
         | VideoBackend::CpuX265
-        | VideoBackend::CpuAv1
         | VideoBackend::CopyVideo
         | VideoBackend::VtHevc
         | VideoBackend::AmfHevc
@@ -827,7 +853,7 @@ fn quality_label(p: &EstParams) -> String {
     match p.backend {
         VideoBackend::CpuX264 => format!("x264 crf{}", p.cq),
         VideoBackend::CpuX265 => format!("x265 slow crf{}", p.cq),
-        VideoBackend::CpuAv1 => format!("svt-av1 p{} crf{}", p.preset.svt(), p.cq),
+        VideoBackend::CpuAv1 => format!("svt-av1 p{} crf{}", p.preset.svt(), svt_crf(p.cq)),
         VideoBackend::CopyVideo => "copy video".into(),
         VideoBackend::VtHevc => format!("vt-hevc cq{}", p.cq),
         VideoBackend::QsvHevc => format!("qsv-hevc icq{} {}", p.cq, p.preset.qsv()),
@@ -861,9 +887,9 @@ pub fn estimate_file(m: &MediaFile, p: &EstParams) -> FileEstimate {
     // ~1% at CQ28 where the raw table predicted 25%).
     let base = 1.0 - (1.0 - est_ratio(&m.vcodec, p.backend)) * eff_density;
     // CQ/CRF curve around the 28 reference. Tables above are calibrated at
-    // 28 for every backend (NVENC CQ, x264/x265 CRF, SVT CRF), so the same
-    // ≈7%-per-point factor applies to all — the shared quality slider is
-    // meaningful on CPU backends too.
+    // the shared CQ 28 for every backend; libsvtav1 receives CQ + 12, so
+    // its table is anchored to that mapped CRF and the same ≈7%-per-point
+    // factor keeps the slider comparable across encoders.
     let cf = cq_factor(p.cq);
     let pf = preset_factor(p.backend, p.preset);
     let sf = scale_factor(m, p.scale);
@@ -873,7 +899,10 @@ pub fn estimate_file(m: &MediaFile, p: &EstParams) -> FileEstimate {
     // Model that floor, or the plan promises a saving the encode cannot
     // deliver (a 0.9 Mbps 720p HEVC file promised 154 → 83 MB and grew).
     if lean_reencode_floor_applies(m, p, density, sf) {
-        let floor = cf / cq_factor(LEAN_REENCODE_REFERENCE_CQ);
+        // The floor is the frontier at this preset: a faster SVT preset
+        // spends more bits for the same CRF, so its minimum output is
+        // proportionally larger (P5 is ~12% above the P7 reference).
+        let floor = pf * cf / cq_factor(LEAN_REENCODE_REFERENCE_CQ);
         video_factor = video_factor.max(floor);
     }
     let scaled_to = effective_scale_target(m, p.scale);
@@ -1704,7 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn av1_backend_selects_svt_and_estimates_below_x265() {
+    fn av1_backend_selects_svt_and_calibrates_its_preset_ladder() {
         let caps = caps_with(&["h264_cuvid", "hevc_cuvid", "av1_cuvid"]);
         let m = file("h264", 1920, 1080, 1_000_000_000, Some(12_000_000));
         let levels = select_levels_for_media(VideoBackend::CpuAv1, &caps, &m);
@@ -1728,18 +1757,17 @@ mod tests {
             image_preserve_format: false,
             film_grain: false,
         };
-        let x265_params = EstParams {
-            preserve_quality: false,
-            backend: VideoBackend::CpuX265,
+        let slow_params = EstParams {
+            preset: NvencPreset::P7,
             ..av1_params
         };
-        let e_av1 = estimate_file(&m, &av1_params);
-        let e_x265 = estimate_file(&m, &x265_params);
+        let e_fast = estimate_file(&m, &av1_params);
+        let e_slow = estimate_file(&m, &slow_params);
         assert!(
-            e_av1.new_bytes < e_x265.new_bytes,
-            "av1 {} vs x265 {}",
-            e_av1.new_bytes,
-            e_x265.new_bytes
+            e_slow.new_bytes < e_fast.new_bytes,
+            "SVT preset 6 (P7) must estimate smaller than preset 8 (P5): {} vs {}",
+            e_slow.new_bytes,
+            e_fast.new_bytes
         );
     }
 
@@ -1748,6 +1776,10 @@ mod tests {
         assert!((cq_factor(28) - 1.0).abs() < 1e-9);
         assert!(cq_factor(32) < 1.0 && cq_factor(32) > 0.6);
         assert!(cq_factor(24) > 1.0);
+        // The shared slider stays put; only SVT's encoder call is offset.
+        assert_eq!(svt_crf(28), 40);
+        assert_eq!(svt_crf(32), 44);
+        assert_eq!(svt_crf(40), 52);
     }
 
     #[test]
@@ -2409,30 +2441,39 @@ mod tests {
     #[test]
     fn lean_modern_source_has_no_small_crf_headroom() {
         // The real report: an already-shrunk 720p HEVC episode (0.9 Mbps,
-        // 154 MB) was estimated at 83 MB for SVT CRF 32 but encoded to
-        // 184 MB. A lean modern source has no same-quality headroom; only
-        // a materially higher CRF can beat it.
+        // 154 MB) was encoded to 184 MB at SVT CRF 32. A lean modern source
+        // has no same-quality headroom; only a materially higher CRF can
+        // beat it. CRF 32 is shared CQ 20 under the SVT offset.
         let mut m = file("hevc", 1280, 720, 161_813_503, Some(851_574));
         m.fps = 23.976;
         m.duration_s = 1321.5;
         let mut p = params();
         p.backend = VideoBackend::CpuAv1;
         p.preset = NvencPreset::P7;
+        p.cq = 20;
+        let below_frontier = estimate_file(&m, &p);
+        assert!(
+            below_frontier.new_bytes >= m.bytes,
+            "a synthetic re-encode below the source's own CRF must not promise a shrink: {} -> {}",
+            m.bytes,
+            below_frontier.new_bytes
+        );
+        // Shared CQ 32 maps to SVT CRF 44 — above the source's frontier.
         p.cq = 32;
         let at32 = estimate_file(&m, &p);
         assert!(
-            at32.new_bytes >= m.bytes,
-            "a same-quality re-encode must not promise a shrink: {} -> {}",
-            m.bytes,
-            at32.new_bytes
+            at32.new_bytes < m.bytes,
+            "a stronger CRF must unlock savings: {} vs {}",
+            at32.new_bytes,
+            m.bytes
         );
         p.cq = 40;
         let at40 = estimate_file(&m, &p);
         assert!(
-            at40.new_bytes < m.bytes,
-            "a stronger CRF must still unlock savings: {} vs {}",
+            at40.new_bytes < at32.new_bytes,
+            "the top of the slider must be the smallest estimate: {} vs {}",
             at40.new_bytes,
-            m.bytes
+            at32.new_bytes
         );
     }
 
@@ -2615,6 +2656,15 @@ mod tests {
         assert_eq!(NvencPreset::P4.amf(), "balanced");
         assert_eq!(NvencPreset::P6.amf(), "quality");
         assert_eq!(NvencPreset::P9.qsv(), "slower");
+        // The estimator follows the SVT axis too: faster presets spend
+        // more bits, and preset 6 (P7) is the reference at 1.0.
+        assert_eq!(preset_factor(VideoBackend::CpuAv1, NvencPreset::P7), 1.0);
+        assert!(
+            preset_factor(VideoBackend::CpuAv1, NvencPreset::P5) > 1.1,
+            "SVT 8 is materially larger than SVT 6"
+        );
+        assert!(preset_factor(VideoBackend::CpuAv1, NvencPreset::P9) < 1.0);
+        assert_eq!(preset_factor(VideoBackend::CpuX265, NvencPreset::P5), 1.0);
     }
 
     #[test]

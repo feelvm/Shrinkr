@@ -91,7 +91,7 @@ not video.
 
 ### Estimate and preflight
 
-The size model is deliberately conservative. At CRF/CQ 28 the expected
+The size model is deliberately conservative. At shared CQ 28 the expected
 output/input ratio comes from per-codec tables, then:
 
 ```text
@@ -99,6 +99,7 @@ density       = clamp(typical_bits_per_pixel / actual_bits_per_pixel, 0.35, 1.15
 base_ratio    = 1 - (1 - table_ratio) * density
 cq_factor     = 0.93 ^ (cq - 28)          // ≈7% per quality point
 preset_factor = 1.12 P3 / 1.04 P4 / 1.00 P5 / 0.96 P6 / 0.94 P7+
+                SVT: 1.22 p10 / 1.18 p9 / 1.12 p8 / 1.06 p7 / 1.00 p6 / 0.97 p5 / 0.94 p4
 scale_factor  = (output_pixels / input_pixels) ^ 0.85
 video_bytes   = source_video_bytes * base_ratio * cq_factor * preset_factor * scale_factor
 output_bytes  = video_bytes + planned_audio_bytes
@@ -113,15 +114,16 @@ A lean modern source — HEVC, AV1 or VP9 at or below typical bits per pixel —
 re-encoded by SVT-AV1 at its native resolution gets a floor:
 
 ```text
-video_factor >= cq_factor(cq) / cq_factor(36)
+video_factor >= preset_factor * cq_factor(cq) / cq_factor(24)   // SVT CRF 36 = shared CQ 24
 ```
 
 SVT's CRF scale is stricter than the hardware CQ scale, so an already-efficient
 file from an earlier pass sits near CRF 36 equivalent. Estimating below that
 quality promises savings the second-generation encode cannot deliver (a
-0.9 Mbps 720p HEVC file estimated at 83 MB encoded to 184 MB). Above CRF 36 the
-usual curve applies. Older codecs and downscaling are exempt: both create real
-headroom.
+0.9 Mbps 720p HEVC file estimated at 83 MB encoded to 184 MB). On the shared
+slider, Smallest's CQ 32 maps to CRF 44 — above that frontier — so it can
+still promise and deliver a saving. Older codecs and downscaling are exempt:
+both create real headroom.
 
 Preflight classifies each file:
 
@@ -199,13 +201,16 @@ Encoder flags by family:
 | AMF | `hevc_amf`/`h264_amf`/`av1_amf`, `-rc cqp`, `-qp_i N-2 -qp_p N`, mapped quality mode, VBAQ on H.264/HEVC |
 | x264 | `libx264 -crf N -preset medium` |
 | x265 | `libx265 -crf N -preset slow` |
-| SVT-AV1 | `libsvtav1 -crf N -preset 4–10`, always `yuv420p10le`, optional `film-grain=N:film-grain-denoise=1` |
+| SVT-AV1 | `libsvtav1 -crf (CQ+12) -preset 4-10`, always `yuv420p10le`, optional `film-grain=N:film-grain-denoise=1` |
 | Copy video | `-c:v copy`, no video filters or encoder flags |
 
-The shared preset knob maps to each family: P3–P6 are NVENC presets; SVT uses
+The shared preset knob maps to each family: P3-P6 are NVENC presets; SVT uses
 P3→10, P4→9, P5→8 (default), P6→7, P7→6, P8→5, P9→4; Quick Sync uses named
-presets; AMF uses speed/balanced/quality. Hardware encoders clamp P7–P9 to
-their slowest available preset.
+presets; AMF uses speed/balanced/quality. Hardware encoders clamp P7-P9 to
+their slowest available preset. The shared quality slider also maps to SVT's
+stricter CRF scale: libsvtav1 receives `CQ + 12` (CQ 28 ≈ CRF 40, CQ 32 = CRF
+44), so the same slider number means a comparable quality and size across
+encoder families.
 
 ### Verification and placement
 
@@ -292,9 +297,15 @@ backend, preset, and CQ on the current machine:
 
 | Goal | Resolution |
 | --- | --- |
-| Fastest | `auto`, P4, CQ 28 — least shrink, quickest encode |
-| Balanced | AV1 NVENC P5 CQ 28 when the trial passed; otherwise `auto` P5 CQ 28 |
-| Smallest | SVT-AV1 preset 6 (P7) CRF 32; then AV1 NVENC P6, HEVC NVENC P6, VideoToolbox/QSV/AMF HEVC P5, then `auto` P6 |
+| Fastest | `auto`, P4, CQ 30 - least shrink, quickest encode |
+| Balanced | AV1 NVENC P5 CQ 30 when the trial passed; otherwise `auto` P5 CQ 32 |
+| Smallest | SVT-AV1 preset 6 (P7) at shared CQ 32 (= CRF 44); then AV1 NVENC P6 CQ 34, HEVC NVENC P6 CQ 34, VideoToolbox/QSV/AMF HEVC P5 CQ 34, then `auto` P6 CQ 34 |
+
+The CQ values are shared-slider values calibrated against measured encodes,
+not nominal encoder numbers: SVT's CRF scale is stricter, so libsvtav1
+receives `CQ + 12` (`SVT_CRF_OFFSET` in `core/src/pipeline.rs`). Fastest
+and Balanced therefore deliver a real, visible shrink instead of the 2-5%
+that CQ 28 produced on already-efficient sources.
 
 Once files are loaded, each segment shows the measured trade-off for that
 batch: predicted shrink percentage and wall time from the size model. Editing
@@ -303,8 +314,9 @@ settings. Under Preserve quality, the CQ value is pinned by the mode, so
 segments match on encoder and preset only.
 
 Smallest has a second safety net: when its first full encode is not smaller
-than the source, it retries at CRF +4 (up to three attempts, capped at 40)
-before discarding the result. The run report names the final CRF.
+than the source, it retries at shared CQ +4 (up to three attempts, capped at
+CQ 40, i.e. SVT CRF 44 → 48 → 52) before discarding the result. The run report
+names the final CRF.
 
 ### Preserve quality
 

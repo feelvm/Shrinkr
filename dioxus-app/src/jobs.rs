@@ -18,6 +18,16 @@ use std::sync::{atomic::AtomicBool, atomic::AtomicUsize, atomic::Ordering, Arc, 
 use std::thread;
 use std::time::Instant;
 
+/// The CRF the encoder actually receives for a shared slider value. Only
+/// SVT-AV1 maps the shared CQ to a different scale.
+fn encoder_crf(backend: shrinkr_core::pipeline::VideoBackend, cq: u32) -> u32 {
+    if backend == shrinkr_core::pipeline::VideoBackend::CpuAv1 {
+        shrinkr_core::pipeline::svt_crf(cq)
+    } else {
+        cq
+    }
+}
+
 #[derive(Debug)]
 pub enum JobMsg {
     TargetsAdded(Vec<PathBuf>),
@@ -467,9 +477,11 @@ fn run_one_job(
                     tx,
                     JobMsg::ExecWarn {
                         msg: format!(
-                            "warn {fname}: CRF {cq} encoded {} but the source is {}; retrying at CRF {next}",
+                            "warn {fname}: CRF {} encoded {} but the source is {}; retrying at CRF {}",
+                            encoder_crf(params.backend, cq),
                             human_bytes(er.output_bytes),
-                            human_bytes(f.bytes)
+                            human_bytes(f.bytes),
+                            encoder_crf(params.backend, next)
                         ),
                     },
                 );
@@ -518,9 +530,10 @@ fn run_one_job(
                         tx,
                         JobMsg::ExecWarn {
                             msg: format!(
-                                "warn {fname}: auto CRF {cq} missed the full-file gate ({reason}); \
+                                "warn {fname}: auto CRF {} missed the full-file gate ({reason}); \
                                  retrying at CRF {}",
-                                shrinkr_core::quality::VIDEO_CQ
+                                encoder_crf(params.backend, cq),
+                                encoder_crf(params.backend, shrinkr_core::quality::VIDEO_CQ)
                             ),
                         },
                     );
@@ -536,7 +549,10 @@ fn run_one_job(
     };
     let quality_note = match score {
         Some(score) if auto.is_some_and(|a| a.cq == cq) => {
-            format!(", quality checked (SSIM {score:.4}, auto CRF {cq})")
+            format!(
+                ", quality checked (SSIM {score:.4}, auto CRF {})",
+                encoder_crf(params.backend, cq)
+            )
         }
         Some(score) => format!(", quality checked (SSIM {score:.4})"),
         None => String::new(),
@@ -573,7 +589,10 @@ fn run_one_job(
     );
     detail.push_str(&quality_note);
     if gain_retries > 0 {
-        detail.push_str(&format!(", raised to CRF {cq} after a no-gain attempt"));
+        detail.push_str(&format!(
+            ", raised to CRF {} after a no-gain attempt",
+            encoder_crf(params.backend, cq)
+        ));
     }
     if params.film_grain
         && params.backend == shrinkr_core::pipeline::VideoBackend::CpuAv1

@@ -1,7 +1,8 @@
 //! Benchmark mode: same source(s) through x264 CRF28 (baseline A), HEVC
 //! NVENC CQ28 at P3–P6 (B–E), plus AV1 NVENC P5 (F) and SVT-AV1 preset 8
 //! (G) when this machine can run them — recording size/time/fps/
-//! realtime/GPU per row.
+//! realtime/GPU per row. The shared CQ 28 maps to SVT CRF 40; the CSV
+//! reports the CRF the encoder actually received.
 //!
 //! Every successful row also feeds the estimate calibration
 //! (`crate::calib`): measured size vs the model's prediction becomes a

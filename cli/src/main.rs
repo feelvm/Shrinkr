@@ -47,7 +47,8 @@ fn cli_help() -> String {
      --target <400MB|2x|50%>  solve per-file quality for a size target\n\
      --benchmark <file|dir>   run the capability-gated encoder matrix per input\n\
      --bench-out <dir>        CSV + notes dir (default ./bench-out)\n\
-     --cq <18-40>             quality: NVENC CQ / x264/x265 CRF / AV1 CRF (default 28)\n\
+     --cq <18-40>             quality: NVENC CQ / x264/x265 CRF / shared AV1 CQ\n\
+     \u{20}                      (SVT-AV1 gets CRF = CQ + 12; default 28)\n\
      --scale <preserve|1080p|720p|480p|WxH>  video resolution; WxH caps\n\
      \u{20}                      the box, e.g. 1920x1080 (default preserve)\n\
      --image-cq <18-40>       image quality (default: --cq value)\n\
