@@ -1,3 +1,5 @@
 /target
 /.zcode
 /dist
+/.pins-tmp
+/signing

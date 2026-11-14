@@ -1,0 +1,25 @@
+# Pinned third-party FFmpeg builds used by Shrinkr — the release workflow
+# sidecars (release.yml) and the in-app Windows download (core/src/ffmpeg_fetch.rs)
+# verify every download against this file before anything is unpacked or run.
+# Verify locally with: sha256sum -c FFMPEG-PINS.sha256
+#
+# Bump procedure (see FFMPEG-NOTES.txt for attribution/licensing):
+#   1. Pick the new artifact (FFmpeg-Builds: use a dated `autobuild-YYYY-MM-DD`
+#      release tag, whose asset names are immutable — never the floating
+#      "latest" tag, whose assets are replaced on rebuilds).
+#   2. Download it, run it through the release sanity check, then add the
+#      asset name + SHA-256 here and update the URLs in release.yml and
+#      ffmpeg_fetch.rs to the same pinned tag.
+#   3. Record the build in FFMPEG-NOTES.txt.
+# Windows x64 — FFmpeg-Builds master autobuild N-128889-g88c46fce27 (2026-11-13)
+# https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-11-13-12-43/ffmpeg-N-128889-g88c46fce27-win64-gpl.zip
+35fa1c17eeead1f572072b134458788caf71c4a7fbce9e0bb2f3c41032959531  ffmpeg-N-128889-g88c46fce27-win64-gpl.zip
+# Linux x64 — same build as the Windows pin
+# https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-11-13-12-43/ffmpeg-N-128889-g88c46fce27-linux64-gpl.tar.xz
+efa8f93583e84d5a1036e7e08e19db9f03ca637d7620ed58b0ecca39e9e34323  ffmpeg-N-128889-g88c46fce27-linux64-gpl.tar.xz
+# macOS arm64 — osxexperts.net, ffmpeg 9.0.2 (checked 2026-11-14)
+# https://www.osxexperts.net/ffmpeg902arm.zip
+4597f0f3a397cc0027bfd03dc4dd9c3066be15943cc788370846b4305d178bcb  ffmpeg902arm.zip
+# macOS arm64 — osxexperts.net, ffprobe 9.0.2 (checked 2026-11-14)
+# https://www.osxexperts.net/ffprobe902arm.zip
+c765d316eb210f3c98de6f9688df784552f3f8f586090e2a8cb871be9003164e  ffprobe902arm.zip

@@ -49,16 +49,27 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} -p shrinkr -p shrinkr-cli
 
       # The archives ship static ffmpeg/ffprobe sidecars so users don't
-      # need to install anything. Sources per platform (see
-      # FFMPEG-NOTES.txt for attribution/licensing):
-      #   Windows/Linux : BtbN FFmpeg-Builds (permanent "latest" URLs)
-      #   macOS arm64   : osxexperts.net (versioned names — scrape the page)
+      # need to install anything. Every download is pinned to an immutable
+      # artifact AND verified against FFMPEG-PINS.sha256 before anything is
+      # unpacked — the same pins file core/src/ffmpeg_fetch.rs checks at
+      # runtime, so release builds and in-app downloads can never drift.
+      # Bump procedure: FFMPEG-PINS.sha256 header + FFMPEG-NOTES.txt.
       - name: Download FFmpeg sidecars (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
+          $tag = "autobuild-2026-11-13-12-43"
+          $asset = "ffmpeg-N-128889-g88c46fce27-win64-gpl.zip"
+          $pin = Select-String -Path FFMPEG-PINS.sha256 -Pattern ([regex]::Escape($asset)) |
+            Select-Object -First 1
+          if (-not $pin) { throw "no SHA-256 pin for $asset in FFMPEG-PINS.sha256" }
+          $expected = ($pin.Line.Trim() -split '\s+')[0].ToLower()
+          Invoke-WebRequest -Uri "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/$tag/$asset" -OutFile ffmpeg.zip
+          $actual = (Get-FileHash -Algorithm SHA256 ffmpeg.zip).Hash.ToLower()
+          if ($actual -ne $expected) {
+            throw "ffmpeg.zip checksum mismatch: got $actual, expected $expected (see FFMPEG-PINS.sha256)"
+          }
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-build
           New-Item -ItemType Directory -Force sidecars | Out-Null
           Copy-Item (Get-ChildItem -Recurse ffmpeg-build -Filter ffmpeg.exe | Select-Object -First 1).FullName sidecars/ffmpeg.exe
@@ -68,7 +79,16 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          curl -fsSL -o ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          tag="autobuild-2026-11-13-12-43"
+          asset="ffmpeg-N-128889-g88c46fce27-linux64-gpl.tar.xz"
+          expected=$(grep -E "[[:space:]]${asset}\$" FFMPEG-PINS.sha256 | awk '{print $1}')
+          if [ -z "$expected" ]; then
+            echo "no SHA-256 pin for $asset in FFMPEG-PINS.sha256" >&2; exit 1
+          fi
+          curl -fsSL -o ffmpeg.tar.xz "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/$tag/$asset"
+          echo "$expected  ffmpeg.tar.xz" | sha256sum -c - >/dev/null || {
+            echo "ffmpeg.tar.xz checksum mismatch against FFMPEG-PINS.sha256" >&2; exit 1
+          }
           mkdir ffmpeg-build sidecars
           tar -xf ffmpeg.tar.xz -C ffmpeg-build
           cp -v "$(find ffmpeg-build -type f -name ffmpeg -print -quit)" sidecars/ffmpeg
@@ -78,15 +98,20 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          page=$(curl -fsSL https://www.osxexperts.net/)
-          ff=$(echo "$page" | grep -o 'ffmpeg[0-9]*arm\.zip' | head -n1)
-          fp=$(echo "$page" | grep -o 'ffprobe[0-9]*arm\.zip' | head -n1)
-          if [ -z "$ff" ] || [ -z "$fp" ]; then
-            echo "could not locate ffmpeg/ffprobe Apple Silicon zips on osxexperts.net" >&2
-            exit 1
-          fi
-          curl -fsSL -o ffmpeg.zip "https://www.osxexperts.net/$ff"
-          curl -fsSL -o ffprobe.zip "https://www.osxexperts.net/$fp"
+          curl -fsSL -o ffmpeg.zip "https://www.osxexperts.net/ffmpeg902arm.zip"
+          curl -fsSL -o ffprobe.zip "https://www.osxexperts.net/ffprobe902arm.zip"
+          for pair in "ffmpeg.zip:ffmpeg902arm.zip" "ffprobe.zip:ffprobe902arm.zip"; do
+            f="${pair%%:*}"; asset="${pair##*:}"
+            expected=$(grep -E "[[:space:]]${asset}\$" FFMPEG-PINS.sha256 | awk '{print $1}')
+            if [ -z "$expected" ]; then
+              echo "no SHA-256 pin for $asset in FFMPEG-PINS.sha256" >&2; exit 1
+            fi
+            actual=$(shasum -a 256 "$f" | awk '{print $1}')
+            if [ "$actual" != "$expected" ]; then
+              echo "$f checksum mismatch: got $actual, expected $expected (FFMPEG-PINS.sha256)" >&2
+              exit 1
+            fi
+          done
           mkdir ffmpeg-build ffprobe-build sidecars
           unzip -j ffmpeg.zip -d ffmpeg-build
           unzip -j ffprobe.zip -d ffprobe-build
