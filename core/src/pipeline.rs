@@ -1354,6 +1354,14 @@ fn bitrate_suggests_headroom(m: &MediaFile) -> bool {
 /// Returns `(w,h)` to scale to (even numbers, aspect preserved), or `None`
 /// to keep the source resolution. Never upscales.
 ///
+/// The result is in DISPLAY-oriented space: ffmpeg's default `autorotate`
+/// applies the display-matrix rotation *before* user filters, so the
+/// frames entering `-vf scale` are already rotated. Computing the target
+/// from the coded dimensions instead would feed rotated frames into a
+/// coded-space target and squash the aspect ratio (e.g. a portrait phone
+/// clip coded 1920x1080 rot90 under "Force 720p" would come out 1280x720
+/// landscape). Pixel counts are unaffected, so size estimates stay valid.
+///
 /// The preset caps apply to the SHORT side so landscape `1920x1080` and
 /// portrait `1080x1920` are treated identically (both are "1080p-class"),
 /// matching the bitrate-headroom tiers. Keying off height alone would
@@ -1361,7 +1369,8 @@ fn bitrate_suggests_headroom(m: &MediaFile) -> bool {
 /// `Custom(w, h)` instead fits inside the box: each side is its own cap,
 /// so landscape sources hit the width limit and portrait ones the height.
 pub fn scale_target(m: &MediaFile, policy: ScalePolicy) -> Option<(u32, u32)> {
-    if m.width < 16 || m.height < 16 {
+    let (w, h) = m.display_dims();
+    if w < 16 || h < 16 {
         return None;
     }
     // Uniform shrink factor (< 1.0), or None to keep the source
@@ -1369,25 +1378,25 @@ pub fn scale_target(m: &MediaFile, policy: ScalePolicy) -> Option<(u32, u32)> {
     // stay untouched.
     let k = match policy {
         ScalePolicy::Preserve => return None,
-        ScalePolicy::Force1080p => short_side_k(m, 1080)?,
-        ScalePolicy::Force720p => short_side_k(m, 720)?,
-        ScalePolicy::Force480p => short_side_k(m, 480)?,
+        ScalePolicy::Force1080p => short_side_k(w, h, 1080)?,
+        ScalePolicy::Force720p => short_side_k(w, h, 720)?,
+        ScalePolicy::Force480p => short_side_k(w, h, 480)?,
         ScalePolicy::Custom(bw, bh) => {
             let (bw, bh) = (bw.max(2), bh.max(2));
-            if m.width <= bw && m.height <= bh {
+            if w <= bw && h <= bh {
                 return None;
             }
-            (bw as f64 / m.width as f64).min(bh as f64 / m.height as f64)
+            (bw as f64 / w as f64).min(bh as f64 / h as f64)
         }
     };
     let even = |v: u32| (((v as f64 * k) / 2.0).round() as u32 * 2).max(2);
-    Some((even(m.width), even(m.height)))
+    Some((even(w), even(h)))
 }
 
 /// Shrink factor for a short-side cap, or `None` when the source already
 /// fits (short side at/below the cap).
-fn short_side_k(m: &MediaFile, cap: u32) -> Option<f64> {
-    let short = m.width.min(m.height);
+fn short_side_k(w: u32, h: u32, cap: u32) -> Option<f64> {
+    let short = w.min(h);
     if short <= cap {
         return None;
     }
@@ -1400,11 +1409,12 @@ fn short_side_k(m: &MediaFile, cap: u32) -> Option<f64> {
 /// With `Preserve` on odd input this yields a 1px shave instead of a
 /// guaranteed failure on every fallback level.
 pub fn effective_scale_target(m: &MediaFile, policy: ScalePolicy) -> Option<(u32, u32)> {
+    let (w, h) = m.display_dims();
     if let Some(t) = scale_target(m, policy) {
         return Some(t);
     }
-    if m.width >= 2 && m.height >= 2 && (m.width % 2 == 1 || m.height % 2 == 1) {
-        Some((m.width - m.width % 2, m.height - m.height % 2))
+    if w >= 2 && h >= 2 && (w % 2 == 1 || h % 2 == 1) {
+        Some((w - w % 2, h - h % 2))
     } else {
         None
     }
@@ -1660,6 +1670,7 @@ mod tests {
                 sample_rate: Some(48000),
             }],
             acodec: "aac".into(),
+            rotation_deg: 0,
             video_stream_count: 1,
             audio_stream_count: 1,
             sub_count: 0,
@@ -1939,6 +1950,39 @@ mod tests {
         );
         m.width = 640;
         assert_eq!(effective_scale_target(&m, ScalePolicy::Preserve), None);
+    }
+
+    #[test]
+    fn rotated_sources_scale_in_display_space() {
+        // A portrait phone clip coded 1920x1080 with a 90° display matrix:
+        // players show 1080x1920, and ffmpeg's autorotate transposes the
+        // frames *before* user filters, so the target must be display-space.
+        let mut m = file("h264", 1920, 1080, 1_000_000_000, Some(12_000_000));
+        m.rotation_deg = 90;
+        assert_eq!(scale_target(&m, ScalePolicy::Force720p), Some((720, 1280)));
+        assert_eq!(
+            effective_scale_target(&m, ScalePolicy::Force720p),
+            Some((720, 1280))
+        );
+        // 180° rotation keeps the axis order; 270° swaps like 90°.
+        m.rotation_deg = 180;
+        assert_eq!(scale_target(&m, ScalePolicy::Force720p), Some((1280, 720)));
+        m.rotation_deg = 270;
+        assert_eq!(scale_target(&m, ScalePolicy::Force720p), Some((720, 1280)));
+        // Custom boxes fit the displayed picture: a portrait display hits
+        // the height cap where the coded frame would hit the width cap.
+        m.rotation_deg = 90;
+        assert_eq!(
+            scale_target(&m, ScalePolicy::Custom(1920, 1080)),
+            Some((608, 1080))
+        );
+        // Preserve shaves odd *displayed* dimensions, not coded ones.
+        let mut odd = file("mpeg4", 1081, 1920, 100_000_000, Some(1_000_000));
+        odd.rotation_deg = 90; // displays 1920x1081
+        assert_eq!(
+            effective_scale_target(&odd, ScalePolicy::Preserve),
+            Some((1920, 1080))
+        );
     }
 
     #[test]

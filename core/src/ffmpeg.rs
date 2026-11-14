@@ -986,11 +986,9 @@ pub fn run_with_fallback(
         .iter()
         .map(|e| {
             const CAP: usize = 300;
-            if e.len() > CAP {
-                format!("{}â€¦", &e[..CAP])
-            } else {
-                e.clone()
-            }
+            // Char-boundary-safe: ffmpeg stderr embeds input paths, so a
+            // non-ASCII filename here would panic a byte-index slice.
+            crate::text::truncate_head(e, CAP)
         })
         .collect::<Vec<_>>()
         .join("  âŸ¶  ");
@@ -1243,11 +1241,9 @@ fn error_snippet(tail: &str, status: std::process::ExitStatus) -> String {
     }
     const CAP: usize = 600;
     let s = parts.join(" | ");
-    if s.len() > CAP {
-        format!("{}â€¦", &s[..CAP])
-    } else {
-        s
-    }
+    // Char-boundary-safe: stderr embeds input paths, so this can be
+    // non-ASCII (a byte-index slice would panic mid-character).
+    crate::text::truncate_head(&s, CAP)
 }
 
 fn run_once(
@@ -1914,6 +1910,7 @@ mod tests {
             audio_stream_count: 0,
             sub_count: 0,
             attach_count: 0,
+            rotation_deg: 0,
             has_chapters: false,
         }
     }

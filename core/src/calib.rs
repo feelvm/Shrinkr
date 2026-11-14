@@ -208,6 +208,7 @@ mod tests {
             audio_stream_count: 1,
             sub_count: 0,
             attach_count: 0,
+            rotation_deg: 0,
             has_chapters: false,
         }
     }

@@ -53,6 +53,11 @@ pub struct MediaFile {
     pub audio: Vec<AudioTrack>,
     /// primary audio codec ("none" when the file has no audio).
     pub acodec: String,
+    /// Display-matrix rotation in degrees, normalized to 0/90/180/270.
+    /// Phone recordings store coded frames landscape plus this metadata;
+    /// players autorotate on decode, so 90/270 means the *displayed*
+    /// picture swaps width and height.
+    pub rotation_deg: i32,
     // other streams
     pub video_stream_count: usize,
     pub audio_stream_count: usize,
@@ -62,10 +67,24 @@ pub struct MediaFile {
 }
 
 impl MediaFile {
-    /// Short `1920x1080`-style label (falls back to `?` when unknown).
+    /// Dimensions as displayed by a player: width/height with 90°/270°
+    /// display-matrix rotation applied. ffmpeg's default `autorotate`
+    /// applies the rotation *before* user filters, so scale policies,
+    /// SSIM references and dimension comparisons must work in this space.
+    /// Tolerates un-normalized values (probe stores 0/90/180/270).
+    pub fn display_dims(&self) -> (u32, u32) {
+        match self.rotation_deg.rem_euclid(360) {
+            90 | 270 => (self.height, self.width),
+            _ => (self.width, self.height),
+        }
+    }
+
+    /// Short `1920x1080`-style label (display-oriented; falls back to `?`
+    /// when unknown).
     pub fn res_label(&self) -> String {
-        if self.width > 0 && self.height > 0 {
-            format!("{}x{}", self.width, self.height)
+        let (w, h) = self.display_dims();
+        if w > 0 && h > 0 {
+            format!("{}x{}", w, h)
         } else {
             "?".to_string()
         }
@@ -146,6 +165,62 @@ struct StreamJson {
     channel_layout: Option<String>,
     #[serde(default)]
     sample_rate: Option<String>,
+    /// Modern ffprobe reports rotation as `side_data_list` with
+    /// `side_data_type: "Display Matrix"` and a `rotation` field.
+    #[serde(default)]
+    side_data_list: Option<Vec<SideDataJson>>,
+    /// Legacy fallback: pre-5.x files carry `tags: { rotate: "90" }`.
+    #[serde(default)]
+    tags: Option<StreamTagsJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SideDataJson {
+    #[serde(default)]
+    side_data_type: Option<String>,
+    /// Degrees, may be negative (e.g. -90.0). Counter-clockwise per the
+    /// display matrix; only the mod-180 orientation matters here.
+    #[serde(default)]
+    rotation: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamTagsJson {
+    #[serde(default, rename = "rotate")]
+    rotate: Option<String>,
+}
+
+/// Normalized display rotation (0/90/180/270) for one stream's metadata.
+/// Accepts both the modern display-matrix field and the legacy `rotate`
+/// tag; negative and >360 values wrap into the [0, 360) range.
+fn rotation_of(s: &StreamJson) -> i32 {
+    let raw: Option<f64> = s
+        .side_data_list
+        .as_ref()
+        .and_then(|list| {
+            list.iter()
+                .find(|sd| {
+                    sd.side_data_type
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case("Display Matrix"))
+                })
+                .and_then(|sd| sd.rotation)
+        })
+        .or_else(|| {
+            s.tags
+                .as_ref()
+                .and_then(|t| t.rotate.as_deref())
+                .and_then(|r| r.parse::<f64>().ok())
+        });
+    let Some(v) = raw else { return 0 };
+    let norm = (v.rem_euclid(360.0)).round() as i32;
+    match norm {
+        90 | 180 | 270 => norm,
+        // Near-0 (±2°) is the common "no real rotation" case; anything
+        // else off-grid is a broken matrix — ignore rather than guess.
+        n if n <= 2 || n >= 358 => 0,
+        _ => 0,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,6 +301,7 @@ pub fn probe_file(path: &Path) -> Result<MediaFile> {
     let mut color_transfer = String::new();
     let mut color_range = String::new();
     let mut vbitrate: Option<u64> = None;
+    let mut rotation = 0i32;
     let mut video_n = 0usize;
     let mut audio: Vec<AudioTrack> = vec![];
     let mut sub_n = 0usize;
@@ -253,6 +329,7 @@ pub fn probe_file(path: &Path) -> Result<MediaFile> {
                     vcodec = s.codec_name.clone().unwrap_or_else(|| "unknown".into());
                     w = s.width.unwrap_or(0);
                     h = s.height.unwrap_or(0);
+                    rotation = rotation_of(s);
                     // prefer avg_frame_rate, fall back to r_frame_rate
                     let a = s.avg_frame_rate.as_deref().unwrap_or("0/0");
                     let r = s.r_frame_rate.as_deref().unwrap_or("0/0");
@@ -322,6 +399,7 @@ pub fn probe_file(path: &Path) -> Result<MediaFile> {
         duration_s: dur,
         acodec,
         audio,
+        rotation_deg: rotation,
         video_stream_count: video_n,
         audio_stream_count: audio_n,
         sub_count: sub_n,
@@ -355,4 +433,91 @@ pub fn probe_parallelism() -> usize {
         .map(|n| n.get())
         .unwrap_or(4)
         .clamp(2, 8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream_json(json: &str) -> StreamJson {
+        serde_json::from_str(json).expect("stream json parses")
+    }
+
+    #[test]
+    fn rotation_parsed_from_display_matrix_and_legacy_tag() {
+        // Modern ffprobe: Display Matrix side data, negative degrees.
+        let s = stream_json(
+            r#"{"codec_type":"video","side_data_list":[
+                {"side_data_type":"Display Matrix","displaymatrix":"00000000","rotation":-90}]}"#,
+        );
+        assert_eq!(rotation_of(&s), 270);
+        let s = stream_json(
+            r#"{"codec_type":"video","side_data_list":[
+                {"side_data_type":"Display Matrix","rotation":90}]}"#,
+        );
+        assert_eq!(rotation_of(&s), 90);
+        // Legacy pre-5.x tag.
+        let s = stream_json(r#"{"codec_type":"video","tags":{"rotate":"180"}}"#);
+        assert_eq!(rotation_of(&s), 180);
+        // No metadata at all.
+        let s = stream_json(r#"{"codec_type":"video"}"#);
+        assert_eq!(rotation_of(&s), 0);
+        // Off-grid / near-zero matrices are ignored, not guessed.
+        let s = stream_json(
+            r#"{"codec_type":"video","side_data_list":[
+                {"side_data_type":"Display Matrix","rotation":-1.5}]}"#,
+        );
+        assert_eq!(rotation_of(&s), 0);
+        let s = stream_json(
+            r#"{"codec_type":"video","side_data_list":[
+                {"side_data_type":"Display Matrix","rotation":47.0}]}"#,
+        );
+        assert_eq!(rotation_of(&s), 0);
+        // Non-display side data must not match.
+        let s = stream_json(
+            r#"{"codec_type":"video","side_data_list":[
+                {"side_data_type":"Spherical Mapping","rotation":90}]}"#,
+        );
+        assert_eq!(rotation_of(&s), 0);
+    }
+
+    fn video_media(rotation_deg: i32) -> MediaFile {
+        MediaFile {
+            path: "t.mp4".into(),
+            bytes: 1_000_000,
+            vcodec: "h264".into(),
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            pix_fmt: "yuv420p".into(),
+            bit_depth: 8,
+            color_space: String::new(),
+            color_primaries: String::new(),
+            color_transfer: String::new(),
+            color_range: String::new(),
+            vbitrate: None,
+            format_bitrate: None,
+            duration_s: 10.0,
+            audio: vec![],
+            acodec: "none".into(),
+            rotation_deg,
+            video_stream_count: 1,
+            audio_stream_count: 0,
+            sub_count: 0,
+            attach_count: 0,
+            has_chapters: false,
+        }
+    }
+
+    #[test]
+    fn display_dims_swap_quarter_turns_only() {
+        for rot in [0, 180, 360, -180] {
+            assert_eq!(video_media(rot).display_dims(), (1920, 1080), "rot {rot}");
+        }
+        for rot in [90, 270, -90, -270] {
+            assert_eq!(video_media(rot).display_dims(), (1080, 1920), "rot {rot}");
+        }
+        // res_label reports what the user sees, not what is coded.
+        assert_eq!(video_media(90).res_label(), "1080x1920");
+    }
 }

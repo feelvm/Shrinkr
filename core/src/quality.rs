@@ -163,7 +163,13 @@ pub fn verify(source: &MediaFile, output: &Path, cancel: &Arc<AtomicBool>) -> Re
             }
         }
     }
-    let scores = compare_ssim(&source.path, output, result.width, result.height, cancel)?;
+    // The SSIM reference must be sized to what the output *decodes to*, not
+    // to its coded dimensions: ffmpeg's autorotate bakes rotation into the
+    // re-encoded frames, so a rotated source's output decodes display-
+    // oriented. Comparing in coded space would squash the reference and
+    // false-fail every rotated source.
+    let (vw, vh) = result.display_dims();
+    let scores = compare_ssim(&source.path, output, vw, vh, cancel)?;
     scores.verify()
 }
 
@@ -307,7 +313,7 @@ pub fn auto_cq(
         return None;
     }
     let (width, height) = effective_scale_target(media, scale)
-        .unwrap_or((media.width, media.height))
+        .unwrap_or_else(|| media.display_dims())
         .max((16, 16));
     let dir = search_dir(work_dir);
     if std::fs::create_dir_all(&dir).is_err() {
@@ -488,6 +494,7 @@ mod tests {
                 layout: "stereo".into(),
             }],
             acodec: "aac".into(),
+            rotation_deg: 0,
             video_stream_count: 1,
             audio_stream_count: 1,
             sub_count: 0,

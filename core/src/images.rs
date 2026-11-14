@@ -1085,11 +1085,9 @@ pub fn encode_image(
             let mut r = err;
             let _ = r.read_to_end(&mut buf);
             let s = String::from_utf8_lossy(&buf);
-            let tail: String = if s.len() > 2000 {
-                s[s.len() - 2000..].to_string()
-            } else {
-                s.into_owned()
-            };
+            // Char-boundary-safe tail: ffmpeg stderr embeds input paths,
+            // which can be non-ASCII (a byte-index slice would panic).
+            let tail: String = crate::text::truncate_tail(&s, 2000);
             if let Ok(mut g) = tail2.lock() {
                 *g = tail;
             }
@@ -1286,6 +1284,7 @@ mod tests {
             audio_stream_count: 0,
             sub_count: 0,
             attach_count: 0,
+            rotation_deg: 0,
             has_chapters: false,
         }
     }
