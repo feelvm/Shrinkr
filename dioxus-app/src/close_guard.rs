@@ -136,7 +136,7 @@ mod unix {
         std::thread::spawn(move || {
             let quit = rfd::MessageDialog::new()
                 .set_title(CONFIRM_TITLE)
-                .set_text(CONFIRM_TEXT)
+                .set_description(CONFIRM_TEXT)
                 .set_buttons(rfd::MessageButtons::YesNo)
                 .set_level(rfd::MessageLevel::Warning)
                 .show();
