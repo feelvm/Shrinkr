@@ -134,13 +134,14 @@ mod unix {
             return;
         }
         std::thread::spawn(move || {
-            let quit = rfd::MessageDialog::new()
+            let result = rfd::MessageDialog::new()
                 .set_title(CONFIRM_TITLE)
                 .set_description(CONFIRM_TEXT)
                 .set_buttons(rfd::MessageButtons::YesNo)
                 .set_level(rfd::MessageLevel::Warning)
                 .show();
             DIALOG_PENDING.store(false, Ordering::Relaxed);
+            let quit = matches!(result, rfd::MessageDialogResult::Yes);
             let _ = tx.unbounded_send(crate::jobs::JobMsg::CloseGuardResolved { quit });
         });
     }
