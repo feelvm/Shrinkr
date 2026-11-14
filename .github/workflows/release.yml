@@ -293,4 +293,4 @@ jobs:
           ls | grep -v '^SHA256SUMS' | xargs sha256sum > ../SHA256SUMS.txt
           cd ..
           cat SHA256SUMS.txt
-          gh release upload "$tag" SHA256SUMS.txt --clobber
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" SHA256SUMS.txt --clobber
