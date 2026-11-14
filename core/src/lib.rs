@@ -19,4 +19,5 @@ pub mod pipeline;
 pub mod process;
 pub mod quality;
 pub mod target;
+pub mod text;
 pub mod update;
