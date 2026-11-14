@@ -144,6 +144,16 @@ at CRF +4, up to three attempts and capped at CRF 40; every retry is logged and
 the final report names the CRF that won. Other backends keep the quality the
 user selected and report no gain instead of silently degrading the picture.
 
+Wall-time estimates use single-stream throughput measured at 1080p, scaled by
+the preset and output area: x264 medium ~90 fps, x265 slow ~18, SVT-AV1
+preset 8 ~80, NVENC HEVC ~470. Workers do not multiply encoder throughput —
+one NVENC engine is shared (four workers measured ~1.25× one session) and a
+CPU encode already uses every core — so `parallel` contributes only a small
+overlap gain. Full-file SSIM checks are CPU-bound and scale better (~2× with
+four workers). Under Preserve quality the per-file time also includes the CQ
+sample search and the complete-file SSIM gate, which on fast hardware
+encoders can cost more than the encode itself.
+
 ### Stream planning
 
 The default plan keeps:

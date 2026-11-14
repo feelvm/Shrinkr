@@ -122,34 +122,204 @@ impl Goal {
 /// cannot run or its choice misses the full-file gate.
 pub const PRESERVE_QUALITY_CQ: u32 = shrinkr_core::quality::VIDEO_CQ;
 
-/// Measured-fps table for wall-time estimates. Shared by the batch
-/// estimate, the per-goal segment estimates and the live queue ETA.
+/// Single-stream encoder rate at the 1080p reference area. These are
+/// engine-throughput numbers, not per-worker rates: one NVENC engine is
+/// shared by every worker, and a CPU encode already spreads across all
+/// cores. Conservative on purpose — an ETA that finishes early is worse
+/// than one that finishes a little late.
 fn backend_fps(backend: VideoBackend) -> f64 {
     match backend {
         VideoBackend::CpuX264 => 90.0,
-        VideoBackend::CpuX265 => 45.0,
-        VideoBackend::CpuAv1 => 120.0, // SVT-AV1 preset 8, measured 145+ fps
-        // AV1 hardware sits a notch under the HEVC engines on the same die;
-        // the other families' HEVC is NVENC-class on their own machines.
-        VideoBackend::Av1Nvenc | VideoBackend::QsvAv1 | VideoBackend::AmfAv1 => 500.0,
-        _ => 600.0,
+        // x265 runs its fixed `slow` preset: ~18 fps measured at 1080p on
+        // a laptop Ryzen. The old 45 fps was a medium-preset number.
+        VideoBackend::CpuX265 => 18.0,
+        // SVT-AV1 preset 8 measured 80–82 fps at 1080p here; slower
+        // presets are handled by `preset_factor`.
+        VideoBackend::CpuAv1 => 80.0,
+        // One session of HEVC NVENC measured ~470 fps at 1080p; AV1
+        // hardware is the same speed class on the dies that have it.
+        VideoBackend::Av1Nvenc
+        | VideoBackend::QsvAv1
+        | VideoBackend::AmfAv1
+        | VideoBackend::HevcNvenc
+        | VideoBackend::H264Nvenc
+        | VideoBackend::VtHevc
+        | VideoBackend::QsvHevc
+        | VideoBackend::AmfHevc => 470.0,
+        // Audio-only pass: video is stream-copied, so wall time is
+        // remux-bound (~1000 fps measured) rather than encoder-bound.
+        VideoBackend::CopyVideo => 1000.0,
+        // Auto resolves through `resolve_backend` before this is called;
+        // an unresolved Auto (caps not probed yet) assumes hardware.
+        VideoBackend::Auto => 470.0,
     }
 }
+
+/// Relative speed of the preset knob inside one encoder family. The
+/// x264/x265 paths pin their own preset (medium/slow), while SVT and
+/// NVENC move with the shared P knob.
+fn preset_factor(backend: VideoBackend, preset: NvencPreset) -> f64 {
+    match backend {
+        // SVT roughly doubles in speed every two presets; 8 is the
+        // reference the 80 fps table entry was measured at.
+        VideoBackend::CpuAv1 => match preset.svt() {
+            10 => 2.0,
+            9 => 1.4,
+            8 => 1.0,
+            7 => 0.70,
+            6 => 0.50,
+            5 => 0.35,
+            _ => 0.25,
+        },
+        VideoBackend::CpuX264 | VideoBackend::CpuX265 => 1.0,
+        // NVENC's P knobs move the rate by roughly 15% per step.
+        _ => match preset {
+            NvencPreset::P3 => 1.30,
+            NvencPreset::P4 => 1.15,
+            NvencPreset::P5 => 1.0,
+            NvencPreset::P6 => 0.85,
+            NvencPreset::P7 | NvencPreset::P8 | NvencPreset::P9 => 0.80,
+        },
+    }
+}
+
+/// Area the fps table is calibrated at (1920×1080).
+const FPS_REF_PIXELS: f64 = 1920.0 * 1080.0;
+
+/// Full-file SSIM check rate at 1080p: ffmpeg decodes both files, scales
+/// the source to the output size and compares every frame (~213 fps
+/// measured). Slower than the encode on fast hardware encoders, so it
+/// must be in the estimate — Preserve quality runs it on every file.
+const VERIFY_FPS_1080P: f64 = 200.0;
 
 /// Encoder work for one still image. Stills encode in well under a
 /// second; the frames-per-second table doesn't apply to a single frame.
 /// Shared by the plan estimate and the live queue ETA.
 const IMAGE_WORK_SECS: f64 = 0.35;
 
-/// Encoder seconds one file costs under `backend`, before dividing by
-/// the worker count: videos use the shared fps table, stills the flat
-/// per-image cost.
-fn file_work_secs(f: &MediaFile, backend: VideoBackend) -> f64 {
-    if shrinkr_core::images::is_shrinkable_image(&f.path) {
-        IMAGE_WORK_SECS
+/// Output frame area for a file under `p`, in pixels.
+fn output_pixels(f: &MediaFile, p: &EstParams) -> f64 {
+    let (w, h) = shrinkr_core::pipeline::effective_scale_target(f, p.scale)
+        .unwrap_or_else(|| f.display_dims());
+    f64::from(w.max(2)) * f64::from(h.max(2))
+}
+
+/// Throughput multiplier for a larger-than-1080p frame. Hardware
+/// sessions cap frame rate before they cap pixels, so smaller outputs
+/// don't get a speed-up; above 1080p the per-frame cost grows with area.
+fn area_factor(pixels: f64) -> f64 {
+    if pixels <= FPS_REF_PIXELS {
+        1.0
     } else {
-        f.total_frames() / backend_fps(backend)
+        (FPS_REF_PIXELS / pixels).max(0.05)
     }
+}
+
+/// Seconds the full-file SSIM gate adds to one file under Preserve
+/// quality. The comparison decodes `max(source, output)` resolution, so
+/// a 4K source downscaled to 720p still pays the 4K decode.
+fn verify_secs(f: &MediaFile, p: &EstParams) -> f64 {
+    if !p.preserve_quality
+        || p.backend == VideoBackend::CopyVideo
+        || shrinkr_core::images::is_shrinkable_image(&f.path)
+    {
+        return 0.0;
+    }
+    let (sw, sh) = f.display_dims();
+    let source_px = f64::from(sw.max(2)) * f64::from(sh.max(2));
+    let pixels = source_px.max(output_pixels(f, p));
+    f.total_frames() / (VERIFY_FPS_1080P * area_factor(pixels))
+}
+
+/// Seconds the Preserve-quality CQ search adds before the real encode:
+/// up to five probes, each encoding and scoring the same short sample
+/// windows, plus an ffmpeg launch per probe.
+fn search_secs(f: &MediaFile, p: &EstParams, backend: VideoBackend) -> f64 {
+    if !p.preserve_quality || p.backend == VideoBackend::CopyVideo || f.duration_s < 4.0 {
+        return 0.0;
+    }
+    let len = (f.duration_s / 12.0)
+        .clamp(1.5, 3.0)
+        .min(f.duration_s / 2.0);
+    let windows = if f.duration_s >= len * 4.0 { 3.0 } else { 1.0 };
+    let source_fps = f.total_frames() / f.duration_s;
+    let sample_frames = len * windows * source_fps;
+    let (sw, sh) = f.display_dims();
+    let source_px = f64::from(sw.max(2)) * f64::from(sh.max(2));
+    let pixels = source_px.max(output_pixels(f, p));
+    let fps = backend_fps(backend) * preset_factor(backend, p.preset) * area_factor(pixels);
+    // Five probe encodes + five SSIM comparisons of the same windows.
+    let per_probe = sample_frames / fps + sample_frames / (VERIFY_FPS_1080P * area_factor(pixels));
+    5.0 * (per_probe + 0.35)
+}
+
+/// Wall-time speed-up from `parallel` workers. Extra workers overlap
+/// I/O and quality checking, but they do not multiply encoder throughput:
+/// NVENC has one shared engine (4 workers measured ~1.25× one session),
+/// and each CPU encode already uses all cores. Linear scaling was the
+/// reason the old ETA ran 2–4× short.
+fn parallel_gain(parallel: usize) -> f64 {
+    if parallel <= 1 {
+        1.0
+    } else {
+        (1.0 + 0.08 * (parallel - 1) as f64).min(1.25)
+    }
+}
+
+/// Speed-up for quality checks (SSIM + CQ search), which are CPU-bound.
+/// Four concurrent full-file checks measured ~2.1× one check on a
+/// laptop Ryzen, so these overlap much better than encoder sessions.
+fn verify_gain(parallel: usize) -> f64 {
+    if parallel <= 1 {
+        1.0
+    } else {
+        (1.0 + 0.35 * (parallel - 1) as f64).min(2.2)
+    }
+}
+
+/// `Auto` resolved the way the encoder ladder resolves it: HEVC NVENC
+/// first, then the other hardware families, then x264.
+fn resolve_backend(backend: VideoBackend, caps: Option<&HwCaps>) -> VideoBackend {
+    if backend != VideoBackend::Auto {
+        return backend;
+    }
+    let Some(caps) = caps else {
+        return VideoBackend::Auto;
+    };
+    if caps.hevc_nvenc {
+        VideoBackend::HevcNvenc
+    } else if caps.h264_nvenc {
+        VideoBackend::H264Nvenc
+    } else if caps.vt_hevc {
+        VideoBackend::VtHevc
+    } else if caps.qsv_hevc {
+        VideoBackend::QsvHevc
+    } else if caps.amf_hevc {
+        VideoBackend::AmfHevc
+    } else {
+        VideoBackend::CpuX264
+    }
+}
+
+/// Seconds the encoder alone needs for one video at the single-stream
+/// rate: table fps × preset factor × output-area factor.
+fn encode_secs(f: &MediaFile, p: &EstParams, backend: VideoBackend) -> f64 {
+    let fps =
+        backend_fps(backend) * preset_factor(backend, p.preset) * area_factor(output_pixels(f, p));
+    f.total_frames() / fps
+}
+
+/// `(encoder seconds, quality-check seconds)` for one file under the
+/// single-stream assumptions: the encoder and the Preserve-quality search
+/// plus full-file SSIM gate run serially on a worker, but compete for
+/// different resources across workers, so the ETA divides each by its own
+/// measured gain. Stills keep the flat per-image cost.
+fn file_work_parts(f: &MediaFile, p: &EstParams, backend: VideoBackend) -> (f64, f64) {
+    if shrinkr_core::images::is_shrinkable_image(&f.path) {
+        return (IMAGE_WORK_SECS, 0.0);
+    }
+    let checks = search_secs(f, p, backend) + verify_secs(f, p);
+    (encode_secs(f, p, backend), checks)
 }
 
 /// Estimated `(source_bytes, output_bytes)` for one file under `params`.
@@ -1048,20 +1218,29 @@ impl AppState {
     /// queue click raises it immediately and progress lowers the current
     /// batch's share. Rows already done, failed, removed or skipped
     /// contribute nothing. `None` when no batch is running.
+    ///
+    /// Work is counted at the *single-stream* rate and divided only by
+    /// [`parallel_gain`], not by the worker count: workers share one
+    /// encoder engine, so four workers do not encode four times as fast.
+    /// Started files additionally report their own measured encode rate;
+    /// that rate already includes contention, so it becomes a floor, not
+    /// something to divide again.
     pub fn queue_remaining_secs(&self) -> Option<f64> {
         if !self.executing {
             return None;
         }
         let cfg = self.exec_cfg.as_ref();
-        let backend = cfg.map(|c| c.params.backend).unwrap_or(self.backend);
-        let parallel = cfg.map(|c| c.parallel).unwrap_or(self.parallel).max(1) as f64;
+        let params = cfg.map(|c| c.params).unwrap_or_else(|| self.est_params());
+        let backend = resolve_backend(params.backend, self.caps);
+        let parallel = cfg.map(|c| c.parallel).unwrap_or(self.parallel).max(1);
         // Skip/delete decisions beat the queue: a skipped row stays
         // visible (it proves the choice), but it will not encode, so it
         // must not inflate the time left.
         let skips = self.exec_skips.as_ref().and_then(|m| m.lock().ok());
         let skipped = |p: &std::path::Path| skips.as_ref().is_some_and(|g| g.contains(p));
-        let mut work = 0.0;
-        let mut longest = 0.0f64;
+        let mut encode_work = 0.0;
+        let mut check_work = 0.0;
+        let mut floor = 0.0f64;
         for (i, item) in self.exec_items.iter().enumerate() {
             if item.done || item.failed || item.removed || skipped(&item.path) {
                 continue;
@@ -1070,36 +1249,55 @@ impl AppState {
                 continue;
             };
             let frac = item.frac.clamp(0.0, 1.0);
-            // Started videos report the encoder's real rate; use it
-            // instead of the static table so the ETA follows this
-            // machine. Unstarted rows keep the table that produced the
-            // plan's own time estimate.
-            let secs = if shrinkr_core::images::is_shrinkable_image(&f.path) {
-                IMAGE_WORK_SECS * (1.0 - frac)
-            } else if frac > 0.0 && item.fps > 0.5 {
-                f.total_frames() * (1.0 - frac) / item.fps
+            if shrinkr_core::images::is_shrinkable_image(&f.path) {
+                let left = IMAGE_WORK_SECS * (1.0 - frac);
+                encode_work += left;
+                floor = floor.max(left);
+                continue;
+            }
+            // The search runs before the first progress tick, so a file
+            // whose encode has started no longer pays for it. The SSIM
+            // check runs after the encode and is therefore always ahead.
+            let search_left = if frac > 0.0 {
+                0.0
             } else {
-                file_work_secs(f, backend) * (1.0 - frac)
+                search_secs(f, &params, backend)
             };
-            work += secs;
-            // A started file already occupies a worker slot: when it is
-            // the only work left, dividing by the worker count would
-            // predict a finish before the encode can actually end.
-            longest = longest.max(secs);
+            let verify_left = verify_secs(f, &params);
+            let encode_left = encode_secs(f, &params, backend) * (1.0 - frac);
+            encode_work += encode_left;
+            check_work += search_left + verify_left;
+            // A started file already occupies a worker slot and its fps
+            // is the rate this machine actually sustains under the
+            // current queue. An unstarted file is a single-stream lower
+            // bound: when it is the last one left, the shared-engine gain
+            // no longer applies to it.
+            if frac > 0.0 && item.fps > 0.5 {
+                floor = floor.max(f.total_frames() * (1.0 - frac) / item.fps + verify_left);
+            } else {
+                floor = floor.max(encode_left + search_left + verify_left);
+            }
         }
-        let mut eta = (work / parallel).max(longest);
+        let mut eta = encode_work / parallel_gain(parallel) + check_work / verify_gain(parallel);
+        eta = eta.max(floor);
         // Waiting segments run one after another, each with its own
         // frozen settings (parallelism included), so their wall time is
         // added per segment rather than mixed into the current batch.
         for seg in &self.pending {
-            let seg_parallel = seg.cfg.parallel.max(1) as f64;
-            let seg_work: f64 = seg
-                .files
-                .iter()
-                .filter(|f| !skipped(&f.path))
-                .map(|f| file_work_secs(f, seg.cfg.params.backend))
-                .sum();
-            eta += seg_work / seg_parallel;
+            let seg_backend = resolve_backend(seg.cfg.params.backend, self.caps);
+            let seg_parallel = seg.cfg.parallel.max(1);
+            let mut seg_encode = 0.0;
+            let mut seg_checks = 0.0;
+            let mut seg_longest = 0.0f64;
+            for f in seg.files.iter().filter(|f| !skipped(&f.path)) {
+                let (encode, checks) = file_work_parts(f, &seg.cfg.params, seg_backend);
+                seg_encode += encode;
+                seg_checks += checks;
+                seg_longest = seg_longest.max(encode + checks);
+            }
+            let wall =
+                seg_encode / parallel_gain(seg_parallel) + seg_checks / verify_gain(seg_parallel);
+            eta += wall.max(seg_longest);
         }
         Some(eta)
     }
@@ -1274,24 +1472,25 @@ impl AppState {
         );
         let estimate = {
             let mut new_b = 0u64;
-            let mut total_frames = 0f64;
-            let mut image_count = 0usize;
+            let mut encode_work = 0.0;
+            let mut check_work = 0.0;
+            let backend = resolve_backend(p.backend, self.caps);
             for &i in eligible.iter() {
                 let f = &self.files[i];
                 if shrinkr_core::images::is_shrinkable_image(&f.path) {
                     new_b += file_size_estimate(f, &p).1;
-                    image_count += 1;
                 } else {
                     new_b += estimate_file(f, &p).new_bytes;
-                    total_frames += f.total_frames();
                 }
+                let (encode, checks) = file_work_parts(f, &p, backend);
+                encode_work += encode;
+                check_work += checks;
             }
             let total_b: u64 = eligible.iter().map(|&i| self.files[i].bytes).sum();
             let saved = new_b as i64 - total_b as i64;
-            let fps = backend_fps(self.backend);
-            let video_secs = total_frames / fps / (self.parallel.max(1) as f64);
-            let image_secs = image_count as f64 * IMAGE_WORK_SECS / (self.parallel.max(1) as f64);
-            (total_b, new_b, saved, video_secs + image_secs)
+            let parallel = self.parallel.max(1);
+            let secs = encode_work / parallel_gain(parallel) + check_work / verify_gain(parallel);
+            (total_b, new_b, saved, secs)
         };
         // Goal segments resolve through hardware capabilities, which land
         // asynchronously; until then they render without estimates.
@@ -1299,12 +1498,15 @@ impl AppState {
             let mut arr = [GoalEstimate::default(); 3];
             for (gi, goal) in Goal::ALL.iter().enumerate() {
                 let (backend, preset, cq) = goal.resolve(caps);
+                let backend = resolve_backend(backend, Some(caps));
                 let mut gp = self.est_params();
                 gp.backend = backend;
                 gp.preset = preset;
                 gp.cq = cq;
                 self.apply_preserve_quality(&mut gp);
                 let mut est = GoalEstimate::default();
+                let mut encode_work = 0.0;
+                let mut check_work = 0.0;
                 for f in &self.files {
                     if shrinkr_core::images::is_shrinkable_image(&f.path) {
                         // Images don't differ across goals — they'd dilute
@@ -1319,7 +1521,9 @@ impl AppState {
                     if !verdict.will_shrink() {
                         continue;
                     }
-                    est.secs += f.total_frames() / backend_fps(backend);
+                    let (encode, checks) = file_work_parts(f, &gp, backend);
+                    encode_work += encode;
+                    check_work += checks;
                     if verdict.is_warn() {
                         est.warned += 1;
                         est.warned_total_b += f.bytes;
@@ -1330,7 +1534,9 @@ impl AppState {
                         est.files += 1;
                     }
                 }
-                est.secs /= self.parallel.max(1) as f64;
+                let parallel = self.parallel.max(1);
+                est.secs =
+                    encode_work / parallel_gain(parallel) + check_work / verify_gain(parallel);
                 arr[gi] = est;
             }
             arr
@@ -1631,6 +1837,49 @@ mod tests {
     }
 
     #[test]
+    fn time_model_uses_shared_engine_rates_and_resolves_auto() {
+        // A CPU-only box must resolve Auto to x264, not inherit the
+        // hardware table (the old fallback made it look ~6x faster).
+        let cpu = shrinkr_core::hw::HwCaps {
+            cuda_hwaccel: false,
+            hevc_nvenc: false,
+            h264_nvenc: false,
+            av1_nvenc_listed: false,
+            av1_nvenc_usable: false,
+            nvenc_b_ref_mode: false,
+            vt_h264: false,
+            vt_hevc: false,
+            qsv_h264: false,
+            qsv_hevc: false,
+            qsv_av1_listed: false,
+            qsv_av1_usable: false,
+            amf_h264: false,
+            amf_hevc: false,
+            amf_av1_listed: false,
+            amf_av1_usable: false,
+            svt_av1: false,
+            cuvid_decoders: vec![],
+            gpu_label: "CPU test".into(),
+            hwaccels: vec![],
+        };
+        assert_eq!(
+            resolve_backend(VideoBackend::Auto, Some(&cpu)),
+            VideoBackend::CpuX264
+        );
+        // x265's fixed `slow` preset is ~5x slower than the old table.
+        assert!(backend_fps(VideoBackend::CpuX265) < backend_fps(VideoBackend::CpuX264));
+        // SVT presets move by roughly 2x per two steps; NVENC's do not.
+        assert!(preset_factor(VideoBackend::CpuAv1, NvencPreset::P7) < 0.6);
+        assert!(preset_factor(VideoBackend::CpuAv1, NvencPreset::P3) > 1.5);
+        assert!(preset_factor(VideoBackend::HevcNvenc, NvencPreset::P3) < 1.5);
+        // Bigger frames cost proportionally more; smaller frames do not
+        // pretend hardware runs faster (it caps frame rate before pixels).
+        assert_eq!(area_factor(FPS_REF_PIXELS), 1.0);
+        assert!(area_factor(3840.0 * 2160.0) < 0.3);
+        assert_eq!(area_factor(1280.0 * 720.0), 1.0);
+    }
+
+    #[test]
     fn preserve_quality_protects_audio_only_runs_too() {
         let mut s = app();
         s.backend = VideoBackend::CopyVideo;
@@ -1851,6 +2100,7 @@ mod tests {
         // mid-run must raise the ETA on the next render.
         let mut s = app();
         s.preserve_quality = false;
+        s.backend = VideoBackend::HevcNvenc;
         s.executing = true;
         let cfg = ExecCfg {
             params: s.est_params(),
@@ -1862,9 +2112,11 @@ mod tests {
             extra_args: vec![],
         };
         s.exec_cfg = Some(cfg.clone());
-        // 600 s at 30 fps = 18 000 frames; Auto's table runs at 600 fps,
-        // so each video costs 30 encoder-seconds and a two-worker batch
-        // takes 15 wall-seconds per file.
+        // 600 s at 30 fps = 18 000 frames. Each video costs the single-
+        // stream rate; two workers do not double encoder throughput, they
+        // only add `parallel_gain(2)`.
+        let per_file = 18_000.0 / backend_fps(VideoBackend::HevcNvenc);
+        let gain = parallel_gain(2);
         let mut files = Vec::new();
         for name in ["a.mp4", "b.mp4", "c.mp4", "d.mp4"] {
             let mut f = video();
@@ -1883,11 +2135,15 @@ mod tests {
             .collect();
         s.exec_files = files;
         s.exec_total = 4;
-        // Four unstarted videos over two workers: 120 encoder-seconds
-        // divided by two = 60 wall-seconds.
+        // Four unstarted videos: four single-stream costs over the shared
+        // engine's measured 2-worker gain.
         let batch_only = s.queue_remaining_secs().expect("batch is running");
-        assert!((batch_only - 60.0).abs() < 0.01, "{batch_only}");
-        // Each queued-behind-batch video adds its own 15 wall-seconds.
+        let batch = |n: f64| n * per_file / gain;
+        // A waiting segment with one file cannot be divided by a gain —
+        // it will run alone once its turn comes.
+        let single = per_file;
+        assert!((batch_only - batch(4.0)).abs() < 0.01, "{batch_only}");
+        // Each queued-behind-batch video adds one more file's cost.
         let mut queued_one = video();
         queued_one.path = PathBuf::from("q1.mp4");
         s.pending.push(PendingSegment {
@@ -1896,7 +2152,10 @@ mod tests {
             warn: true,
         });
         let with_one = s.queue_remaining_secs().unwrap();
-        assert!((with_one - 75.0).abs() < 0.01, "{with_one}");
+        assert!(
+            (with_one - (batch(4.0) + single)).abs() < 0.01,
+            "{with_one}"
+        );
         // A second addition raises it again — the update the UI promises.
         let mut queued_two = video();
         queued_two.path = PathBuf::from("q2.mp4");
@@ -1906,26 +2165,132 @@ mod tests {
             warn: true,
         });
         let with_two = s.queue_remaining_secs().unwrap();
-        assert!((with_two - 90.0).abs() < 0.01, "{with_two}");
+        assert!(
+            (with_two - (batch(4.0) + 2.0 * single)).abs() < 0.01,
+            "{with_two}"
+        );
         assert!(with_two > with_one);
-        // Two current files finishing leaves the remaining 60
-        // encoder-seconds across two workers: 30 s, plus the 30 s of
-        // waiting files.
+        // Two current files finishing leaves two running + two waiting.
         s.exec_items[0].done = true;
         s.exec_items[0].frac = 1.0;
         s.exec_items[1].done = true;
         s.exec_items[1].frac = 1.0;
         let after_progress = s.queue_remaining_secs().unwrap();
-        assert!((after_progress - 60.0).abs() < 0.01, "{after_progress}");
+        assert!(
+            (after_progress - (batch(2.0) + 2.0 * single)).abs() < 0.01,
+            "{after_progress}"
+        );
         // Skipping a waiting file takes it back out of the estimate while
         // its row stays in the segment.
         let skipped_path = s.pending[0].files[0].path.clone();
         s.exec_skips = Some(Arc::new(Mutex::new(HashSet::from([skipped_path]))));
         let after_skip = s.queue_remaining_secs().unwrap();
-        assert!((after_skip - 45.0).abs() < 0.01, "{after_skip}");
+        assert!(
+            (after_skip - (batch(2.0) + single)).abs() < 0.01,
+            "{after_skip}"
+        );
         // Nothing runs when the batch ends.
         s.executing = false;
         assert_eq!(s.queue_remaining_secs(), None);
+    }
+
+    #[test]
+    fn queue_eta_never_divides_by_the_raw_worker_count() {
+        // Four NVENC workers share one engine. The old model divided the
+        // 600 fps table by 4; the live ETA must not shrink by 4x when the
+        // slider moves 1 → 4.
+        assert_eq!(parallel_gain(1), 1.0);
+        assert!(parallel_gain(4) > 1.0 && parallel_gain(4) < 1.5);
+        assert_eq!(parallel_gain(64), 1.25);
+    }
+
+    #[test]
+    fn nvenc_four_worker_eta_matches_the_measured_batch() {
+        // Measured on an RTX 3060 laptop: four 22-minute 1080p episodes at
+        // parallel=4 finish in ~200 s each (≈150 fps per stream, ≈600 fps
+        // aggregate). The old /parallel model predicted ~52 s per group.
+        let mut s = app();
+        s.preserve_quality = false;
+        s.backend = VideoBackend::HevcNvenc;
+        s.scale = ScalePolicy::Preserve;
+        s.parallel = 4;
+        s.executing = true;
+        s.exec_cfg = Some(ExecCfg {
+            params: s.est_params(),
+            keep_subs: true,
+            parallel: 4,
+            replace: true,
+            threshold: 10.0,
+            threshold_policy: ThresholdPolicy::Warn,
+            extra_args: vec![],
+        });
+        let mut files = Vec::new();
+        for name in ["a.mkv", "b.mkv", "c.mkv", "d.mkv"] {
+            let mut f = video();
+            f.path = PathBuf::from(name);
+            f.duration_s = 22.0 * 60.0;
+            f.fps = 500.0 / 21.0;
+            files.push(f);
+        }
+        s.exec_items = files
+            .iter()
+            .map(|f| {
+                ExecItem::new(
+                    f.path.file_name().unwrap().to_string_lossy().into_owned(),
+                    f.path.clone(),
+                    "1920x1080".into(),
+                )
+            })
+            .collect();
+        s.exec_files = files;
+        s.exec_total = 4;
+        let eta = s.queue_remaining_secs().expect("batch is running");
+        assert!(
+            (180.0..=260.0).contains(&eta),
+            "measured batch ≈200s, model {eta}"
+        );
+    }
+
+    #[test]
+    fn preserve_quality_eta_includes_search_and_full_file_ssim() {
+        let mut s = app();
+        s.backend = VideoBackend::HevcNvenc;
+        s.preserve_quality = false;
+        s.executing = true;
+        let cfg = ExecCfg {
+            params: s.est_params(),
+            keep_subs: true,
+            parallel: 1,
+            replace: true,
+            threshold: 10.0,
+            threshold_policy: ThresholdPolicy::Warn,
+            extra_args: vec![],
+        };
+        s.exec_cfg = Some(cfg);
+        let f = video();
+        s.exec_items = vec![ExecItem::new(
+            "t.mp4".into(),
+            f.path.clone(),
+            "1920x1080".into(),
+        )];
+        s.exec_files = vec![f.clone()];
+        s.exec_total = 1;
+        let plain = s.queue_remaining_secs().unwrap();
+        // The default mode searches CQ from samples and then SSIM-checks
+        // the complete file; both run on the worker after the encode and
+        // must show up in the ETA.
+        s.preserve_quality = true;
+        s.exec_cfg = Some(ExecCfg {
+            params: s.est_params(),
+            keep_subs: true,
+            parallel: 1,
+            replace: true,
+            threshold: 10.0,
+            threshold_policy: ThresholdPolicy::Warn,
+            extra_args: vec![],
+        });
+        let guarded = s.queue_remaining_secs().unwrap();
+        assert!(guarded > plain * 1.5, "plain {plain}, guarded {guarded}");
     }
 
     #[test]
