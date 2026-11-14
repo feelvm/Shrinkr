@@ -32,7 +32,7 @@ const MAX_PNG_BYTES: usize = 512 * 1024 * 1024;
 
 /// How hard the optimizer works. Both levels are lossless; `Max` spends
 /// more time searching for a smaller DEFLATE stream.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OptimizeLevel {
     #[default]
     Balanced,

@@ -426,7 +426,13 @@ pub struct AppState {
     pub exec_cfg: Option<ExecCfg>,
     /// Pump sender, stored so job handlers can start chained batches.
     pub job_tx: Option<futures_channel::mpsc::UnboundedSender<crate::jobs::JobMsg>>,
-    pub log: Vec<LogEntry>,
+    /// All log lines (capped ring), Arc-shared so the rendered window
+    /// clones by refcount, not by string.
+    pub log: Vec<std::sync::Arc<LogEntry>>,
+    /// The filtered, size-capped window the Log panel actually renders.
+    /// Maintained by `push_log`/`refresh_log_visible` so a live progress
+    /// tick costs an Arc bump per row instead of a filter+clone of 200.
+    pub log_visible: Vec<std::sync::Arc<LogEntry>>,
     pub log_filter: LevelFilter,
     pub bench_running: bool,
     pub bench_rows: Vec<BenchRow>,
@@ -460,6 +466,23 @@ pub struct AppState {
     pub update_ready: Option<String>,
     pub update_error: Option<String>,
     pub update_checked_once: bool,
+    /// Hardware capability detection, populated off the UI thread and
+    /// handed over once ready (`&'static` from the core OnceLock — the
+    /// UI must never block on the trial-encode detection itself).
+    pub caps: Option<&'static shrinkr_core::hw::HwCaps>,
+    /// Convert capability detection (includes a `soffice --version`
+    /// spawn that can take seconds) — cards read capabilities only
+    /// once this flips true.
+    pub convert_caps_ready: bool,
+    /// Paths currently in the library, mirroring `files`. `apply_msg`
+    /// uses it for O(1) re-scan dedupe instead of a linear scan per
+    /// probed file.
+    pub file_set: HashSet<PathBuf>,
+    /// Plan computations (eligible/estimates/goal segments), keyed on a
+    /// fingerprint of the settings + library they read. Progress ticks
+    /// change neither, so the O(library) preflight passes run once per
+    /// settings change instead of once per render.
+    pub est_cache: std::sync::Mutex<Option<std::sync::Arc<EstCache>>>,
 }
 
 /// One file in the Convert tab.
@@ -692,15 +715,22 @@ impl Default for AppState {
             staged: vec![],
             exec_cfg: None,
             job_tx: None,
-            log: vec![LogEntry::new(
+            log: vec![std::sync::Arc::new(LogEntry::new(
                 "Add folders and/or files — they scan automatically.".into(),
-            )],
+            ))],
+            log_visible: vec![std::sync::Arc::new(LogEntry::new(
+                "Add folders and/or files — they scan automatically.".into(),
+            ))],
             log_filter: LevelFilter::all(),
             bench_running: false,
             bench_rows: vec![],
             bench_note: String::new(),
-            ffmpeg_ok: tool_ok("ffmpeg"),
-            ffprobe_ok: tool_ok("ffprobe"),
+            // Optimistic until the background warmup reports (running
+            // two blocking `ffmpeg -version` spawns here froze the first
+            // paint for hundreds of ms). A missing tool corrects the
+            // flags within a second via JobMsg::ToolsChecked.
+            ffmpeg_ok: true,
+            ffprobe_ok: true,
             ffmpeg_fetching: false,
             ffmpeg_fetch_pct: 0.0,
             convert_files: vec![],
@@ -723,6 +753,10 @@ impl Default for AppState {
             update_ready: None,
             update_error: None,
             update_checked_once: false,
+            caps: None,
+            convert_caps_ready: false,
+            file_set: HashSet::new(),
+            est_cache: std::sync::Mutex::new(None),
         }
     }
 }
@@ -733,6 +767,27 @@ pub fn tool_ok(prog: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Cached plan computations: everything derived from (settings, library,
+/// capabilities) that every render used to recompute over the whole
+/// library while a batch streamed progress into the same signal. Keyed on
+/// fingerprints, so any knob or library change recomputes once; progress
+/// ticks change neither and hit the cache.
+pub(crate) struct EstCache {
+    /// `(settings fingerprint, library fingerprint, caps known)`.
+    key: (u64, u64, bool),
+    /// Eligible (shrink-verdict) library indices.
+    pub eligible: Arc<Vec<usize>>,
+    /// `(shrink, warned, skipped)` over the probed library.
+    pub plan_counts: (usize, usize, usize),
+    /// Per-file verdict rows for the plan list.
+    pub preflight_rows: Arc<Vec<(String, String, Preflight)>>,
+    /// `(eligible_input_bytes, new_bytes, byte delta, est_seconds)`.
+    pub estimate: (u64, u64, i64, f64),
+    /// Per-goal segment estimates (`Fastest/Balanced/Smallest`), `None`
+    /// until GPU detection lands (goal resolution reads caps).
+    pub goals: Option<[GoalEstimate; 3]>,
 }
 
 impl AppState {
@@ -755,22 +810,9 @@ impl AppState {
 
     /// `(shrink, warned, skipped)` over the probed library. Muted codecs
     /// sit outside every bucket — they are not part of the run at all.
+    /// Cached with the rest of the plan.
     pub fn plan_counts(&self) -> (usize, usize, usize) {
-        let p = self.est_params();
-        let t = self.threshold();
-        let policy = self.threshold_policy();
-        let mut counts = (0, 0, 0);
-        for f in &self.files {
-            if self.muted_codecs.contains(&f.vcodec) {
-                continue;
-            }
-            match preflight_auto_with(f, &p, t, policy) {
-                Preflight::Shrink { .. } => counts.0 += 1,
-                Preflight::Warn { .. } => counts.1 += 1,
-                Preflight::Skip { .. } => counts.2 += 1,
-            }
-        }
-        counts
+        self.cached().plan_counts
     }
 
     /// Clear the library selection: every added file leaves the view, and
@@ -784,6 +826,7 @@ impl AppState {
         self.scan_gen = self.scan_gen.wrapping_add(1);
         self.targets.clear();
         self.files.clear();
+        self.file_set.clear();
         self.staged.clear();
         self.bench_rows.clear();
         self.bench_note.clear();
@@ -871,17 +914,8 @@ impl AppState {
             .any(|f| !shrinkr_core::images::is_shrinkable_image(&f.path))
     }
 
-    pub fn eligible(&self) -> Vec<usize> {
-        let p = self.est_params();
-        let t = self.threshold();
-        let policy = self.threshold_policy();
-        self.files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| !self.muted_codecs.contains(&f.vcodec))
-            .filter(|(_, f)| preflight_auto_with(f, &p, t, policy).will_shrink())
-            .map(|(i, _)| i)
-            .collect()
+    pub fn eligible(&self) -> Arc<Vec<usize>> {
+        Arc::clone(&self.cached().eligible)
     }
 
     /// Library files still addable to a running batch via the mid-run
@@ -932,27 +966,7 @@ impl AppState {
     /// per-file time (they encode in well under a second; the
     /// frames-per-second model doesn't apply to single frames).
     pub fn estimate(&self) -> (u64, u64, i64, f64) {
-        let p = self.est_params();
-        let idx = self.eligible();
-        let mut new_b = 0u64;
-        let mut total_frames = 0f64;
-        let mut image_count = 0usize;
-        for &i in &idx {
-            let f = &self.files[i];
-            if shrinkr_core::images::is_shrinkable_image(&f.path) {
-                new_b += file_size_estimate(f, &p).1;
-                image_count += 1;
-            } else {
-                new_b += estimate_file(f, &p).new_bytes;
-                total_frames += f.total_frames();
-            }
-        }
-        let total_b: u64 = idx.iter().map(|&i| self.files[i].bytes).sum();
-        let saved = new_b as i64 - total_b as i64;
-        let fps = backend_fps(self.backend);
-        let video_secs = total_frames / fps / (self.parallel.max(1) as f64);
-        let image_secs = image_count as f64 * IMAGE_WORK_SECS / (self.parallel.max(1) as f64);
-        (total_b, new_b, saved, video_secs + image_secs)
+        self.cached().estimate
     }
 
     /// Per-goal estimate over the video library: the goal's encoder and
@@ -968,43 +982,13 @@ impl AppState {
     /// "+38%" on a shrink axis although the run discards those results
     /// and keeps the originals — they surface as a warned count instead.
     pub fn goal_estimate(&self, goal: Goal) -> GoalEstimate {
-        let caps = shrinkr_core::hw::caps();
-        let (backend, preset, cq) = goal.resolve(caps);
-        let mut p = self.est_params();
-        p.backend = backend;
-        p.preset = preset;
-        p.cq = cq;
-        self.apply_preserve_quality(&mut p);
-        let t = self.threshold();
-        let policy = self.threshold_policy();
-        let mut est = GoalEstimate::default();
-        for f in &self.files {
-            if shrinkr_core::images::is_shrinkable_image(&f.path) {
-                // Images don't differ across goals — they'd dilute the
-                // segment contrast with three identical numbers.
-                continue;
-            }
-            // Muted codecs are not part of any goal's run either.
-            if self.muted_codecs.contains(&f.vcodec) {
-                continue;
-            }
-            let verdict = preflight_auto_with(f, &p, t, policy);
-            if !verdict.will_shrink() {
-                continue;
-            }
-            est.secs += f.total_frames() / backend_fps(backend);
-            if verdict.is_warn() {
-                est.warned += 1;
-                est.warned_total_b += f.bytes;
-                est.warned_new_b += estimate_file(f, &p).new_bytes;
-            } else {
-                est.total_b += f.bytes;
-                est.new_b += estimate_file(f, &p).new_bytes;
-                est.files += 1;
-            }
+        let cache = self.cached();
+        match &cache.goals {
+            Some(goals) => goals[goal as usize],
+            // Capabilities not detected yet — an empty segment beats
+            // blocking the UI thread on the trial-encode detection.
+            None => GoalEstimate::default(),
         }
-        est.secs /= self.parallel.max(1) as f64;
-        est
     }
 
     /// (filename, resolution, verdict) rows for the plan list. Resolution
@@ -1013,26 +997,8 @@ impl AppState {
     /// back as `Preflight::Skip` with a mute reason — they never run, and
     /// the plan list must say why instead of showing their threshold
     /// verdict (which would imply they are queued).
-    pub fn preflight_rows(&self) -> Vec<(String, String, Preflight)> {
-        let p = self.est_params();
-        let t = self.threshold();
-        let policy = self.threshold_policy();
-        self.files
-            .iter()
-            .map(|f| {
-                let name = f
-                    .path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?")
-                    .to_string();
-                if self.muted_codecs.contains(&f.vcodec) {
-                    let reason = format!("{} muted in Library — not queued", f.vcodec);
-                    return (name, f.res_label(), Preflight::Skip { reason });
-                }
-                (name, f.res_label(), preflight_auto_with(f, &p, t, policy))
-            })
-            .collect()
+    pub fn preflight_rows(&self) -> Arc<Vec<(String, String, Preflight)>> {
+        Arc::clone(&self.cached().preflight_rows)
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -1176,23 +1142,199 @@ impl AppState {
     }
 
     pub fn push_log(&mut self, line: String) {
-        self.log.push(LogEntry::new(line));
+        self.log.push(std::sync::Arc::new(LogEntry::new(line)));
         if self.log.len() > 300 {
             let excess = self.log.len() - 300;
             self.log.drain(..excess);
         }
+        self.refresh_log_visible();
     }
 
-    /// Chronological, filter-honouring view for the log panel (newest last).
-    /// Capped so the DOM stays small during long runs.
-    pub fn visible_log(&self) -> Vec<LogEntry> {
+    /// Rebuild the rendered window after a log-filter change (push_log
+    /// keeps it fresh otherwise).
+    pub fn refresh_log_visible(&mut self) {
         let n = self.log.len();
         let start = n.saturating_sub(200);
-        self.log[start..]
+        self.log_visible = self.log[start..]
             .iter()
             .filter(|e| self.log_filter.visible(e.level))
             .cloned()
-            .collect()
+            .collect();
+    }
+
+    // ── Plan cache ──────────────────────────────────────────────────
+
+    /// Fingerprint over every setting the plan computations read. Any
+    /// knob change flips the key and invalidates the cache; progress
+    /// ticks touch none of these, so mid-run renders hit.
+    fn settings_fp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.preserve_quality.hash(&mut h);
+        self.backend.hash(&mut h);
+        self.nvenc_preset.hash(&mut h);
+        self.cq.hash(&mut h);
+        self.scale.hash(&mut h);
+        self.opus_bps.hash(&mut h);
+        self.all_audio.hash(&mut h);
+        self.film_grain.hash(&mut h);
+        self.image_cq.hash(&mut h);
+        self.image_scale.hash(&mut h);
+        self.image_preserve_format.hash(&mut h);
+        self.min_saving_pct.to_bits().hash(&mut h);
+        self.skip_efficient.hash(&mut h);
+        let mut muted: Vec<&String> = self.muted_codecs.iter().collect();
+        muted.sort();
+        for c in muted {
+            c.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Fingerprint over the library itself. Files are only ever appended
+    /// (probes) or wiped (Clear), so count + total bytes + the last path
+    /// distinguishes every real change.
+    fn files_fp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.files.len().hash(&mut h);
+        self.files.iter().map(|f| f.bytes).sum::<u64>().hash(&mut h);
+        if let Some(last) = self.files.last() {
+            last.path.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// The cached plan (recomputed when its key moved).
+    fn cached(&self) -> std::sync::Arc<EstCache> {
+        let key = (self.settings_fp(), self.files_fp(), self.caps.is_some());
+        let mut slot = self.est_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = slot.as_ref() {
+            if c.key == key {
+                return std::sync::Arc::clone(c);
+            }
+        }
+        let cache = std::sync::Arc::new(self.compute_est_cache(key));
+        *slot = Some(std::sync::Arc::clone(&cache));
+        cache
+    }
+
+    fn compute_est_cache(&self, key: (u64, u64, bool)) -> EstCache {
+        let p = self.est_params();
+        let t = self.threshold();
+        let policy = self.threshold_policy();
+        let eligible: Arc<Vec<usize>> = Arc::new(
+            self.files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !self.muted_codecs.contains(&f.vcodec))
+                .filter(|(_, f)| preflight_auto_with(f, &p, t, policy).will_shrink())
+                .map(|(i, _)| i)
+                .collect(),
+        );
+        let plan_counts = {
+            let mut counts = (0, 0, 0);
+            for f in &self.files {
+                if self.muted_codecs.contains(&f.vcodec) {
+                    continue;
+                }
+                match preflight_auto_with(f, &p, t, policy) {
+                    Preflight::Shrink { .. } => counts.0 += 1,
+                    Preflight::Warn { .. } => counts.1 += 1,
+                    Preflight::Skip { .. } => counts.2 += 1,
+                }
+            }
+            counts
+        };
+        let preflight_rows: Arc<Vec<(String, String, Preflight)>> = Arc::new(
+            self.files
+                .iter()
+                .map(|f| {
+                    let name = f
+                        .path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    if self.muted_codecs.contains(&f.vcodec) {
+                        let reason = format!("{} muted in Library — not queued", f.vcodec);
+                        return (name, f.res_label(), Preflight::Skip { reason });
+                    }
+                    (name, f.res_label(), preflight_auto_with(f, &p, t, policy))
+                })
+                .collect(),
+        );
+        let estimate = {
+            let mut new_b = 0u64;
+            let mut total_frames = 0f64;
+            let mut image_count = 0usize;
+            for &i in eligible.iter() {
+                let f = &self.files[i];
+                if shrinkr_core::images::is_shrinkable_image(&f.path) {
+                    new_b += file_size_estimate(f, &p).1;
+                    image_count += 1;
+                } else {
+                    new_b += estimate_file(f, &p).new_bytes;
+                    total_frames += f.total_frames();
+                }
+            }
+            let total_b: u64 = eligible.iter().map(|&i| self.files[i].bytes).sum();
+            let saved = new_b as i64 - total_b as i64;
+            let fps = backend_fps(self.backend);
+            let video_secs = total_frames / fps / (self.parallel.max(1) as f64);
+            let image_secs = image_count as f64 * IMAGE_WORK_SECS / (self.parallel.max(1) as f64);
+            (total_b, new_b, saved, video_secs + image_secs)
+        };
+        // Goal segments resolve through hardware capabilities, which land
+        // asynchronously; until then they render without estimates.
+        let goals = self.caps.map(|caps| {
+            let mut arr = [GoalEstimate::default(); 3];
+            for (gi, goal) in Goal::ALL.iter().enumerate() {
+                let (backend, preset, cq) = goal.resolve(caps);
+                let mut gp = self.est_params();
+                gp.backend = backend;
+                gp.preset = preset;
+                gp.cq = cq;
+                self.apply_preserve_quality(&mut gp);
+                let mut est = GoalEstimate::default();
+                for f in &self.files {
+                    if shrinkr_core::images::is_shrinkable_image(&f.path) {
+                        // Images don't differ across goals — they'd dilute
+                        // the segment contrast with three identical numbers.
+                        continue;
+                    }
+                    // Muted codecs are not part of any goal's run either.
+                    if self.muted_codecs.contains(&f.vcodec) {
+                        continue;
+                    }
+                    let verdict = preflight_auto_with(f, &gp, t, policy);
+                    if !verdict.will_shrink() {
+                        continue;
+                    }
+                    est.secs += f.total_frames() / backend_fps(backend);
+                    if verdict.is_warn() {
+                        est.warned += 1;
+                        est.warned_total_b += f.bytes;
+                        est.warned_new_b += estimate_file(f, &gp).new_bytes;
+                    } else {
+                        est.total_b += f.bytes;
+                        est.new_b += estimate_file(f, &gp).new_bytes;
+                        est.files += 1;
+                    }
+                }
+                est.secs /= self.parallel.max(1) as f64;
+                arr[gi] = est;
+            }
+            arr
+        });
+        EstCache {
+            key,
+            eligible,
+            plan_counts,
+            preflight_rows,
+            estimate,
+            goals,
+        }
     }
 }
 
@@ -1237,6 +1379,7 @@ mod tests {
                 sample_rate: Some(48000),
             }],
             acodec: "aac".into(),
+            rotation_deg: 0,
             video_stream_count: 1,
             audio_stream_count: 1,
             sub_count: 0,
@@ -1287,6 +1430,9 @@ mod tests {
         s.min_saving_pct = 0.0;
         s.skip_efficient = false;
         s.files.push(video());
+        // Goal segments resolve through hardware capabilities; production
+        // receives them from the warmup message, tests detect directly.
+        s.caps = Some(shrinkr_core::hw::caps());
         let pinned = s.goal_estimate(Goal::Fastest);
         let released = {
             s.preserve_quality = false;
@@ -1319,6 +1465,9 @@ mod tests {
         s.min_saving_pct = 0.0;
         s.skip_efficient = false;
         s.files.push(video());
+        // Goal segments resolve through hardware capabilities; production
+        // receives them from the warmup message, tests detect directly.
+        s.caps = Some(shrinkr_core::hw::caps());
         let est = s.goal_estimate(Goal::Fastest);
         assert_eq!(est.warned_total_b, video().bytes);
         assert!(est.total_b == 0 && est.new_b == 0);
@@ -1508,13 +1657,16 @@ mod tests {
         s.preserve_quality = false;
         s.min_saving_pct = 0.0;
         s.skip_efficient = false;
+        // Goal segments resolve through hardware capabilities; production
+        // receives them from the warmup message, tests detect directly.
+        s.caps = Some(shrinkr_core::hw::caps());
         let mut hevc = video();
         hevc.vcodec = "hevc".into();
         hevc.path = std::path::PathBuf::from("h.mkv");
         s.files = vec![video(), hevc];
         s.muted_codecs.insert("h264".into());
         // Both run gates drop the muted codec.
-        assert_eq!(s.eligible(), vec![1]);
+        assert_eq!(*s.eligible(), vec![1]);
         assert_eq!(s.queueable(), vec![1]);
         // The headline estimate covers exactly the unmuted bytes.
         let (total_b, _, _, _) = s.estimate();

@@ -10,9 +10,11 @@
 // in-app Log panel, so nothing is lost by detaching.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod close_guard;
 mod components;
 mod dialog;
 mod jobs;
+mod persist;
 mod state;
 
 use components::ui::{
@@ -227,10 +229,31 @@ const SLIDER_CSS: &str = include_str!("../assets/slider.css");
 
 #[component]
 fn App() -> Element {
-    let mut state = use_signal(AppState::default);
+    // Load persisted settings before the first render (file read, not a
+    // subprocess — cheap enough for the first paint to stay fast).
+    let mut initial = AppState::default();
+    if let Some(saved) = persist::load() {
+        saved.apply(&mut initial);
+    }
+    let mut state = use_signal(move || initial);
     use_context_provider(|| state);
     let pump = use_coroutine(move |mut rx: UnboundedReceiver<JobMsg>| async move {
         while let Some(m) = rx.next().await {
+            // The close-guard answer needs the window handle (UI thread
+            // only) — resolve it here, never inside apply_msg.
+            if let JobMsg::CloseGuardResolved { quit } = m {
+                let ctx = dioxus::desktop::window();
+                use dioxus::desktop::WindowCloseBehaviour;
+                if quit {
+                    ctx.set_close_behavior(WindowCloseBehaviour::WindowCloses);
+                    ctx.close();
+                } else {
+                    // Keep "hide while busy" active; just bring the
+                    // window back from the close attempt.
+                    ctx.window.set_visible(true);
+                }
+                continue;
+            }
             jobs::apply_msg(&mut state, m);
         }
     });
@@ -250,6 +273,84 @@ fn App() -> Element {
             });
         }
     });
+    // Startup warmup, off the UI thread: tool probes + GPU/convert
+    // capability detection used to run synchronously during the first
+    // render and froze the window for seconds (a hung driver: up to 80).
+    let mut warmed = use_signal(|| false);
+    use_effect(move || {
+        if !warmed() {
+            warmed.set(true);
+            let tx = pump.tx();
+            crate::jobs::start_warmup(tx);
+            persist::spawn_saver();
+        }
+    });
+    // Close guard: mirror "anything running" into the static the
+    // window-proc / event-handler paths read, and on non-Windows flip
+    // dioxus' close behaviour to hide-while-busy (the dialog resolution
+    // runs through the pump above). Windows intercepts WM_CLOSE natively
+    // and needs no behaviour flip.
+    use_effect(move || {
+        let s = state.read();
+        let busy =
+            s.executing || s.convert_executing || s.optimize_executing || s.update_installing;
+        drop(s);
+        close_guard::set_busy(busy);
+        #[cfg(not(target_os = "windows"))]
+        {
+            let ctx = dioxus::desktop::window();
+            use dioxus::desktop::WindowCloseBehaviour;
+            ctx.set_close_behavior(if busy {
+                WindowCloseBehaviour::WindowHides
+            } else {
+                WindowCloseBehaviour::WindowCloses
+            });
+        }
+    });
+    // macOS/Linux: tao's close request can't be prevented synchronously,
+    // so observe it and ask on a worker thread — the "hide while busy"
+    // behaviour set above keeps the window alive until the pump receives
+    // the answer.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let tx = pump.tx();
+        dioxus::desktop::use_wry_event_handler(move |event, _target| {
+            if let dioxus::desktop::tao::event::Event::WindowEvent {
+                event: dioxus::desktop::tao::event::WindowEvent::CloseRequested { .. },
+                ..
+            } = event
+            {
+                if close_guard::should_intercept() {
+                    close_guard::spawn_confirm_dialog(tx.clone());
+                }
+            }
+        });
+    }
+    // Windows-only: intercept the main window's WM_CLOSE while busy.
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::HasWindowHandle;
+        let ctx = dioxus::desktop::window();
+        let hwnd = ctx
+            .window
+            .window_handle()
+            .ok()
+            .and_then(|h| match h.as_raw() {
+                raw_window_handle::RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
+                _ => None,
+            });
+        if let Some(hwnd) = hwnd {
+            close_guard::install(hwnd);
+        }
+    }
+    // Settings saver: every state change refreshes the pending snapshot;
+    // the background thread writes at most once per second. Collecting
+    // ~25 small fields per message is far cheaper than the render it
+    // rides on.
+    use_effect(move || {
+        let snapshot = persist::collect(&state.read());
+        persist::offer(snapshot);
+    });
     rsx! {
         style { dangerous_inner_html: TAILWIND_CSS }
         style { dangerous_inner_html: SLIDER_CSS }
@@ -263,8 +364,15 @@ fn App() -> Element {
     }
 }
 
-fn pump_tx() -> UnboundedSender<JobMsg> {
-    use_coroutine_handle::<JobMsg>().tx()
+/// Pump sender for click handlers. Read from state (set once by App)
+/// instead of resolving the coroutine hook: calling a hook from inside an
+/// event closure silently grew a hook slot per click.
+fn pump_tx(state: &Signal<AppState>) -> UnboundedSender<JobMsg> {
+    state
+        .read()
+        .job_tx
+        .clone()
+        .expect("pump sender is set once App mounts")
 }
 
 /// OS file-drop paths from an HTML5 drop event. On desktop the webview
@@ -287,26 +395,37 @@ fn Header() -> Element {
     let fetching = s.ffmpeg_fetching;
     let fetch_pct = s.ffmpeg_fetch_pct;
     let fetch_supported = shrinkr_core::ffmpeg_fetch::supported();
+    // GPU label + capability gaps come from the state copy (background
+    // detection); reading hw::caps() directly here would block the first
+    // paint on the trial-encode detection.
+    let caps = s.caps;
     drop(s);
     // Say only what this machine can't do, and only for features the UI
     // exposes — everything supported is selectable (and greyed out when
     // missing) in the Pipeline dropdown, so no capability dump is needed.
-    let caps = shrinkr_core::hw::caps();
-    let mut missing: Vec<&str> = vec![];
-    if !caps.hevc_nvenc {
-        missing.push("NVENC HEVC");
-    }
-    if !caps.h264_nvenc {
-        missing.push("NVENC H.264");
-    }
-    if !caps.svt_av1 {
-        missing.push("CPU AV1");
-    }
-    let missing_note = if missing.is_empty() {
-        String::new()
-    } else {
-        format!("unavailable: {}", missing.join(", "))
+    let (gpu_label, missing_note) = match caps {
+        Some(caps) => {
+            let mut missing: Vec<&str> = vec![];
+            if !caps.hevc_nvenc {
+                missing.push("NVENC HEVC");
+            }
+            if !caps.h264_nvenc {
+                missing.push("NVENC H.264");
+            }
+            if !caps.svt_av1 {
+                missing.push("CPU AV1");
+            }
+            let missing_note = if missing.is_empty() {
+                String::new()
+            } else {
+                format!("unavailable: {}", missing.join(", "))
+            };
+            (caps.gpu_label.clone(), missing_note)
+        }
+        // Detection still running — the badge arrives with the result.
+        None => (String::new(), String::new()),
     };
+    let gpu_badge = !matches!(gpu_label.as_str(), "" | "none" | "unknown");
     rsx! {
         header { class: "relative flex shrink-0 items-center justify-between border-b border-border bg-card px-5 py-3",
             div {
@@ -337,8 +456,8 @@ fn Header() -> Element {
                         }
                     }
                 }
-                if !matches!(caps.gpu_label.as_str(), "" | "none" | "unknown") {
-                    Badge { variant: BadgeVariant::Secondary, "{caps.gpu_label}" }
+                if gpu_badge {
+                    Badge { variant: BadgeVariant::Secondary, "{gpu_label}" }
                 }
                 if !missing_note.is_empty() {
                     Badge { variant: BadgeVariant::Destructive, "{missing_note}" }
@@ -398,14 +517,14 @@ fn fetch_clicked(mut state: Signal<AppState>) {
     state.write().push_log(
         "Downloading FFmpeg (bundled builds come from github.com/BtbN/FFmpeg-Builds)…".into(),
     );
-    crate::jobs::start_ffmpeg_fetch(pump_tx());
+    crate::jobs::start_ffmpeg_fetch(pump_tx(&state));
 }
 
 /// UI-thread part of "Check for updates": flag + worker handoff.
 fn check_clicked(mut state: Signal<AppState>) {
     state.write().update_checking = true;
     state.write().update_error = None;
-    crate::jobs::start_update_check(pump_tx(), env!("CARGO_PKG_VERSION").to_string());
+    crate::jobs::start_update_check(pump_tx(&state), env!("CARGO_PKG_VERSION").to_string());
 }
 
 /// UI-thread part of "Update": refuse while a batch runs (the running
@@ -426,7 +545,7 @@ fn update_clicked(mut state: Signal<AppState>) {
     state
         .write()
         .push_log("Downloading + installing update…".into());
-    crate::jobs::start_update_install(pump_tx(), env!("CARGO_PKG_VERSION").to_string());
+    crate::jobs::start_update_install(pump_tx(&state), env!("CARGO_PKG_VERSION").to_string());
 }
 
 #[component]
@@ -465,14 +584,21 @@ fn Sidebar() -> Element {
     // The run's skip set (paths the user skipped or deleted from the
     // queue): rows read their "skipped" badge from it, so a click shows
     // on the next frame without waiting for the worker's confirmation
-    // message. Its removal happens through the shared Arc, hence the
-    // lock at read time.
-    let skips: HashSet<std::path::PathBuf> = s
-        .exec_skips
-        .as_ref()
-        .and_then(|m| m.lock().ok())
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    // message. Cloning the whole set per render (a fresh HashSet of every
+    // queued path, under the workers' lock) is replaced by two boolean
+    // vectors resolved inside one short lock scope.
+    let (exec_skipped, pending_skipped): (Vec<bool>, Vec<bool>) = {
+        let guard = s.exec_skips.as_ref().and_then(|m| m.lock().ok());
+        let in_set = |p: &std::path::Path| guard.as_ref().is_some_and(|g| g.contains(p));
+        (
+            s.exec_items.iter().map(|i| in_set(&i.path)).collect(),
+            s.pending
+                .iter()
+                .flat_map(|seg| seg.files.iter())
+                .map(|f| in_set(&f.path))
+                .collect(),
+        )
+    };
     // Files already waiting behind the running batch (queued via the
     // Queue button or committed with Add to queue). They live in
     // `pending` until the batch drains, and must be visible here —
@@ -483,9 +609,8 @@ fn Sidebar() -> Element {
         .pending
         .iter()
         .flat_map(|seg| seg.files.iter())
-        .map(|f| {
-            let path = f.path.clone();
-            let skipped = skips.contains(&path);
+        .zip(&pending_skipped)
+        .map(|(f, skipped)| {
             (
                 f.path
                     .file_name()
@@ -493,8 +618,8 @@ fn Sidebar() -> Element {
                     .unwrap_or("?")
                     .to_string(),
                 f.res_label(),
-                path,
-                skipped,
+                f.path.clone(),
+                *skipped,
             )
         })
         .collect();
@@ -543,7 +668,7 @@ fn Sidebar() -> Element {
     }
     let process_label = format!("Process {n_eligible} file(s)");
     // OS drag & drop onto the sidebar queues shrink sources.
-    let drop_tx = pump_tx();
+    let drop_tx = pump_tx(&state);
     let mut drag_over = use_signal(|| false);
     let drag_cls = if drag_over() {
         "ring-2 ring-inset ring-primary"
@@ -577,7 +702,7 @@ fn Sidebar() -> Element {
                             variant: ButtonVariant::Outline,
                             class: "w-full",
                             onclick: move |_| {
-                                let tx = pump_tx();
+                                let tx = pump_tx(&state);
                                 std::thread::spawn(move || {
                                     let mut dlg = rfd::FileDialog::new();
                                     if let Some(p) = &parent {
@@ -594,7 +719,7 @@ fn Sidebar() -> Element {
                             variant: ButtonVariant::Outline,
                             class: "w-full",
                             onclick: move |_| {
-                                let tx = pump_tx();
+                                let tx = pump_tx(&state);
                                 std::thread::spawn(move || {
                                     let mut dlg = rfd::FileDialog::new();
                                     if let Some(p) = &parent {
@@ -708,14 +833,14 @@ fn Sidebar() -> Element {
                         // finish probing before a batch snapshots it.
                         disabled: scan_busy,
                         title: if scan_busy { Some("Waiting for the scan to finish".to_string()) } else { None },
-                        onclick: move |_| crate::process_clicked(state, pump_tx()),
+                        onclick: move |_| crate::process_clicked(state, pump_tx(&state)),
                         "{process_label}"
                     }
                     if n_retry > 0 {
                         Button {
                             variant: ButtonVariant::Warning,
                             class: "w-full",
-                            onclick: move |_| crate::retry_clicked(state, pump_tx()),
+                            onclick: move |_| crate::retry_clicked(state, pump_tx(&state)),
                             "Retry {n_retry} failed {retry_file_word}"
                         }
                     }
@@ -734,12 +859,12 @@ fn Sidebar() -> Element {
                     }
                     p { class: "text-xs font-semibold", "Per-file progress ({exec_done}/{exec_total})" }
                     div { class: "flex max-h-40 flex-col gap-2 overflow-y-auto",
-                        for item in exec_items {
+                        for (row , item) in exec_items.iter().enumerate() {
                             {
                                 // Deleted from the queue before its turn: gone
                                 // from the panel (the log line remembers it).
+                                let skipped = exec_skipped[row];
                                 let path = item.path.clone();
-                                let skipped = skips.contains(&path);
                                 // One PathBuf clone per control: the move
                                 // closures each own their file target.
                                 let path_del = path.clone();
@@ -978,7 +1103,8 @@ fn Main() -> Element {
 /// Shrink-tab empty state, doubling as a drop zone for files/folders.
 #[component]
 fn ShrinkEmpty() -> Element {
-    let drop_tx = pump_tx();
+    let state = use_context::<Signal<AppState>>();
+    let drop_tx = pump_tx(&state);
     let mut drag_over = use_signal(|| false);
     let drag_cls = if drag_over() {
         "ring-2 ring-inset ring-primary"
@@ -1050,6 +1176,8 @@ fn PipelineCard() -> Element {
     // Same total the Estimate card reports, lifted into the header so the
     // source → output number stays visible while tuning the pipeline.
     let (est_in, est_out, _, _) = s.estimate();
+    // Capabilities come from the state copy, not a blocking hw::caps().
+    let caps = s.caps;
     drop(s);
     let cq_label = if preserve_quality {
         "Auto".to_string()
@@ -1075,8 +1203,26 @@ fn PipelineCard() -> Element {
     // Capability gating: hardware backends this machine can't run are
     // absent from the dropdown entirely (detection trials the AV1
     // variants with the real flag set) — the menu never offers an option
-    // that would fail over to a fallback.
-    let caps = shrinkr_core::hw::caps();
+    // that would fail over to a fallback. Until background detection
+    // lands, only the always-available CPU options show; the hardware
+    // entries appear with the result.
+    let (av1_nvenc, hevc_nvenc, h264_nvenc, vt_hevc, qsv_hevc, qsv_av1, amf_hevc, amf_av1, svt_av1) =
+        match caps {
+            Some(c) => (
+                c.av1_nvenc_usable,
+                c.hevc_nvenc,
+                c.h264_nvenc,
+                c.vt_hevc,
+                c.qsv_hevc,
+                c.qsv_av1_usable,
+                c.amf_hevc,
+                c.amf_av1_usable,
+                c.svt_av1,
+            ),
+            None => (
+                false, false, false, false, false, false, false, false, false,
+            ),
+        };
     rsx! {
         Card {
             CardHeader {
@@ -1143,33 +1289,33 @@ fn PipelineCard() -> Element {
                                 // variants) — an incompatible option is
                                 // never shown, never mind selectable.
                                 option { value: "auto", selected: backend == VideoBackend::Auto, "Auto (best HW → CPU)" }
-                                if caps.av1_nvenc_usable {
+                                if av1_nvenc {
                                     option { value: "av1-nvenc", selected: backend == VideoBackend::Av1Nvenc, "NVENC AV1 (RTX 40+)" }
                                 }
-                                if caps.hevc_nvenc {
+                                if hevc_nvenc {
                                     option { value: "hevc", selected: backend == VideoBackend::HevcNvenc, "NVENC HEVC" }
                                 }
-                                if caps.h264_nvenc {
+                                if h264_nvenc {
                                     option { value: "h264", selected: backend == VideoBackend::H264Nvenc, "NVENC H.264" }
                                 }
-                                if caps.vt_hevc {
+                                if vt_hevc {
                                     option { value: "vt-hevc", selected: backend == VideoBackend::VtHevc, "VideoToolbox HEVC (Apple)" }
                                 }
-                                if caps.qsv_hevc {
+                                if qsv_hevc {
                                     option { value: "qsv-hevc", selected: backend == VideoBackend::QsvHevc, "Quick Sync HEVC (Intel)" }
                                 }
-                                if caps.qsv_av1_usable {
+                                if qsv_av1 {
                                     option { value: "qsv-av1", selected: backend == VideoBackend::QsvAv1, "Quick Sync AV1 (Arc)" }
                                 }
-                                if caps.amf_hevc {
+                                if amf_hevc {
                                     option { value: "amf-hevc", selected: backend == VideoBackend::AmfHevc, "AMF HEVC (AMD)" }
                                 }
-                                if caps.amf_av1_usable {
+                                if amf_av1 {
                                     option { value: "amf-av1", selected: backend == VideoBackend::AmfAv1, "AMF AV1 (RX 7000+)" }
                                 }
                                 option { value: "x264", selected: backend == VideoBackend::CpuX264, "CPU x264 (CRF = slider)" }
                                 option { value: "x265", selected: backend == VideoBackend::CpuX265, "CPU x265 slow (CRF = slider)" }
-                                if caps.svt_av1 {
+                                if svt_av1 {
                                     option { value: "av1", selected: backend == VideoBackend::CpuAv1, "CPU AV1 SVT (slow)" }
                                 }
                                 option { value: "copy", selected: backend == VideoBackend::CopyVideo, "Audio only" }
@@ -1342,7 +1488,7 @@ fn PipelineCard() -> Element {
                         // SVT-only tool: hidden entirely when the build
                         // lacks the encoder, like every other capability-
                         // gated option.
-                        if caps.svt_av1 {
+                        if svt_av1 {
                             label { class: "flex items-center gap-2 text-sm",
                                 Checkbox {
                                     checked: film_grain,
@@ -1546,7 +1692,10 @@ struct GoalSub {
 fn GoalPicker() -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let s = state.read();
-    let caps = shrinkr_core::hw::caps();
+    // Goals resolve through hardware capabilities; before background
+    // detection lands, segments render unhighlighted with their subtitles
+    // (and without estimates) instead of blocking on the trial encodes.
+    let caps = s.caps;
     let backend = s.backend;
     let preset = s.nvenc_preset;
     let cq = s.cq;
@@ -1557,10 +1706,10 @@ fn GoalPicker() -> Element {
     let segs: Vec<(Goal, bool, Option<GoalSub>)> = Goal::ALL
         .iter()
         .map(|&goal| {
-            let active = if preserve_quality {
-                goal.matches_preserve_quality(backend, preset, caps)
-            } else {
-                goal.matches(backend, preset, cq, caps)
+            let active = match caps {
+                Some(c) if preserve_quality => goal.matches_preserve_quality(backend, preset, c),
+                Some(c) => goal.matches(backend, preset, cq, c),
+                None => false,
             };
             let est = s.goal_estimate(goal);
             let counted = est.files + est.warned;
@@ -1808,11 +1957,14 @@ fn EstimateCard() -> Element {
     let (_, warned, _) = s.plan_counts();
     let threshold = s.threshold();
     let (elig_b, new_b, _delta_b, secs) = s.estimate();
+    // A set, not a per-file linear `contains` over the eligible indices —
+    // that term was O(library × eligible) on every render.
+    let elig_set: HashSet<usize> = elig_idx.iter().copied().collect();
     let skipped_b: u64 = s
         .files
         .iter()
         .enumerate()
-        .filter(|(i, _)| !elig_idx.contains(i))
+        .filter(|(i, _)| !elig_set.contains(i))
         .map(|(_, f)| f.bytes)
         .sum();
     // Signed wording: a growing plan says how much it grows (bytes and
@@ -1842,7 +1994,7 @@ fn EstimateCard() -> Element {
     };
     let rows: Vec<(String, String, String, String)> = s
         .preflight_rows()
-        .into_iter()
+        .iter()
         .map(|(name, res, verdict)| {
             // Warn rows are part of the run (they count as eligible) but
             // stand out from clean shrinks so the threshold is visible.
@@ -1851,12 +2003,13 @@ fn EstimateCard() -> Element {
                 Preflight::Warn { reason } => ("⚠", "text-xs text-orange-300", reason),
                 Preflight::Skip { reason } => ("✗", "text-xs text-muted-foreground", reason),
             };
+            let (mark, cls) = (mark.to_string(), cls.to_string());
             let label = if res == "?" {
                 format!("{name}: ")
             } else {
                 format!("{name} · {res}: ")
             };
-            (mark.to_string(), label, reason, cls.to_string())
+            (mark, label, reason.clone(), cls)
         })
         .collect();
     let target_text = s.target_text.clone();
@@ -1917,7 +2070,7 @@ fn EstimateCard() -> Element {
                             Button {
                                 variant: ButtonVariant::Outline,
                                 disabled: target_solving || preserve_quality,
-                                onclick: move |_| crate::solve_clicked(state, pump_tx()),
+                                onclick: move |_| crate::solve_clicked(state, pump_tx(&state)),
                                 if target_solving { "Fitting…" } else { "Fit to size" }
                             }
                         }
@@ -2419,7 +2572,7 @@ fn BenchCard() -> Element {
                         Button {
                             variant: ButtonVariant::Outline,
                             onclick: move |_| {
-                                let tx = pump_tx();
+                                let tx = pump_tx(&state);
                                 let s = state.read();
                                 if s.files.is_empty() {
                                     drop(s);
@@ -2517,7 +2670,7 @@ fn BenchCard() -> Element {
                             variant: ButtonVariant::Outline,
                             onclick: move |_| {
                                 let rows = state.read().bench_rows.clone();
-                                let tx = pump_tx();
+                                let tx = pump_tx(&state);
                                 std::thread::spawn(move || {
                                     let mut dlg = rfd::FileDialog::new();
                                     if let Some(p) = &parent {
@@ -2559,9 +2712,17 @@ fn ConvertCard() -> Element {
     let done = s.convert_done;
     let total = files.len();
     let ready = files.iter().filter(|f| f.runnable()).count();
+    let convert_caps_ready = s.convert_caps_ready;
     drop(s);
-    let caps_summary = shrinkr_core::convert::caps().summary();
-    let has_office = shrinkr_core::convert::caps().has_office();
+    // One caps read, and only after the warmup thread has populated the
+    // core OnceLock — this card mounts hidden on the first render, and a
+    // direct read here blocked startup on `soffice --version`.
+    let (caps_summary, has_office) = if convert_caps_ready {
+        let c = shrinkr_core::convert::caps();
+        (c.summary(), c.has_office())
+    } else {
+        (String::new(), false)
+    };
     // Drop-zone highlight.
     let mut drag_over = use_signal(|| false);
     let drag_cls = if drag_over() {
@@ -2590,7 +2751,7 @@ fn ConvertCard() -> Element {
                             drag_over.set(false);
                             let paths = dropped_paths(&evt);
                             if !paths.is_empty() {
-                                let tx = pump_tx();
+                                let tx = pump_tx(&state);
                                 crate::jobs::start_convert_scan(tx, paths);
                             }
                         },
@@ -2602,7 +2763,7 @@ fn ConvertCard() -> Element {
                             class: "flex-1",
                             disabled: executing,
                             onclick: move |_| {
-                                let tx = pump_tx();
+                                let tx = pump_tx(&state);
                                 std::thread::spawn(move || {
                                     let mut dlg = rfd::FileDialog::new();
                                     if let Some(p) = &parent {
@@ -2791,7 +2952,7 @@ fn ConvertCard() -> Element {
                                 variant: ButtonVariant::Default,
                                 class: "w-full",
                                 disabled: ready == 0,
-                                onclick: move |_| convert_clicked(state, pump_tx()),
+                                onclick: move |_| convert_clicked(state, pump_tx(&state)),
                                 "{convert_label}"
                             }
                         } else {
@@ -2809,7 +2970,7 @@ fn ConvertCard() -> Element {
                             "Nothing here yet — drop files above. Estimates show the expected size change per file."
                         }
                     }
-                    if !has_office {
+                    if convert_caps_ready && !has_office {
                         Callout { variant: CalloutVariant::Info, title: "Documents need LibreOffice",
                             "Word, Excel, PowerPoint and PDF conversion needs LibreOffice installed (soffice on PATH). Media and subtitle conversion works without it."
                         }
@@ -2913,7 +3074,7 @@ fn OptimizeCard() -> Element {
                             drag_over.set(false);
                             let paths = dropped_paths(&evt);
                             if !paths.is_empty() {
-                                crate::jobs::start_optimize_scan(pump_tx(), paths);
+                                crate::jobs::start_optimize_scan(pump_tx(&state), paths);
                             }
                         },
                         "Drop PDFs, PNGs or JPEGs here."
@@ -2924,7 +3085,7 @@ fn OptimizeCard() -> Element {
                             class: "flex-1",
                             disabled: executing,
                             onclick: move |_| {
-                                let tx = pump_tx();
+                                let tx = pump_tx(&state);
                                 std::thread::spawn(move || {
                                     let mut dlg = rfd::FileDialog::new();
                                     if let Some(p) = &parent {
@@ -3067,7 +3228,7 @@ fn OptimizeCard() -> Element {
                                 variant: ButtonVariant::Default,
                                 class: "w-full",
                                 disabled: ready == 0,
-                                onclick: move |_| optimize_clicked(state, pump_tx()),
+                                onclick: move |_| optimize_clicked(state, pump_tx(&state)),
                                 "{run_label}"
                             }
                         } else {
@@ -3132,8 +3293,13 @@ fn optimize_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
 #[component]
 fn LogCard() -> Element {
     let mut state = use_context::<Signal<AppState>>();
-    let entries = state.read().visible_log();
-    let filter = state.read().log_filter;
+    // The rendered window is maintained by push_log / refresh_log_visible:
+    // borrow it here instead of re-filtering and cloning 200 entries on
+    // every progress tick.
+    let s = state.read();
+    let entries = s.log_visible.clone();
+    let filter = s.log_filter;
+    drop(s);
     // Whether the view is pinned to the newest line. Flips to false the
     // moment the user scrolls up (via onscroll below); flips back when
     // they return to the bottom or hit "latest".
@@ -3179,6 +3345,7 @@ fn LogCard() -> Element {
                                     class: "{cls}",
                                     onclick: move |_| {
                                         state.write().log_filter.toggle(level);
+                                        state.write().refresh_log_visible();
                                     },
                                     "{level.badge()}"
                                 }
@@ -3237,7 +3404,7 @@ fn LogCard() -> Element {
 /// One log row: timestamp + severity dot + tag + message, all colored
 /// from the entry's pre-classified level.
 #[component]
-fn LogLine(entry: LogEntry) -> Element {
+fn LogLine(entry: std::sync::Arc<LogEntry>) -> Element {
     let (dot, tag, text) = match entry.level {
         Level::Error => ("bg-destructive", "text-red-500", "text-red-500"),
         Level::Warn => ("bg-orange-300", "text-orange-300", "text-orange-300"),

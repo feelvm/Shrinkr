@@ -26,7 +26,7 @@
 use crate::hw::HwCaps;
 use crate::media::MediaFile;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, serde::Serialize, serde::Deserialize)]
 pub enum VideoBackend {
     /// Ordered fallback ladder driven by [`HwCaps`] across all families.
     Auto,
@@ -104,7 +104,7 @@ impl VideoBackend {
 /// buying a few percent at each step, which is exactly what the Smallest
 /// goal is for. Hardware encoders clamp P8/P9 to NVENC's own P7, the
 /// slowest preset their API accepts.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, serde::Serialize, serde::Deserialize)]
 pub enum NvencPreset {
     P3,
     P4,
@@ -186,7 +186,7 @@ impl NvencPreset {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ScalePolicy {
     /// Never resize (default).
     Preserve,
@@ -527,7 +527,7 @@ pub fn select_levels_for_media(mode: VideoBackend, caps: &HwCaps, media: &MediaF
 /// The GUI exposes this as the "Skip already-efficient files" checkbox:
 /// checked means below-threshold files are skipped; unchecked means they
 /// are still queued, but flagged as warnings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThresholdPolicy {
     /// Skip estimates below the threshold (classic preflight).
     Skip,

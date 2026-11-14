@@ -14,7 +14,9 @@ use shrinkr_core::media::{human_bytes, probe_file, MediaFile};
 use shrinkr_core::pipeline::{preflight_auto_with, EstParams, Preflight, ThresholdPolicy};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::AtomicBool, atomic::AtomicUsize, atomic::Ordering, Arc, Mutex};
+use std::sync::{
+    atomic::AtomicBool, atomic::AtomicU64, atomic::AtomicUsize, atomic::Ordering, Arc, Mutex,
+};
 use std::thread;
 use std::time::Instant;
 
@@ -190,10 +192,77 @@ pub enum JobMsg {
     UpdateInstalled(Result<String, String>),
     FfmpegFetchProgress(f64),
     FfmpegFetched(Result<String, String>),
+    // ── Startup warmup (run off the UI thread) ──
+    /// Tool probes that used to run synchronously in `AppState::default`
+    /// and froze the first paint.
+    ToolsChecked {
+        ffmpeg: bool,
+        ffprobe: bool,
+    },
+    /// Hardware capability detection (3 ffmpeg probes + up to 4 trial
+    /// encodes) has landed in the core OnceLock.
+    HwCapsReady,
+    /// Convert capability detection (includes a `soffice --version`
+    /// spawn) has landed.
+    ConvertCapsReady,
+    /// macOS/Linux close guard: the confirmation dialog answered. The
+    /// pump handles this before `apply_msg` — it alone may touch the
+    /// window's close behaviour (UI-thread-only cell). Never constructed
+    /// on Windows builds (the native message box resolves inline).
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    CloseGuardResolved {
+        quit: bool,
+    },
 }
 
 fn send(tx: &UnboundedSender<JobMsg>, msg: JobMsg) {
     let _ = tx.unbounded_send(msg);
+}
+
+/// Millis of the last globally flushed progress message. Each render of
+/// the whole UI tree rides on one of these, so every worker coalesces
+/// through this one gate: at most ~7 renders/s from progress alone,
+/// regardless of how many encodes run in parallel.
+static LAST_PROGRESS_MS: AtomicU64 = AtomicU64::new(0);
+
+const PROGRESS_MIN_INTERVAL_MS: u64 = 150;
+
+/// Whether a progress message may go out now (global 150 ms window).
+/// Final ticks (`frac >= 1.0`) always pass so a file never finishes on a
+/// stale bar.
+fn progress_due(frac: f64) -> bool {
+    if frac >= 1.0 {
+        return true;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = LAST_PROGRESS_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < PROGRESS_MIN_INTERVAL_MS {
+        return false;
+    }
+    LAST_PROGRESS_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Startup warmup, off the UI thread: the two tool probes and the GPU /
+/// converter capability detections that used to run synchronously during
+/// the first render (a hung driver held the window up to 80 s). Reports
+/// back through the pump so the UI can show a "detecting…" state.
+pub fn start_warmup(tx: UnboundedSender<JobMsg>) {
+    thread::spawn(move || {
+        let ffmpeg = tool_ok("ffmpeg");
+        let ffprobe = tool_ok("ffprobe");
+        send(&tx, JobMsg::ToolsChecked { ffmpeg, ffprobe });
+        // Populate the core OnceLocks; the UI reads them only after the
+        // corresponding Ready message arrives, so nothing blocks.
+        let _ = shrinkr_core::hw::caps();
+        send(&tx, JobMsg::HwCapsReady);
+        let _ = shrinkr_core::convert::caps();
+        send(&tx, JobMsg::ConvertCapsReady);
+    });
 }
 
 /// One worker: walk targets, report hits, then probe each.
@@ -439,15 +508,20 @@ fn run_one_job(
             grain_strength,
             &|p| {
                 // frac>=0 carries position; fps-only lines (frac<0) refresh
-                // the rate while keeping the last position.
-                send(
-                    tx,
-                    JobMsg::ExecProgress {
-                        job: job_idx,
-                        frac: p.frac,
-                        fps: p.fps,
-                    },
-                );
+                // the rate while keeping the last position. Coalesced
+                // through the global gate: every message is a full UI
+                // re-render, so parallel workers must not each tick at
+                // their own rate.
+                if progress_due(p.frac) {
+                    send(
+                        tx,
+                        JobMsg::ExecProgress {
+                            job: job_idx,
+                            frac: p.frac,
+                            fps: p.fps,
+                        },
+                    );
+                }
             },
             cancel,
         );
@@ -1737,8 +1811,10 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             s.probe_total = total;
             if let Some(f) = file {
                 // Same targets re-scanned would otherwise duplicate the
-                // library and re-queue finished files.
-                if !s.files.iter().any(|x| x.path == f.path) {
+                // library and re-queue finished files. O(1) via the
+                // mirror set: a 5,000-file folder scanned linear-dedupe
+                // per arrival was ~12M path comparisons.
+                if s.file_set.insert(f.path.clone()) {
                     s.files.push(f.clone());
                     // Probed while a batch runs: stage it — the file is
                     // in the library, but joining the queue needs the
@@ -2346,6 +2422,29 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 }
             }
         }
+        JobMsg::ToolsChecked { ffmpeg, ffprobe } => {
+            // Correct the optimistic startup flags (a genuinely missing
+            // tool surfaces its badge within a second of launch).
+            s.ffmpeg_ok = ffmpeg;
+            s.ffprobe_ok = ffprobe;
+            if !ffmpeg || !ffprobe {
+                s.push_log(
+                    "ffmpeg/ffprobe not found — press Download FFmpeg in the header, or grab a release archive (FFmpeg is bundled).".into(),
+                );
+            }
+        }
+        JobMsg::HwCapsReady => {
+            // The core OnceLock is populated; expose it to the UI. Any
+            // cached plan without goal estimates re-computes on the next
+            // render via the cache key's caps-known flag.
+            s.caps = Some(shrinkr_core::hw::caps());
+        }
+        JobMsg::ConvertCapsReady => {
+            s.convert_caps_ready = true;
+        }
+        // Handled by the pump on the UI thread (window close behaviour is
+        // not thread-shareable); nothing to change in state.
+        JobMsg::CloseGuardResolved { .. } => {}
     }
 }
 

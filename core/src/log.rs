@@ -11,7 +11,7 @@
 //! * [`Level::Info`] — everything else (scan/probe progress, headers).
 
 /// Severity of one log line.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Level {
     Error,
     Warn,
@@ -163,7 +163,7 @@ pub fn to_file(line: &str) {
 
 /// Toggle state for the six severity lanes, indexed by `Level as usize`.
 /// Both frontends keep one of these next to their log vec.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LevelFilter(pub [bool; 6]);
 
 impl LevelFilter {

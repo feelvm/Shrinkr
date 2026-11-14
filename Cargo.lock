@@ -5199,10 +5199,13 @@ dependencies = [
  "icons",
  "raw-window-handle 0.6.2",
  "rfd 0.15.4",
+ "serde",
+ "serde_json",
  "shrinkr-core",
  "tempfile",
  "tw_merge",
  "walkdir",
+ "windows-sys 0.59.0",
  "winresource",
 ]
 

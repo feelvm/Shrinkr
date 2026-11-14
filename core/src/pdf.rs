@@ -41,7 +41,7 @@ const MAX_IMAGE_PIXELS: u64 = 80_000_000;
 const MAX_FLATE_STREAM: usize = 128 * 1024 * 1024;
 const MAX_VERIFY_STREAM: usize = 64 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PdfPreset {
     /// Structure/stream cleanup only; pages and images are untouched.
     Lossless,
