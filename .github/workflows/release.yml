@@ -81,7 +81,7 @@ jobs:
           set -euo pipefail
           tag="autobuild-2026-11-13-12-43"
           asset="ffmpeg-N-128889-g88c46fce27-linux64-gpl.tar.xz"
-          expected=$(grep -E "^[0-9a-f]{64}[[:space:]]${asset}\$" FFMPEG-PINS.sha256 | awk '{print $1}')
+          expected=$(grep -E "^[0-9a-f]{64}[[:space:]]+${asset}\$" FFMPEG-PINS.sha256 | awk '{print $1}')
           if [ -z "$expected" ]; then
             echo "no SHA-256 pin for $asset in FFMPEG-PINS.sha256" >&2; exit 1
           fi
@@ -102,7 +102,7 @@ jobs:
           curl -fsSL -o ffprobe.zip "https://www.osxexperts.net/ffprobe902arm.zip"
           for pair in "ffmpeg.zip:ffmpeg902arm.zip" "ffprobe.zip:ffprobe902arm.zip"; do
             f="${pair%%:*}"; asset="${pair##*:}"
-            expected=$(grep -E "^[0-9a-f]{64}[[:space:]]${asset}\$" FFMPEG-PINS.sha256 | awk '{print $1}')
+            expected=$(grep -E "^[0-9a-f]{64}[[:space:]]+${asset}\$" FFMPEG-PINS.sha256 | awk '{print $1}')
             if [ -z "$expected" ]; then
               echo "no SHA-256 pin for $asset in FFMPEG-PINS.sha256" >&2; exit 1
             fi
