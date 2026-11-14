@@ -157,6 +157,7 @@ fn csv_esc(s: &str) -> String {
 /// Run the capability-gated matrix on one source file. Outputs go to
 /// `out_dir`. `dry_run` prints commands without executing. Successful
 /// rows feed the estimate calibration afterwards.
+#[allow(clippy::too_many_arguments)]
 pub fn run_on_file(
     m: &MediaFile,
     out_dir: &Path,
@@ -164,11 +165,11 @@ pub fn run_on_file(
     scale: ScalePolicy,
     keep_subs: bool,
     dry_run: bool,
+    cancel: &Arc<AtomicBool>,
     on_step: &dyn Fn(&str),
 ) -> Vec<BenchRow> {
     let _ = std::fs::create_dir_all(out_dir);
     let be = FfmpegBackend;
-    let cancel = Arc::new(AtomicBool::new(false));
     let caps = crate::hw::caps();
     let mut rows = vec![];
     // (settings, measured output/input ratio) per successful row — the
@@ -176,6 +177,13 @@ pub fn run_on_file(
     let mut measured: Vec<(EstParams, f64)> = vec![];
     let stem = m.path.file_stem().and_then(|s| s.to_str()).unwrap_or("src");
     for item in matrix(cq, caps) {
+        // A cancel stops the matrix between rows; rows already measured
+        // stay in the table (and still calibrate). The in-flight encode
+        // is killed by run_with_progress, which shares the flag.
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            on_step("benchmark: cancelled");
+            break;
+        }
         let safe_tag: String = item
             .tag
             .chars()

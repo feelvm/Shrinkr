@@ -565,6 +565,7 @@ fn cli_shrink(
                 film_grain,
                 &spec,
                 &work,
+                &cancel,
                 &|s| println!("  {s}"),
             ) {
                 Ok(o) => {
@@ -949,8 +950,9 @@ fn cli_benchmark(
                 .map(|b| b as f64 / 1e6)
                 .unwrap_or(-1.0)
         );
-        let rows = bench::run_on_file(&m, out_dir, cq, scale, keep_subs, dry_run, &|s| {
-            println!("  {}", s);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rows = bench::run_on_file(&m, out_dir, cq, scale, keep_subs, dry_run, &cancel, &|s| {
+            println!("  {}", s)
         });
         for r in &rows {
             println!(

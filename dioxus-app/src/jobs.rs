@@ -122,6 +122,7 @@ pub enum JobMsg {
     BenchDone {
         rows: Vec<shrinkr_core::bench::BenchRow>,
         recommendation: Option<String>,
+        cancelled: bool,
     },
     TargetLog {
         line: String,
@@ -941,28 +942,70 @@ pub fn start_bench(
     cq: u32,
     scale: shrinkr_core::pipeline::ScalePolicy,
     keep_subs: bool,
+    cancel: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         let out_dir = shrinkr_core::ffmpeg::work_root()
             .map(|d| d.join("bench"))
             .unwrap_or_else(|_| std::env::temp_dir().join("shrinkr-bench"));
-        let rows = bench::run_on_file(&m, &out_dir, cq, scale, keep_subs, false, &|line| {
-            send(
-                &tx,
-                JobMsg::BenchLog {
-                    line: line.to_string(),
-                },
-            );
-        });
-        let rec = bench::recommend(&rows);
+        let rows = bench::run_on_file(
+            &m,
+            &out_dir,
+            cq,
+            scale,
+            keep_subs,
+            false,
+            &cancel,
+            &|line| {
+                send(
+                    &tx,
+                    JobMsg::BenchLog {
+                        line: line.to_string(),
+                    },
+                );
+            },
+        );
+        let cancelled = cancel.load(Ordering::Relaxed);
+        let rec = if cancelled {
+            None
+        } else {
+            bench::recommend(&rows)
+        };
         send(
             &tx,
             JobMsg::BenchDone {
                 rows,
                 recommendation: rec,
+                cancelled,
             },
         );
     });
+}
+
+/// Stop the running benchmark matrix: the flag is shared with every row
+/// encode, so the in-flight one dies and the rest never start.
+pub fn cancel_bench(mut state: Signal<AppState>) {
+    let Some(c) = state.read().bench_cancel.clone() else {
+        return;
+    };
+    drop(state.read());
+    c.store(true, Ordering::Relaxed);
+    state.write().push_log(
+        "Cancelling benchmark — the in-flight row is stopped, measured rows stay.".into(),
+    );
+}
+
+/// Stop the running Fit-to-size solver: the flag is shared with every
+/// probe encode, so the in-flight one dies and no further rounds start.
+pub fn cancel_target_solve(mut state: Signal<AppState>) {
+    let Some(c) = state.read().target_cancel.clone() else {
+        return;
+    };
+    drop(state.read());
+    c.store(true, Ordering::Relaxed);
+    state
+        .write()
+        .push_log("Cancelling target solve — the in-flight probe is stopped.".into());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -979,6 +1022,7 @@ pub fn start_target_solve(
     all_audio: bool,
     film_grain: bool,
     spec: shrinkr_core::target::TargetSpec,
+    cancel: Arc<AtomicBool>,
 ) {
     use shrinkr_core::target::solve_crf_for_file;
     thread::spawn(move || {
@@ -1004,6 +1048,7 @@ pub fn start_target_solve(
             film_grain,
             &spec,
             &work,
+            &cancel,
             &|line| {
                 send(
                     &tx,
@@ -1026,7 +1071,11 @@ pub fn start_target_solve(
             Err(e) => send(
                 &tx,
                 JobMsg::TargetFailed {
-                    msg: format!("target solve failed for {name}: {e}"),
+                    msg: if e == "cancelled" {
+                        format!("target solve cancelled for {name}")
+                    } else {
+                        format!("target solve failed for {name}: {e}")
+                    },
                 },
             ),
         }
@@ -2169,7 +2218,12 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
         }
         JobMsg::TargetFailed { msg } => {
             s.target_solving = false;
-            s.push_log(format!("warn: {msg}"));
+            s.target_cancel = None;
+            if msg.starts_with("target solve cancelled") {
+                s.push_log(msg);
+            } else {
+                s.push_log(format!("warn: {msg}"));
+            }
         }
         JobMsg::TargetDone {
             name,
@@ -2354,9 +2408,20 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
         JobMsg::BenchDone {
             rows,
             recommendation,
+            cancelled,
         } => {
             s.bench_running = false;
+            s.bench_cancel = None;
+            let measured_rows = rows.iter().filter(|r| r.out_bytes > 0).count();
             s.bench_rows = rows;
+            if cancelled {
+                s.bench_note = format!(
+                    "Benchmark cancelled — {measured_rows} row(s) measured, estimates calibrated from them."
+                );
+                let note = s.bench_note.clone();
+                s.push_log(note);
+                return;
+            }
             if let Some(r) = recommendation {
                 s.bench_note = format!("Recommended default: {}", r);
                 let note = s.bench_note.clone();

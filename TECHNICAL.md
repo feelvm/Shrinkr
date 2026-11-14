@@ -663,6 +663,12 @@ plan computations (eligible files, goal segments, estimates) are cached behind
 a settings+library fingerprint so live progress ticks don't re-run the
 preflight math.
 
+The Fit-to-size solver and the Benchmark matrix are cancellable: their
+cancel flag is shared with every probe encode, so Cancel kills the
+in-flight one, no further rounds start, and — for the solver — no sample
+or probe artifacts stay behind. Rows the benchmark already measured stay
+in the table and still calibrate the estimates.
+
 Rotated sources (phone clips that store landscape-coded frames plus a display
 matrix) scale in display space: the short-side caps, custom boxes, SSIM
 references, and the `res_label` the UI shows all describe the picture as a

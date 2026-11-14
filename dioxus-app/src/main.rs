@@ -2067,11 +2067,22 @@ fn EstimateCard() -> Element {
                                     state.write().target_text = e.value();
                                 },
                             }
-                            Button {
-                                variant: ButtonVariant::Outline,
-                                disabled: target_solving || preserve_quality,
-                                onclick: move |_| crate::solve_clicked(state, pump_tx(&state)),
-                                if target_solving { "Fitting…" } else { "Fit to size" }
+                            if target_solving {
+                                // The solver shares a cancel flag with every
+                                // probe encode; this stops it after the
+                                // in-flight one.
+                                Button {
+                                    variant: ButtonVariant::Destructive,
+                                    onclick: move |_| crate::jobs::cancel_target_solve(state),
+                                    "Cancel fit"
+                                }
+                            } else {
+                                Button {
+                                    variant: ButtonVariant::Outline,
+                                    disabled: preserve_quality,
+                                    onclick: move |_| crate::solve_clicked(state, pump_tx(&state)),
+                                    "Fit to size"
+                                }
                             }
                         }
                     }
@@ -2485,9 +2496,16 @@ fn solve_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         }
     };
     drop(s);
+    // The solver used to be uncancellable: a multi-hour SVT solve could
+    // only be stopped by killing the process (orphaning ffmpeg children
+    // and temp files). The cancel handle is shared with every probe
+    // encode, so the Cancel button kills the in-flight one and no further
+    // rounds start.
+    let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut w = state.write();
         w.target_solving = true;
+        w.target_cancel = Some(cancel.clone());
         w.push_log(format!(
             "Target solve on {fname}: aiming {} with {:?} …",
             spec.describe(),
@@ -2507,6 +2525,7 @@ fn solve_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         params.all_audio,
         params.film_grain,
         spec,
+        cancel,
     );
 }
 
@@ -2609,9 +2628,11 @@ fn BenchCard() -> Element {
                                 let m = s.files[vi].clone();
                                 let (cq, scale, keep_subs) = (s.cq, s.scale, s.keep_subs);
                                 drop(s);
+                                let cancel = Arc::new(AtomicBool::new(false));
                                 {
                                     let mut w = state.write();
                                     w.bench_running = true;
+                                    w.bench_cancel = Some(cancel.clone());
                                     w.bench_rows.clear();
                                     w.bench_note.clear();
                                     w.push_log(format!(
@@ -2620,14 +2641,21 @@ fn BenchCard() -> Element {
                                         cq
                                     ));
                                 }
-                                crate::jobs::start_bench(tx, m, cq, scale, keep_subs);
+                                crate::jobs::start_bench(tx, m, cq, scale, keep_subs, cancel);
                             },
                             "Run on first eligible file"
                         }
                     } else {
-                        div { class: "flex items-center gap-2 text-sm text-muted-foreground",
-                            Spinner {}
-                            "Benchmarking… (temp outputs deleted)"
+                        div { class: "flex items-center justify-between gap-2",
+                            div { class: "flex items-center gap-2 text-sm text-muted-foreground",
+                                Spinner {}
+                                "Benchmarking… (temp outputs deleted)"
+                            }
+                            Button {
+                                variant: ButtonVariant::Destructive,
+                                onclick: move |_| crate::jobs::cancel_bench(state),
+                                "Cancel"
+                            }
                         }
                     }
                     if !note.is_empty() {

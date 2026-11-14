@@ -232,8 +232,15 @@ pub fn solve_crf_for_file(
     film_grain: bool,
     spec: &TargetSpec,
     work_dir: &Path,
+    cancel: &Arc<AtomicBool>,
     on_step: &dyn Fn(&str),
 ) -> Result<SolveOutcome, String> {
+    let cancelled = |cancel: &Arc<AtomicBool>| cancel.load(std::sync::atomic::Ordering::Relaxed);
+    // The in-flight probe encode is killed by `run_with_progress`, which
+    // shares this flag; these checks stop between steps.
+    if cancelled(cancel) {
+        return Err("cancelled".into());
+    }
     const LO: u32 = 18;
     const HI: u32 = 40; // shared quality-slider range on every backend
     if backend == VideoBackend::CopyVideo {
@@ -263,113 +270,138 @@ pub fn solve_crf_for_file(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("target");
-    // 1) Cut samples.
-    let plan = sample_plan(m.duration_s.max(60.0), 3, 45.0);
+    // Sample cuts live beyond the solve closure so the cleanup below
+    // can always reach them.
     let mut sample_paths: Vec<PathBuf> = vec![];
-    let mut sample_src_bytes = 0u64;
-    for (k, (start, len)) in plan.iter().enumerate() {
-        let p = work_dir.join(format!("{stem}-sample{k}.mkv"));
-        let _ = std::fs::remove_file(&p);
-        on_step(&format!(
-            "target probe: cutting sample {}/{} ({}s @ {}s)…",
-            k + 1,
-            plan.len(),
-            len,
-            start.round() as u64
-        ));
-        extract_sample(&m.path, *start, *len, &p)?;
-        sample_src_bytes += file_bytes(&p);
-        sample_paths.push(p);
-    }
-    if sample_src_bytes == 0 {
-        return Err("samples came out empty — source may be unreadable".into());
-    }
-    // 2) Encode samples at two CRFs bracketing the slider value.
-    let c1 = (cq0 + 4).min(HI);
-    let c0 = c1.saturating_sub(4).max(LO);
-    let be = FfmpegBackend;
-    let cancel = Arc::new(AtomicBool::new(false));
-    let mut measured: Vec<(u32, u64, u64)> = vec![];
-    // Probe encodes, factored so the refinement round reuses them.
-    let probe_at = |c: u32,
-                    measured: &mut Vec<(u32, u64, u64)>,
-                    on_step: &dyn Fn(&str)|
-     -> Result<(), String> {
-        let mut out_bytes = 0u64;
-        for (k, sp) in sample_paths.iter().enumerate() {
-            let sm = crate::media::probe_file(sp).map_err(|e| format!("sample probe: {e:#}"))?;
-            let tmp = work_dir.join(format!("{stem}-probe{c}-{k}.mkv"));
-            let _ = std::fs::remove_file(&tmp);
+    let outcome = (|| -> Result<SolveOutcome, String> {
+        // 1) Cut samples.
+        let plan = sample_plan(m.duration_s.max(60.0), 3, 45.0);
+        let mut sample_src_bytes = 0u64;
+        for (k, (start, len)) in plan.iter().enumerate() {
+            if cancelled(cancel) {
+                return Err("cancelled".into());
+            }
+            let p = work_dir.join(format!("{stem}-sample{k}.mkv"));
+            let _ = std::fs::remove_file(&p);
             on_step(&format!(
-                "target probe: sample {}/{} at {} {}…",
+                "target probe: cutting sample {}/{} ({}s @ {}s)…",
                 k + 1,
-                sample_paths.len(),
-                quality_word(backend),
-                c
+                plan.len(),
+                len,
+                start.round() as u64
             ));
-            let er = be
-                .encode(
-                    &sm,
-                    &tmp,
-                    backend,
-                    preset,
-                    c,
-                    scale,
-                    keep_subs,
-                    extra_args,
-                    opus_bps,
-                    all_audio,
-                    if film_grain { 8 } else { 0 },
-                    &|_| {},
-                    &cancel,
-                )
-                .map_err(|e| format!("probe encode at {c} failed: {e}"))?;
-            out_bytes += er.output_bytes;
-            let _ = std::fs::remove_file(&tmp);
+            extract_sample(&m.path, *start, *len, &p)?;
+            sample_src_bytes += file_bytes(&p);
+            sample_paths.push(p);
         }
-        measured.push((c, sample_src_bytes, out_bytes));
-        on_step(&format!(
-            "target probe: {} {} → {} ({:.0}% of sample)",
-            quality_word(backend),
-            c,
-            human_bytes(out_bytes),
-            out_bytes as f64 / sample_src_bytes as f64 * 100.0
-        ));
-        Ok(())
-    };
-    for &c in &[c0, c1] {
-        probe_at(c, &mut measured, on_step)?;
-    }
-    // 3) Fit + solve, with one refinement round when the solution lies
-    // well outside the probed interval (extrapolation is where the error
-    // lives — measuring at the solution fixes most of it).
-    let ratios_of = |measured: &[(u32, u64, u64)]| {
-        measured
-            .iter()
-            .map(|&(c, src, out)| (c, out as f64 / src.max(1) as f64))
-            .collect::<Vec<(u32, f64)>>()
-    };
-    let (mut crf, mut predicted_ratio, mut reachable) =
-        solve_crf(&ratios_of(&measured), target, LO, HI);
-    let probed = |c: u32| measured.iter().any(|&(mc, _, _)| mc == c);
-    if reachable && !probed(crf) && (crf > c1 + 2 || crf + 2 < c0) {
-        on_step(&format!(
-            "target probe: refining at {} {} (outside probed range)…",
-            quality_word(backend),
-            crf
-        ));
-        probe_at(crf, &mut measured, on_step)?;
-        (crf, predicted_ratio, reachable) = solve_crf(&ratios_of(&measured), target, LO, HI);
-    }
+        if sample_src_bytes == 0 {
+            return Err("samples came out empty — source may be unreadable".into());
+        }
+        // 2) Encode samples at two CRFs bracketing the slider value.
+        let c1 = (cq0 + 4).min(HI);
+        let c0 = c1.saturating_sub(4).max(LO);
+        let be = FfmpegBackend;
+        let mut measured: Vec<(u32, u64, u64)> = vec![];
+        // Probe encodes, factored so the refinement round reuses them.
+        let probe_at = |c: u32,
+                        measured: &mut Vec<(u32, u64, u64)>,
+                        on_step: &dyn Fn(&str)|
+         -> Result<(), String> {
+            let mut out_bytes = 0u64;
+            for (k, sp) in sample_paths.iter().enumerate() {
+                if cancelled(cancel) {
+                    return Err("cancelled".into());
+                }
+                let sm =
+                    crate::media::probe_file(sp).map_err(|e| format!("sample probe: {e:#}"))?;
+                let tmp = work_dir.join(format!("{stem}-probe{c}-{k}.mkv"));
+                let _ = std::fs::remove_file(&tmp);
+                on_step(&format!(
+                    "target probe: sample {}/{} at {} {}…",
+                    k + 1,
+                    sample_paths.len(),
+                    quality_word(backend),
+                    c
+                ));
+                let er = be
+                    .encode(
+                        &sm,
+                        &tmp,
+                        backend,
+                        preset,
+                        c,
+                        scale,
+                        keep_subs,
+                        extra_args,
+                        opus_bps,
+                        all_audio,
+                        if film_grain { 8 } else { 0 },
+                        &|_| {},
+                        &cancel,
+                    )
+                    .map_err(|e| format!("probe encode at {c} failed: {e}"))?;
+                out_bytes += er.output_bytes;
+                let _ = std::fs::remove_file(&tmp);
+            }
+            measured.push((c, sample_src_bytes, out_bytes));
+            on_step(&format!(
+                "target probe: {} {} → {} ({:.0}% of sample)",
+                quality_word(backend),
+                c,
+                human_bytes(out_bytes),
+                out_bytes as f64 / sample_src_bytes as f64 * 100.0
+            ));
+            Ok(())
+        };
+        for &c in &[c0, c1] {
+            probe_at(c, &mut measured, on_step)?;
+        }
+        // 3) Fit + solve, with one refinement round when the solution lies
+        // well outside the probed interval (extrapolation is where the error
+        // lives — measuring at the solution fixes most of it).
+        let ratios_of = |measured: &[(u32, u64, u64)]| {
+            measured
+                .iter()
+                .map(|&(c, src, out)| (c, out as f64 / src.max(1) as f64))
+                .collect::<Vec<(u32, f64)>>()
+        };
+        let (mut crf, mut predicted_ratio, mut reachable) =
+            solve_crf(&ratios_of(&measured), target, LO, HI);
+        let probed = |c: u32| measured.iter().any(|&(mc, _, _)| mc == c);
+        if reachable && !probed(crf) && (crf > c1 + 2 || crf + 2 < c0) {
+            if cancelled(cancel) {
+                return Err("cancelled".into());
+            }
+            on_step(&format!(
+                "target probe: refining at {} {} (outside probed range)…",
+                quality_word(backend),
+                crf
+            ));
+            probe_at(crf, &mut measured, on_step)?;
+            (crf, predicted_ratio, reachable) = solve_crf(&ratios_of(&measured), target, LO, HI);
+        }
+        Ok(SolveOutcome {
+            crf,
+            predicted_bytes: (predicted_ratio * m.bytes as f64) as u64,
+            reachable,
+            measured,
+        })
+    })();
+    // Whatever the exit — success, failure, or cancellation — no probe
+    // artifacts stay behind: the sample cuts, and any probe encode a
+    // cancel killed mid-write.
     for p in &sample_paths {
         let _ = std::fs::remove_file(p);
     }
-    Ok(SolveOutcome {
-        crf,
-        predicted_bytes: (predicted_ratio * m.bytes as f64) as u64,
-        reachable,
-        measured,
-    })
+    if let Ok(entries) = std::fs::read_dir(work_dir) {
+        let probe_prefix = format!("{stem}-probe");
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&probe_prefix) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    outcome
 }
 
 fn quality_word(backend: VideoBackend) -> &'static str {

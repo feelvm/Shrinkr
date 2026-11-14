@@ -383,6 +383,10 @@ pub struct AppState {
     /// Raw target-size text for the solver (e.g. "400MB", "2x").
     pub target_text: String,
     pub target_solving: bool,
+    /// Cancel handle for the in-flight Fit-to-size solver (the Cancel
+    /// button resolves it; the solver shares the flag with every probe
+    /// encode).
+    pub target_cancel: Option<Arc<AtomicBool>>,
     pub executing: bool,
     pub exec_items: Vec<ExecItem>,
     /// The files behind `exec_items`, index-aligned. The worker owns the
@@ -435,6 +439,8 @@ pub struct AppState {
     pub log_visible: Vec<std::sync::Arc<LogEntry>>,
     pub log_filter: LevelFilter,
     pub bench_running: bool,
+    /// Cancel handle for the running benchmark matrix.
+    pub bench_cancel: Option<Arc<AtomicBool>>,
     pub bench_rows: Vec<BenchRow>,
     pub bench_note: String,
     pub ffmpeg_ok: bool,
@@ -702,6 +708,7 @@ impl Default for AppState {
             extra_args: String::new(),
             target_text: "2x".into(),
             target_solving: false,
+            target_cancel: None,
             executing: false,
             exec_items: vec![],
             exec_files: vec![],
@@ -723,6 +730,7 @@ impl Default for AppState {
             ))],
             log_filter: LevelFilter::all(),
             bench_running: false,
+            bench_cancel: None,
             bench_rows: vec![],
             bench_note: String::new(),
             // Optimistic until the background warmup reports (running
