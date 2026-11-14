@@ -636,8 +636,38 @@ and transactionally moves every file into the executable's directory
 directories live inside that directory so no rename crosses a filesystem
 boundary. The GUI refuses to install while a batch is running.
 
+Every release archive carries an embedded zipsign signature (ed25519, made by
+the release workflow with the key whose public half is committed as
+`updater-key.pub`), and the updater verifies it against the key embedded in
+the binary before a single archive byte is unpacked — a corrupt, replaced, or
+unsigned archive fails closed. `SHA256SUMS.txt` on each release covers the
+artifacts that carry no embedded signature (DMG, installer). The bundled
+ffmpeg/ffprobe sidecars are pinned per build and checksum-verified against
+`FFMPEG-PINS.sha256` at release time and for the in-app Windows download;
+bumping a pin is documented in that file's header and `FFMPEG-NOTES.txt`.
+
 The Windows installer exists as a separate asset whose name omits the target
 triple, so the updater can never select it by mistake.
+
+## GUI shell
+
+The window refuses to close silently while anything runs (shrink, convert,
+optimize, update install): Windows asks in a native box before forwarding the
+close; macOS/Linux hide on the close attempt and resolve a native dialog
+through the pump. User settings (pipeline knobs, codec mutes, convert/optimize
+prefs, log filter) persist to `settings.json` in the app-data folder,
+debounced in the background and applied before the first render. GPU and
+converter capability detection (ffmpeg trial encodes, `soffice --version`)
+runs on a warmup thread so the first paint never blocks on subprocesses, and
+plan computations (eligible files, goal segments, estimates) are cached behind
+a settings+library fingerprint so live progress ticks don't re-run the
+preflight math.
+
+Rotated sources (phone clips that store landscape-coded frames plus a display
+matrix) scale in display space: the short-side caps, custom boxes, SSIM
+references, and the `res_label` the UI shows all describe the picture as a
+player presents it, matching ffmpeg's default autorotate that transposes
+frames before user filters.
 
 ## Tests and CI
 

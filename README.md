@@ -45,6 +45,10 @@ needed for document conversion.
 - **Linux**: the GUI needs WebKitGTK 4.1 and GTK 3 at runtime
   (`sudo apt install libwebkitgtk-4.1-0 libgtk-3-0` on Debian/Ubuntu).
   `shrinkr-cli` has no such requirement.
+- **Verify a download**: every release publishes `SHA256SUMS.txt`, and the
+  self-update archives carry an embedded signature the app checks before
+  installing. The bundled `ffmpeg`/`ffprobe` are pinned and checksum-verified
+  builds (`FFMPEG-PINS.sha256`).
 
 ## Quick start
 
