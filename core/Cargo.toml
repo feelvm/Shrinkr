@@ -9,7 +9,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 sha2 = "0.10"
-self_update = { version = "1", features = ["archive-zip", "compression-zip-deflate"] }
+self_update = { version = "1", features = [
+    "archive-zip",
+    "compression-zip-deflate",
+    # Verify the downloaded update archive's embedded zipsign signature
+    # (self_update::verify_signature) against UPDATER_KEY before anything
+    # from it is unpacked or run.
+    "signatures",
+] }
 libjpeg-turbo-rs = "0.9"
 lopdf = { version = "0.47", default-features = false, features = ["rayon"] }
 oxipng = { version = "10.2", default-features = false, features = ["parallel", "zopfli"] }
@@ -17,3 +24,5 @@ oxipng = { version = "10.2", default-features = false, features = ["parallel", "
 [dev-dependencies]
 tempfile = "3.27.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# Signing side of zipsign, for the update-signature tests only.
+zipsign-api = { version = "0.2", default-features = false, features = ["sign-zip"] }

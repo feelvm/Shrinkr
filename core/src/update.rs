@@ -9,6 +9,11 @@
 //!    (e.g. `shrinkr-x86_64-pc-windows-msvc.zip`), each with all shipped
 //!    files at its root — the release workflow does this: the GUI binary,
 //!    `shrinkr-cli`, and the bundled `ffmpeg` / `ffprobe` sidecars.
+//! 4. Publish a zipsign signature inside every archive: the release
+//!    workflow signs each zip with the ed25519 key whose public half is
+//!    committed as `updater-key.pub` (secret kept in the repo's
+//!    `ZIPSIGN_SIGNING_KEY` secret). Archives without a matching
+//!    signature are REJECTED before anything is unpacked — fail closed.
 //!
 //! Matching works without an `asset_identifier`: the crate requires the
 //! asset name to contain the running binary's compile-time target triple,
@@ -40,6 +45,14 @@ pub const REPO_NAME: &str = "Shrinkr";
 /// Binary name inside the release archives (`shrinkr.exe` on Windows,
 /// `shrinkr` elsewhere — the platform exe suffix is appended by the crate).
 pub const BIN_NAME: &str = "shrinkr";
+
+/// ed25519 verifying key every update archive must be signed with
+/// (zipsign format: raw 32-byte public key, committed as
+/// `updater-key.pub`; the secret half lives with the maintainer and in
+/// the release workflow's `ZIPSIGN_SIGNING_KEY` secret). Compile-time
+/// include, so a wrong-length key file fails the build rather than the
+/// update.
+const UPDATER_KEY: self_update::VerifyingKey = *include_bytes!("../../updater-key.pub");
 
 /// True when the constants above were left as placeholders.
 pub fn is_configured() -> bool {
@@ -174,12 +187,34 @@ pub fn install_update(current_version: &str) -> Result<String> {
 }
 
 fn install_from_asset(url: &str, scratch: &Path, install_dir: &Path) -> Result<()> {
-    let zip_path = scratch.join("update.zip");
+    // Keep the release asset's file name: the embedded zipsign signature
+    // is salted with the archive name, so verification must see the same
+    // name the signing step saw in CI.
+    let asset_name = url
+        .split(['?', '#'])
+        .next()
+        .and_then(|p| p.rsplit('/').next())
+        .filter(|s| !s.is_empty())
+        .context("release asset URL has no file name")?
+        .to_string();
+    let zip_path = scratch.join(&asset_name);
     let file = std::fs::File::create(&zip_path).context("create download file")?;
     self_update::Download::from_url(url)
         .request_header("ACCEPT", "application/octet-stream")
         .download_to(file)
         .context("download release archive")?;
+
+    // Fail closed before a single archive byte is unpacked, let alone
+    // executed: the archive must carry a signature made with the release
+    // signing key. A corrupt download, a replaced asset, or an unsigned
+    // release all land here.
+    self_update::verify_signature(&zip_path, &[UPDATER_KEY]).map_err(|e| {
+        anyhow::Error::new(e).context(format!(
+            "signature verification of {asset_name} failed — the archive \
+             was not installed; it may be corrupt or not from the publisher"
+        ))
+    })?;
+
     install_from_archive(&zip_path, scratch, install_dir)
 }
 
@@ -244,10 +279,101 @@ pub fn restart_now() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn repo_is_configured() {
         assert!(is_configured());
+    }
+
+    #[test]
+    fn updater_key_is_a_real_key() {
+        // Compile-time length is guaranteed by include_bytes + the array
+        // type; assert it isn't an all-zero placeholder.
+        assert!(UPDATER_KEY.iter().any(|&b| b != 0));
+    }
+
+    /// A deterministic throwaway signing key for signature tests (never
+    /// the real release key, whose public half is embedded above).
+    fn throwaway_signing_key() -> zipsign_api::SigningKey {
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = (i * 37 + 11) as u8;
+        }
+        zipsign_api::SigningKey::from_bytes(&seed)
+    }
+
+    /// Write `files` as a flat zip, sign it with `key` under the given
+    /// context, and return the signed archive's path.
+    fn write_signed_zip(
+        dir: &Path,
+        name: &str,
+        files: &[(&str, &str)],
+        key: &zipsign_api::SigningKey,
+    ) -> PathBuf {
+        let unsigned = dir.join("unsigned.zip");
+        let file = std::fs::File::create(&unsigned).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, contents) in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, contents.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+
+        let mut input = std::fs::File::open(&unsigned).unwrap();
+        let mut signed = std::io::Cursor::new(Vec::new());
+        zipsign_api::sign::copy_and_sign_zip(
+            &mut input,
+            &mut signed,
+            std::slice::from_ref(key),
+            Some(name.as_bytes()),
+        )
+        .unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, signed.into_inner()).unwrap();
+        path
+    }
+
+    #[test]
+    fn signed_archive_verifies_and_tamper_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = throwaway_signing_key();
+        let pub_key: self_update::VerifyingKey = *key.verifying_key().as_bytes();
+
+        let path = write_signed_zip(
+            tmp.path(),
+            "update-sig-test.zip",
+            &[("shrinkr", "bin")],
+            &key,
+        );
+        self_update::verify_signature(&path, &[pub_key]).expect("valid signature accepts");
+
+        // Flip one byte of the stored content — verification must fail.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            self_update::verify_signature(&path, &[pub_key]).is_err(),
+            "tampered archive must be rejected"
+        );
+    }
+
+    #[test]
+    fn unsigned_archive_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let unsigned = tmp.path().join("update-sig-test.zip");
+        let file = std::fs::File::create(&unsigned).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("shrinkr", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"bin").unwrap();
+        zip.finish().unwrap();
+        assert!(
+            self_update::verify_signature(&unsigned, &[UPDATER_KEY]).is_err(),
+            "an archive without an embedded signature must be rejected"
+        );
     }
 
     /// Build a flat zip with the given (name, contents) files.

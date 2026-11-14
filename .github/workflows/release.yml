@@ -143,6 +143,31 @@ jobs:
           ) -DestinationPath "${{ env.ARCHIVE }}" -Force
           Get-ChildItem ${{ env.ARCHIVE }}
 
+      # Sign the self-update archive with the release signing key
+      # (zipsign: an ed25519 signature embedded in the zip, salted with
+      # the archive name). Every installed updater verifies this against
+      # its committed updater-key.pub and REJECTS the archive on any
+      # mismatch — so an unsigned release is unusable, not "less safe":
+      # fail the workflow loudly rather than publish unverifiable bytes.
+      # Key setup: `zipsign gen-key signing.key updater-key.pub`, commit
+      # updater-key.pub, store `openssl base64 -A < signing.key` (or
+      # `base64 -w0`) as the ZIPSIGN_SIGNING_KEY repo secret.
+      - name: Sign update archive (zipsign)
+        shell: bash
+        env:
+          ZIPSIGN_SIGNING_KEY: ${{ secrets.ZIPSIGN_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ZIPSIGN_SIGNING_KEY" ]; then
+            echo "::error::ZIPSIGN_SIGNING_KEY secret is not set — the updater rejects unsigned archives, so this release could not be installed. Generate with 'zipsign gen-key signing.key updater-key.pub' (commit updater-key.pub) and store the base64 of signing.key in the secret."
+            exit 1
+          fi
+          cargo install zipsign --locked
+          echo "$ZIPSIGN_SIGNING_KEY" | openssl base64 -d -A -out zipsign.key
+          zipsign sign zip "${{ env.ARCHIVE }}" zipsign.key
+          rm -f zipsign.key
+          echo "signed ${{ env.ARCHIVE }}"
+
       # Separate download from the zip: the zip stays the self-update
       # asset (matched by target triple), while the setup exe is the
       # user-facing Windows install. Its name deliberately omits the
@@ -246,3 +271,26 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           gh release upload "${{ github.ref_name }}" "Shrinkr-Setup-${VERSION}-x64.exe" --clobber
+
+  # Runs once, after every matrix job has uploaded its artifacts: publish
+  # SHA256SUMS.txt so users (and mirroring scripts) can verify every
+  # download — including the DMG and the installer, which carry no
+  # embedded signature. Re-uploads are safe: the sums exclude themselves.
+  checksums:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Publish SHA256SUMS
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          rm -rf sums-tmp && mkdir sums-tmp
+          gh release download "$tag" -R "$GITHUB_REPOSITORY" -D sums-tmp
+          cd sums-tmp
+          ls | grep -v '^SHA256SUMS' | xargs sha256sum > ../SHA256SUMS.txt
+          cd ..
+          cat SHA256SUMS.txt
+          gh release upload "$tag" SHA256SUMS.txt --clobber

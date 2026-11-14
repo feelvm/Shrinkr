@@ -5029,7 +5029,7 @@ dependencies = [
  "tempfile",
  "ureq",
  "urlencoding",
- "zip",
+ "zip 8.6.0",
  "zipsign-api",
 ]
 
@@ -5227,7 +5227,8 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "walkdir",
- "zip",
+ "zip 8.6.0",
+ "zipsign-api",
 ]
 
 [[package]]
@@ -7320,6 +7321,18 @@ dependencies = [
 
 [[package]]
 name = "zip"
+version = "7.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc12baa6db2b15a140161ce53d72209dacea594230798c24774139b54ecaa980"
+dependencies = [
+ "crc32fast",
+ "indexmap",
+ "memchr",
+ "typed-path",
+]
+
+[[package]]
+name = "zip"
 version = "8.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
@@ -7342,6 +7355,7 @@ dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
  "thiserror 2.0.20",
+ "zip 7.4.0",
 ]
 
 [[package]]
