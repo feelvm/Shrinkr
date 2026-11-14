@@ -1600,7 +1600,9 @@ fn run_one_convert(
             &item.target_ext,
             &tmp_out,
             &|frac| {
-                send(&tx, JobMsg::ConvertProgress { job: job_idx, frac });
+                if progress_due(frac) {
+                    send(&tx, JobMsg::ConvertProgress { job: job_idx, frac });
+                }
             },
             cancel,
         )?;
@@ -1634,7 +1636,10 @@ fn run_one_convert(
         &item.target_ext,
         &tmp_out,
         &|frac| {
-            send(&tx, JobMsg::ConvertProgress { job: job_idx, frac });
+            // Same global render-cost gate as the shrink progress.
+            if progress_due(frac) {
+                send(&tx, JobMsg::ConvertProgress { job: job_idx, frac });
+            }
         },
         cancel,
     );
