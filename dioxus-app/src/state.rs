@@ -384,7 +384,7 @@ use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 /// Encode settings snapshot for chained batches: files queued mid-run
 /// re-run with exactly what the finished batch used.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExecCfg {
     pub params: EstParams,
     pub keep_subs: bool,
@@ -539,6 +539,17 @@ pub struct AppState {
     pub keep_subs: bool,
     pub min_saving_pct: f64,
     pub skip_efficient: bool,
+    /// Skip inputs whose path, size and modified time match the
+    /// processed-file ledger. Prevents re-running a lossy encode on files
+    /// that were already handled; the toggle is the explicit opt-out.
+    pub skip_processed: bool,
+    /// Processed-file ledger entries (display only; the ledger lives in
+    /// the app-data folder).
+    pub history_count: usize,
+    /// Files omitted by the history check during the current scan.
+    pub history_skipped: usize,
+    /// True while the startup worker is probing paths from a saved queue.
+    pub queue_restoring: bool,
     /// Keep every audio track. Default true; Preserve quality forces it.
     pub all_audio: bool,
     pub parallel: usize,
@@ -873,6 +884,10 @@ impl Default for AppState {
             opus_bps: None,
             min_saving_pct: 10.0,
             skip_efficient: true,
+            skip_processed: true,
+            history_count: 0,
+            history_skipped: 0,
+            queue_restoring: false,
             parallel: 2,
             replace: false,
             extra_args: String::new(),
@@ -2399,6 +2414,7 @@ mod tests {
         // the mode off does not silently drop subtitles or extra audio.
         assert!(s.keep_subs);
         assert!(s.all_audio);
+        assert!(s.skip_processed);
         // Originals are kept unless the user explicitly opts into replace.
         assert!(!s.replace);
         assert!(!s.convert_replace);

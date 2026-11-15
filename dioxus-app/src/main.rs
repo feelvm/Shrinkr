@@ -231,9 +231,18 @@ const SLIDER_CSS: &str = include_str!("../assets/slider.css");
 fn App() -> Element {
     // Load persisted settings before the first render (file read, not a
     // subprocess — cheap enough for the first paint to stay fast).
+    let restored_queue = persist::load_queue();
     let mut initial = AppState::default();
     if let Some(saved) = persist::load() {
         saved.apply(&mut initial);
+    }
+    initial.history_count = persist::history_count();
+    if let Some(snapshot) = &restored_queue {
+        initial.queue_restoring = true;
+        initial.push_log(format!(
+            "Restoring {} unfinished file(s) from the previous session.",
+            snapshot.file_count()
+        ));
     }
     let mut state = use_signal(move || initial);
     use_context_provider(|| state);
@@ -259,6 +268,19 @@ fn App() -> Element {
     });
     // Stored sender lets job handlers start chained batches on ExecDone.
     state.write().job_tx = Some(pump.tx());
+    // Restore the unfinished queue written by the previous session. The
+    // saved settings are already applied above; the queue snapshot keeps
+    // its own per-segment settings, so a resume runs exactly what was
+    // queued even if the sidebar knobs changed since.
+    let mut restore_started = use_signal(|| false);
+    use_effect(move || {
+        if !restore_started() {
+            restore_started.set(true);
+            if let Some(snapshot) = restored_queue.clone() {
+                crate::jobs::start_queue_restore(pump.tx(), snapshot);
+            }
+        }
+    });
     // One silent update check shortly after launch (worker reports back
     // via JobMsg::UpdateChecked; result lands in the Header + Log).
     let mut auto_checked = use_signal(|| false);
@@ -568,10 +590,15 @@ fn Sidebar() -> Element {
     // Codec circles' checked state (unchecked = muted): the rows read it
     // directly, so a click greys the type out on the next frame.
     let muted_set = s.muted_codecs.clone();
+    // History controls live in their own always-visible card: a scan that
+    // skips every file must not hide the toggle that caused it.
+    let skip_processed = s.skip_processed;
+    let history_count = s.history_count;
     // Run state — the Process button and its batch progress live at the
     // bottom of this sidebar, next to the import controls.
     let executing = s.executing;
     let paused = s.paused;
+    let queue_restoring = s.queue_restoring;
     let exec_done = s.exec_done();
     let exec_total = s.exec_total;
     let exec_overall = s.exec_overall();
@@ -821,17 +848,98 @@ fn Sidebar() -> Element {
                     }
                 }
             }
+            Card {
+                CardHeader {
+                    CardTitle { "History" }
+                }
+                CardContent {
+                    div { class: "flex flex-col gap-2",
+                        label { class: "flex items-center gap-2 text-sm",
+                            Checkbox {
+                                checked: skip_processed,
+                                on_checked_change: move |v| state.write().skip_processed = v,
+                            }
+                            "Skip already-processed"
+                        }
+                        if history_count > 0 {
+                            div { class: "flex items-center justify-between gap-2",
+                                span { class: "text-xs text-muted-foreground", "{history_count} file(s)" }
+                                Button {
+                                    variant: ButtonVariant::Ghost,
+                                    class: "h-6 px-2 text-xs",
+                                    onclick: move |_| clear_history_clicked(state),
+                                    "Clear"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // Run control, directly under the Library card: the Process
             // button when idle (plus Retry while the last run left
             // failures), batch progress + cancel mid-run.
             div { class: "flex flex-col gap-2",
                 if !executing {
+                    if queue_restoring {
+                        div { class: "flex items-center gap-2 text-xs text-muted-foreground",
+                            Spinner {}
+                            "Restoring queue."
+                        }
+                    }
+                    if !pending_files.is_empty() {
+                        div { class: "flex flex-col gap-2 rounded-md border border-border p-2",
+                            p { class: "text-xs font-semibold", "Restored queue ({waiting})" }
+                            div { class: "flex max-h-40 flex-col gap-1 overflow-y-auto",
+                                for (p_name , p_res , p_path , p_skipped) in pending_files {
+                                    {
+                                        let p_del = p_path.clone();
+                                        rsx! {
+                                            div { class: "flex items-center gap-2",
+                                                span { class: "min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground/80", "{p_name}" }
+                                                if p_res != "?" {
+                                                    span { class: "shrink-0 text-xs text-muted-foreground/60", "{p_res}" }
+                                                }
+                                                span { class: "shrink-0 text-xs text-muted-foreground/60",
+                                                    if p_skipped { "skipped" } else { "waiting" }
+                                                }
+                                                button {
+                                                    class: "shrink-0 rounded px-1 text-xs text-muted-foreground/60 hover:bg-accent hover:text-accent-foreground",
+                                                    title: "Remove from the restored queue",
+                                                    onclick: move |_| {
+                                                        let mut w = state.write();
+                                                        for seg in w.pending.iter_mut() {
+                                                            seg.files.retain(|f| f.path != p_del);
+                                                        }
+                                                        w.pending.retain(|seg| !seg.files.is_empty());
+                                                        crate::persist::save_queue(&w);
+                                                    },
+                                                    "✕"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Button {
+                                variant: ButtonVariant::Default,
+                                class: "w-full",
+                                onclick: move |_| resume_queue_clicked(state, pump_tx(&state)),
+                                "Resume queue"
+                            }
+                            Button {
+                                variant: ButtonVariant::Ghost,
+                                class: "w-full",
+                                onclick: move |_| discard_restored(state),
+                                "Discard"
+                            }
+                        }
+                    }
                     Button {
                         variant: ButtonVariant::Default,
                         class: "w-full",
                         // Auto-scan is part of adding now: let the selection
                         // finish probing before a batch snapshots it.
-                        disabled: scan_busy,
+                        disabled: scan_busy || queue_restoring || waiting > 0,
                         title: if scan_busy { Some("Waiting for the scan to finish".to_string()) } else { None },
                         onclick: move |_| crate::process_clicked(state, pump_tx(&state)),
                         "{process_label}"
@@ -840,6 +948,7 @@ fn Sidebar() -> Element {
                         Button {
                             variant: ButtonVariant::Warning,
                             class: "w-full",
+                            disabled: waiting > 0,
                             onclick: move |_| crate::retry_clicked(state, pump_tx(&state)),
                             "Retry {n_retry} failed {retry_file_word}"
                         }
@@ -2144,8 +2253,9 @@ fn queue_clicked(mut state: Signal<AppState>) {
         warn: true,
     });
     w.push_log(format!(
-        "Queued {added} more file(s) behind the running batch — they start when it finishes, same settings (below-threshold files warn)."
+        "Queued {added} more file(s) behind the running batch - they start when it finishes, same settings (below-threshold files warn)."
     ));
+    crate::persist::save_queue(&w);
 }
 
 /// Mid-run "Add to queue": commit the staged files — folders picked
@@ -2190,8 +2300,9 @@ fn add_staged_clicked(mut state: Signal<AppState>) {
     });
     w.staged.clear();
     w.push_log(format!(
-        "Queued {added} staged file(s) behind the running batch — they start when it finishes, with the picked settings (below-threshold files warn)."
+        "Queued {added} staged file(s) behind the running batch - they start when it finishes, with the picked settings (below-threshold files warn)."
     ));
+    crate::persist::save_queue(&w);
 }
 
 fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
@@ -2202,7 +2313,17 @@ fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         drop(s);
         state
             .write()
-            .push_log("Scan still running — wait for it to finish, then press Process.".into());
+            .push_log("Scan still running - wait for it to finish, then press Process.".into());
+        return;
+    }
+    // A queue restored from the previous session owns the run until the
+    // user resumes or discards it; otherwise Process would run the same
+    // files out of the library and double-encode them.
+    if !s.pending.is_empty() {
+        drop(s);
+        state
+            .write()
+            .push_log("A restored queue is waiting - press Resume queue or Discard first.".into());
         return;
     }
     let idx = s.eligible();
@@ -2269,10 +2390,17 @@ fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
 /// technical (decode, disk, flags), not a threshold verdict, so there's
 /// no preflight re-gate — the attempt either runs or fails again with a
 /// fresh log line. The failed list restarts at what this retry produces.
-fn retry_clicked(state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
+fn retry_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     let s = state.read();
     // Belt and braces: the button only exists between runs.
     if s.executing {
+        return;
+    }
+    if !s.pending.is_empty() {
+        drop(s);
+        state
+            .write()
+            .push_log("A restored queue is waiting - press Resume queue or Discard first.".into());
         return;
     }
     let files = s.retry_files().to_vec();
@@ -2283,6 +2411,17 @@ fn retry_clicked(state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     start_batch(state, tx, files);
 }
 
+/// Forget the processed-file ledger. Scans stop skipping files that were
+/// handled before; the files themselves are untouched.
+fn clear_history_clicked(mut state: Signal<AppState>) {
+    crate::persist::clear_history();
+    let mut w = state.write();
+    w.history_count = 0;
+    w.push_log(
+        "Cleared processed-file history - the next scan treats every file as a fresh input.".into(),
+    );
+}
+
 /// Shared run entry for Process and Retry: ffmpeg sanity check, extra
 /// flags parsed up front (typos fail in the log, not halfway through a
 /// batch), a first-command echo, then the worker hand-off.
@@ -2291,27 +2430,16 @@ fn start_batch(
     tx: UnboundedSender<JobMsg>,
     files: Vec<shrinkr_core::media::MediaFile>,
 ) {
-    use shrinkr_core::ffmpeg::{build_args, command_line};
-    use shrinkr_core::hw::caps;
-    use shrinkr_core::pipeline::{plan_streams_with, select_levels_for_media};
-    if shrinkr_core::process::cmd("ffmpeg")
-        .arg("-version")
-        .output()
-        .is_err()
-    {
-        state.write().push_log(
-            "ERROR: ffmpeg not found — press Download FFmpeg in the header, or grab a release archive (FFmpeg is bundled)."
-                .into(),
-        );
-        return;
-    }
     let s = state.read();
-    let params = s.est_params();
-    let keep_subs = s.effective_keep_subs();
-    let parallel = s.parallel.clamp(1, 8);
-    let replace = s.replace;
-    let threshold = s.threshold();
-    let threshold_policy = s.threshold_policy();
+    let mut cfg = crate::state::ExecCfg {
+        params: s.est_params(),
+        keep_subs: s.effective_keep_subs(),
+        parallel: s.parallel.clamp(1, 8),
+        replace: s.replace,
+        threshold: s.threshold(),
+        threshold_policy: s.threshold_policy(),
+        extra_args: Vec::new(),
+    };
     // Parse the advanced flags now so typos fail fast with a log line,
     // not halfway through a batch.
     let extra_args = match shrinkr_core::ffmpeg::parse_extra_args(s.effective_extra_args()) {
@@ -2324,6 +2452,42 @@ fn start_batch(
             return;
         }
     };
+    drop(s);
+    cfg.extra_args = extra_args;
+    let _ = run_batch(state, tx, files, cfg);
+}
+
+/// Start one batch from an already-resolved settings snapshot. Process,
+/// Retry and Resume all land here; the snapshot is stored as `exec_cfg`
+/// so chained segments keep their queue-time settings, and the queue is
+/// persisted immediately for crash recovery.
+fn run_batch(
+    mut state: Signal<AppState>,
+    tx: UnboundedSender<JobMsg>,
+    files: Vec<shrinkr_core::media::MediaFile>,
+    cfg: crate::state::ExecCfg,
+) -> bool {
+    use shrinkr_core::ffmpeg::{build_args, command_line};
+    use shrinkr_core::hw::caps;
+    use shrinkr_core::pipeline::{plan_streams_with, select_levels_for_media};
+    if shrinkr_core::process::cmd("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_err()
+    {
+        state.write().push_log(
+            "ERROR: ffmpeg not found — press Download FFmpeg in the header, or grab a release archive (FFmpeg is bundled)."
+                .into(),
+        );
+        return false;
+    }
+    let params = cfg.params;
+    let keep_subs = cfg.keep_subs;
+    let parallel = cfg.parallel;
+    let replace = cfg.replace;
+    let threshold = cfg.threshold;
+    let threshold_policy = cfg.threshold_policy;
+    let extra_args = cfg.extra_args.clone();
     let first_cmd = files.first().and_then(|f0| {
         let params = params.for_media(f0);
         if shrinkr_core::images::is_shrinkable_image(&f0.path) {
@@ -2370,17 +2534,7 @@ fn start_batch(
             })
         }
     });
-    drop(s);
     let cancel = Arc::new(AtomicBool::new(false));
-    let cfg = crate::state::ExecCfg {
-        params,
-        keep_subs,
-        parallel,
-        replace,
-        threshold,
-        threshold_policy,
-        extra_args: extra_args.clone(),
-    };
     // A fresh run starts with an empty skip set; queue decisions from the
     // previous run don't leak into this one. Shared with the workers so a
     // mid-run Skip/✕ beats the queue.
@@ -2438,6 +2592,46 @@ fn start_batch(
         cancel,
         skips,
     );
+    let s = state.read();
+    crate::persist::save_queue(&s);
+    true
+}
+
+/// Resume the queue restored from `queue.json`: run the first segment
+/// with its own settings snapshot; the remaining segments chain after it
+/// through the normal `ExecDone` path.
+fn resume_queue_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
+    let seg = {
+        let mut w = state.write();
+        if w.executing || w.queue_restoring || w.pending.is_empty() {
+            return;
+        }
+        w.pending.remove(0)
+    };
+    // Mid-run explicit queue additions run below-threshold files with a
+    // warning; the persisted `warn` flag is what carries that decision.
+    let mut cfg = seg.cfg.clone();
+    if seg.warn {
+        cfg.threshold_policy = shrinkr_core::pipeline::ThresholdPolicy::Warn;
+    }
+    if !run_batch(state, tx, seg.files.clone(), cfg) {
+        // ffmpeg missing / failed hand-off: leave the queue intact.
+        state.write().pending.insert(0, seg);
+        let s = state.read();
+        crate::persist::save_queue(&s);
+    }
+}
+
+/// Throw away a restored queue (the files themselves stay untouched).
+fn discard_restored(mut state: Signal<AppState>) {
+    let mut w = state.write();
+    let n = w.pending_len();
+    if n == 0 {
+        return;
+    }
+    w.pending.clear();
+    crate::persist::save_queue(&w);
+    w.push_log(format!("Discarded {n} restored queued file(s)."));
 }
 
 /// UI-thread part of Fit to size: parse the target + flags up front, then

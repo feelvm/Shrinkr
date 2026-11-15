@@ -24,6 +24,12 @@ automatically. Built in Rust on FFmpeg.
   estimates to your GPU.
 - **Safe by default**: encode to a temp file, re-probe and verify, then place.
   Originals are kept unless you ask to replace them.
+- **Persistent settings, queue and history**: pipeline picks, muted codecs and
+  tab options survive restarts. An interrupted batch is checkpointed and
+  offered on the next launch as a restored queue with Resume and Discard.
+  Successfully shrunk files are fingerprinted by path, size and modified time
+  so folder scans skip unchanged inputs instead of re-applying a lossy encode.
+  The sidebar's History card has the *Skip already-processed* toggle and Clear.
 
 ## Install
 

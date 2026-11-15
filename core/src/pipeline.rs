@@ -603,7 +603,7 @@ pub fn x264_ratio_for(vcodec: &str) -> f64 {
 /// scale × audio plan. `EstParams` mirrors the GUI/CLI settings so the
 /// estimate always describes the job that would actually run.
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EstParams {
     /// Conservative video encode, protected audio, and a measured quality
     /// check before placement. The GUI searches stronger settings from

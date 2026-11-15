@@ -86,6 +86,8 @@ pub enum JobMsg {
     ExecFileDone {
         job: usize,
         detail: String,
+        /// Final path written (== source when replacement was requested).
+        dest: PathBuf,
     },
     /// The encode finished but its result was not smaller than the source,
     /// so it was thrown away and the original kept. Distinct from an
@@ -159,6 +161,12 @@ pub enum JobMsg {
     ConvertError {
         job: Option<usize>,
         msg: String,
+    },
+    /// Result of probing the paths from `queue.json`; applied on the UI
+    /// thread as a paused, resumable queue.
+    QueueRestored {
+        snapshot: crate::persist::QueueSnapshot,
+        probed: Vec<(PathBuf, Option<MediaFile>)>,
     },
     OptimizeAdded(Vec<PathBuf>),
     OptimizeScanStarted {
@@ -360,13 +368,37 @@ pub fn start_scan(tx: UnboundedSender<JobMsg>, targets: Vec<PathBuf>, gen: u64) 
     });
 }
 
+/// Re-probe the paths from a saved queue before restoring it. The UI
+/// stays idle with a "Restoring queue" spinner; missing/changed files are
+/// dropped by `restored_segments` instead of failing the resume.
+pub fn start_queue_restore(tx: UnboundedSender<JobMsg>, snapshot: crate::persist::QueueSnapshot) {
+    thread::spawn(move || {
+        let mut paths: Vec<PathBuf> = snapshot
+            .running
+            .iter()
+            .chain(snapshot.pending.iter())
+            .flat_map(|batch| batch.files.iter().cloned())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        let mut probed = Vec::with_capacity(paths.len());
+        for p in paths {
+            let m = probe_file(&p).ok();
+            probed.push((p, m));
+        }
+        send(&tx, JobMsg::QueueRestored { snapshot, probed });
+    });
+}
+
 /// Result of one file: either an output was placed, or the encode was
 /// thrown away because it didn't beat the source. Both are "expected"
-/// outcomes — only `Err` is a failure.
+/// outcomes - only `Err` is a failure.
 enum JobOutcome {
     Placed {
         saved: i64,
         detail: String,
+        /// Final path written (== source when replace was requested).
+        dest: PathBuf,
     },
     NoGain {
         detail: String,
@@ -679,7 +711,11 @@ fn run_one_job(
             detail.push_str(", grain off");
         }
     }
-    Ok(JobOutcome::Placed { saved, detail })
+    Ok(JobOutcome::Placed {
+        saved,
+        detail,
+        dest,
+    })
 }
 
 /// One still image through the image pipeline: plan → temp encode →
@@ -756,7 +792,11 @@ fn run_one_image_job(
             format!("kept, wrote {dest_name}")
         }
     );
-    Ok(JobOutcome::Placed { saved, detail })
+    Ok(JobOutcome::Placed {
+        saved,
+        detail,
+        dest,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -869,9 +909,20 @@ pub fn start_exec(
                     extra_args.as_ref().clone(),
                     &cancel,
                 ) {
-                    Ok(JobOutcome::Placed { saved, detail }) => {
+                    Ok(JobOutcome::Placed {
+                        saved,
+                        detail,
+                        dest,
+                    }) => {
                         freed.fetch_add(saved, Ordering::Relaxed);
-                        send(&tx, JobMsg::ExecFileDone { job: i, detail });
+                        send(
+                            &tx,
+                            JobMsg::ExecFileDone {
+                                job: i,
+                                detail,
+                                dest,
+                            },
+                        );
                     }
                     Ok(JobOutcome::NoGain { detail }) => {
                         // No gain applies only to this file. Later files and
@@ -1121,8 +1172,9 @@ pub fn skip_queued(mut state: Signal<AppState>, path: &Path) {
     }
     let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("?");
     w.push_log(format!(
-        "skipped {name}: will not run — skipped from the queue (stays in the library)."
+        "skipped {name}: will not run - skipped from the queue (stays in the library)."
     ));
+    crate::persist::save_queue(&w);
 }
 
 /// Delete one file from the queue mid-run (file stays in the library).
@@ -1149,16 +1201,18 @@ pub fn unqueue(mut state: Signal<AppState>, path: &Path) {
         // A segment emptied by this deletion disappears from the panel.
         w.pending.retain(|seg| !seg.files.is_empty());
         w.push_log(format!(
-            "Removed {name} from the queue — it stays in the library."
+            "Removed {name} from the queue - it stays in the library."
         ));
+        crate::persist::save_queue(&w);
         return;
     }
     // Staged mid-run picks: leaving staging (Add to queue never sees them).
     if let Some(pos) = w.staged.iter().position(|f| f.path == path) {
         w.staged.remove(pos);
         w.push_log(format!(
-            "Removed {name} from staging — it stays in the library, not queued."
+            "Removed {name} from staging - it stays in the library, not queued."
         ));
+        crate::persist::save_queue(&w);
         return;
     }
     // Running batch, not yet claimed: hide the row and let the worker's
@@ -1172,10 +1226,11 @@ pub fn unqueue(mut state: Signal<AppState>, path: &Path) {
                 }
             }
             w.push_log(format!(
-                "Removed {name} from the queue — it stays in the library."
+                "Removed {name} from the queue - it stays in the library."
             ));
         }
     }
+    crate::persist::save_queue(&w);
 }
 
 /// Check GitHub Releases for a newer version (worker thread).
@@ -1822,8 +1877,15 @@ fn start_pending_scan(s: &mut AppState) {
 }
 
 /// Apply one job message to UI state. Runs on the UI thread (coroutine).
+/// The wrapper persists the unfinished queue after every message so a
+/// crash/force-quit can restore the remaining work on the next launch.
 pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
     let mut s = state.write();
+    apply_msg_inner(&mut s, msg);
+    crate::persist::save_queue(&s);
+}
+
+fn apply_msg_inner(s: &mut AppState, msg: JobMsg) {
     match msg {
         JobMsg::TargetsAdded(paths) => {
             for p in paths {
@@ -1836,7 +1898,7 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             // removes it), so successive picks build one batch — and a
             // mid-run pick probes into `staged`, where the explicit
             // "Add to queue" click commits it with the current settings.
-            start_pending_scan(&mut s);
+            start_pending_scan(s);
         }
         JobMsg::ScanDone { gen, paths } => {
             // A Clear since this scan started: its results belong to a
@@ -1845,6 +1907,7 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 return;
             }
             s.scanning = false;
+            s.history_skipped = 0;
             if paths.is_empty() {
                 s.push_log("No media files found.".into());
             } else {
@@ -1874,26 +1937,33 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                 // library and re-queue finished files. O(1) via the
                 // mirror set: a 5,000-file folder scanned linear-dedupe
                 // per arrival was ~12M path comparisons.
-                if s.file_set.insert(f.path.clone()) {
-                    s.files.push(f.clone());
-                    // Probed while a batch runs: stage it — the file is
-                    // in the library, but joining the queue needs the
-                    // explicit "Add to queue" click, which snapshots the
-                    // user's picked settings for this batch. A codec
-                    // muted in the Library never passes to the queue —
-                    // not even via staging; the file stays greyed out.
-                    if s.executing && !s.muted_codecs.contains(&f.vcodec) {
-                        s.staged.push(f.clone());
-                        let name = f
-                            .path
-                            .file_name()
-                            .and_then(|x| x.to_str())
-                            .unwrap_or("?")
-                            .to_string();
-                        let staged = s.staged.len();
-                        s.push_log(format!(
-                            "{name} staged ({staged} staged) — Add to queue runs them with the picked settings"
-                        ));
+                if !s.file_set.contains(&f.path) {
+                    if s.skip_processed && crate::persist::was_processed(&f.path) {
+                        // Same path, size and mtime as a successful run:
+                        // don't feed it through another lossy encode.
+                        s.history_skipped += 1;
+                    } else {
+                        s.file_set.insert(f.path.clone());
+                        s.files.push(f.clone());
+                        // Probed while a batch runs: stage it - the file is
+                        // in the library, but joining the queue needs the
+                        // explicit "Add to queue" click, which snapshots the
+                        // user's picked settings for this batch. A codec
+                        // muted in the Library never passes to the queue -
+                        // not even via staging; the file stays greyed out.
+                        if s.executing && !s.muted_codecs.contains(&f.vcodec) {
+                            s.staged.push(f.clone());
+                            let name = f
+                                .path
+                                .file_name()
+                                .and_then(|x| x.to_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            let staged = s.staged.len();
+                            s.push_log(format!(
+                                "{name} staged ({staged} staged) - Add to queue runs them with the picked settings"
+                            ));
+                        }
                     }
                 }
             }
@@ -1935,9 +2005,58 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
                     ));
                 }
             }
+            if s.history_skipped > 0 {
+                let n = s.history_skipped;
+                s.history_skipped = 0;
+                s.push_log(format!(
+                    "skip: {n} already-processed file(s) omitted - unchanged since a previous run (uncheck Skip already-processed files to re-add)."
+                ));
+            }
             // A second pick can wait in targets while this scan ran, idle
             // or mid-run: chain straight into it so auto-scan keeps up.
-            start_pending_scan(&mut s);
+            start_pending_scan(s);
+        }
+        JobMsg::QueueRestored { snapshot, probed } => {
+            s.queue_restoring = false;
+            // Restored files join the library too, so a cancel/discard
+            // leaves them visible and selectable instead of vanishing with
+            // the queue. The Process/Retry guards keep them from being
+            // started twice while the restored queue still owns them.
+            for (_, media) in &probed {
+                if let Some(f) = media {
+                    if s.file_set.insert(f.path.clone()) {
+                        s.files.push(f.clone());
+                    }
+                }
+            }
+            let (segments, dropped) = crate::persist::restored_segments(snapshot, &probed);
+            let restored: usize = segments.iter().map(|seg| seg.files.len()).sum();
+            if restored == 0 {
+                s.push_log("No unfinished queue files could be restored.".into());
+            } else if s.executing {
+                // The user started something while the restore probe ran:
+                // append instead of discarding, so the restored work still
+                // runs after the current batch.
+                s.pending.extend(segments);
+                let extra = if dropped > 0 {
+                    format!(" ({dropped} missing)")
+                } else {
+                    String::new()
+                };
+                s.push_log(format!(
+                    "Restored {restored} unfinished file(s){extra} behind the running batch."
+                ));
+            } else {
+                s.pending = segments;
+                let extra = if dropped > 0 {
+                    format!(" ({dropped} missing)")
+                } else {
+                    String::new()
+                };
+                s.push_log(format!(
+                    "Restored {restored} unfinished file(s){extra}. Press Resume queue."
+                ));
+            }
         }
         JobMsg::ExecWarn { msg } => s.push_log(msg),
         JobMsg::ExecSearchingQuality { job, name } => {
@@ -2000,10 +2119,16 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             }
             s.push_log(format!("Checking picture and audio quality for {name}…"));
         }
-        JobMsg::ExecFileDone { job, detail } => {
+        JobMsg::ExecFileDone { job, detail, dest } => {
             if let Some(item) = s.exec_items.get_mut(job) {
                 item.done = true;
                 item.frac = 1.0;
+            }
+            // Remember the source and the written output by fingerprint:
+            // a rescan of either should not re-apply a lossy encode.
+            if let Some(src) = s.exec_items.get(job).map(|i| i.path.clone()) {
+                crate::persist::record_processed(&[src.as_path(), dest.as_path()]);
+                s.history_count = crate::persist::history_count();
             }
             s.push_log(detail);
         }
@@ -2051,7 +2176,25 @@ pub fn apply_msg(state: &mut Signal<AppState>, msg: JobMsg) {
             s.paused = false;
             let cancelled = s.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
             if cancelled {
-                // Pending files stay in the library, unrun.
+                // Restored queues hold files that are not in the library
+                // yet. On cancel, keep the unfinished ones visible instead
+                // of dropping them with the queue - the log below promises
+                // they stay in the library.
+                let mut keep: Vec<shrinkr_core::media::MediaFile> = s
+                    .exec_items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| !item.done && !item.failed && !item.removed)
+                    .filter_map(|(i, _)| s.exec_files.get(i).cloned())
+                    .collect();
+                for seg in &s.pending {
+                    keep.extend(seg.files.iter().cloned());
+                }
+                for f in keep {
+                    if s.file_set.insert(f.path.clone()) {
+                        s.files.push(f);
+                    }
+                }
                 let n = s.pending_len();
                 let staged = s.staged.len();
                 s.pending.clear();

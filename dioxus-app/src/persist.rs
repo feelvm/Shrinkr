@@ -1,23 +1,40 @@
-//! Settings persistence: the user's pipeline picks survive restarts.
+//! Durable GUI state: pipeline picks, the unfinished queue, and the
+//! processed-file ledger.
 //!
 //! The GUI keeps every knob in one big in-memory `AppState`; on first run
 //! it all reset to defaults, which read as broken ("I set this yesterday").
 //! `collect` snapshots the user-facing settings out of `AppState`,
-//! `offer` hands the latest snapshot to a background saver (debounced —
+//! `offer` hands the latest snapshot to a background saver (debounced -
 //! sliders fire dozens of events per drag), and `load` reads the last
 //! saved set back in `AppState::default`. Unknown fields and new fields
 //! both default through serde, so schema drift degrades to "a knob or two
 //! resets", never a crash.
+//!
+//! Two more files share the same folder:
+//! * `queue.json` - the unfinished part of a running batch plus every
+//!   waiting segment. Written while work is in flight; on the next launch
+//!   it is re-probed and restored as a paused queue (`Resume queue`).
+//! * `history.json` - a bounded ledger of processed inputs keyed by path,
+//!   size and modified time. Scans can skip files that have not changed
+//!   since a run instead of re-applying a lossy encode. The GUI exposes a
+//!   toggle and a clear button; the ledger is advisory, never destructive.
 
-use crate::state::AppState;
+use crate::state::{AppState, ExecCfg, PendingSegment};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 /// Bump when a field's meaning changes in a way old files can't map onto
-/// (currently: never — serde defaults make every addition/back-compat
+/// (currently: never - serde defaults make every addition/back-compat
 /// rename loadable without a version bump).
 const SCHEMA_VERSION: u32 = 1;
+const QUEUE_SCHEMA_VERSION: u32 = 1;
+const HISTORY_SCHEMA_VERSION: u32 = 1;
+/// Keep the ledger bounded: enough for a large archived project, small
+/// enough that lookup and the JSON write stay cheap.
+const MAX_HISTORY_ENTRIES: usize = 5000;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -40,11 +57,12 @@ pub struct GuiSettings {
     // ── General ──
     pub min_saving_pct: f64,
     pub skip_efficient: bool,
+    pub skip_processed: bool,
     pub parallel: usize,
     pub replace: bool,
     pub extra_args: String,
     pub target_text: String,
-    /// Codec mutes are user decisions about their library — persisted too.
+    /// Codec mutes are user decisions about their library - persisted too.
     pub muted_codecs: Vec<String>,
     // ── Convert / Optimize tabs ──
     pub convert_replace: bool,
@@ -57,7 +75,7 @@ pub struct GuiSettings {
 
 impl Default for GuiSettings {
     /// Defaults mirror `AppState::default` (which does NOT read the
-    /// settings file — the load+apply happens in App, so constructing a
+    /// settings file - the load+apply happens in App, so constructing a
     /// default here cannot recurse or race the file).
     fn default() -> Self {
         let s = AppState::default();
@@ -85,6 +103,7 @@ impl GuiSettings {
         s.image_preserve_format = self.image_preserve_format;
         s.min_saving_pct = self.min_saving_pct;
         s.skip_efficient = self.skip_efficient;
+        s.skip_processed = self.skip_processed;
         s.parallel = self.parallel.clamp(1, 8);
         s.replace = self.replace;
         s.extra_args = self.extra_args.clone();
@@ -116,6 +135,7 @@ pub fn collect(s: &AppState) -> GuiSettings {
         image_preserve_format: s.image_preserve_format,
         min_saving_pct: s.min_saving_pct,
         skip_efficient: s.skip_efficient,
+        skip_processed: s.skip_processed,
         parallel: s.parallel.clamp(1, 8),
         replace: s.replace,
         extra_args: s.extra_args.clone(),
@@ -133,18 +153,272 @@ pub fn collect(s: &AppState) -> GuiSettings {
     }
 }
 
-// ── Debounced saver ─────────────────────────────────────────────────
+// ── Unfinished queue ─────────────────────────────────────────────────
 
-static PENDING: std::sync::Mutex<Option<GuiSettings>> = std::sync::Mutex::new(None);
+/// One batch of paths plus the settings they were queued with. The files
+/// are re-probed on restore, so a moved/deleted input is dropped instead
+/// of failing the resume.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct QueuedBatch {
+    pub files: Vec<PathBuf>,
+    pub cfg: ExecCfg,
+    pub warn: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct QueueSnapshot {
+    pub schema_version: u32,
+    pub saved_at: u64,
+    /// The part of the running batch that had not finished when the
+    /// snapshot was taken (the in-flight file is re-run from scratch).
+    pub running: Option<QueuedBatch>,
+    /// Batches waiting behind it, in order.
+    pub pending: Vec<QueuedBatch>,
+}
+
+impl QueueSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.running.is_none() && self.pending.is_empty()
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.running
+            .iter()
+            .chain(self.pending.iter())
+            .map(|b| b.files.len())
+            .sum()
+    }
+}
+
+/// A queue snapshot for the current state. Only unfinished work is
+/// captured: done/failed/removed rows and user-skipped paths are left out
+/// so a restart never repeats a finished encode or overrides a skip.
+pub fn collect_queue(s: &AppState) -> QueueSnapshot {
+    let skipped: HashSet<PathBuf> = s
+        .exec_skips
+        .as_ref()
+        .and_then(|m| m.lock().ok())
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let running = if s.executing {
+        s.exec_cfg.as_ref().and_then(|cfg| {
+            let files: Vec<PathBuf> = s
+                .exec_items
+                .iter()
+                .zip(s.exec_files.iter())
+                .filter(|(item, f)| {
+                    !item.done && !item.failed && !item.removed && !skipped.contains(&f.path)
+                })
+                .map(|(_, f)| f.path.clone())
+                .collect();
+            if files.is_empty() {
+                None
+            } else {
+                Some(QueuedBatch {
+                    files,
+                    cfg: cfg.clone(),
+                    warn: false,
+                })
+            }
+        })
+    } else {
+        None
+    };
+    let pending: Vec<QueuedBatch> = s
+        .pending
+        .iter()
+        .filter_map(|seg| {
+            let files: Vec<PathBuf> = seg
+                .files
+                .iter()
+                .filter(|f| !skipped.contains(&f.path))
+                .map(|f| f.path.clone())
+                .collect();
+            if files.is_empty() {
+                None
+            } else {
+                Some(QueuedBatch {
+                    files,
+                    cfg: seg.cfg.clone(),
+                    warn: seg.warn,
+                })
+            }
+        })
+        .collect();
+    QueueSnapshot {
+        schema_version: QUEUE_SCHEMA_VERSION,
+        saved_at: now_ms(),
+        running,
+        pending,
+    }
+}
+
+/// Hand the current queue to the saver. No-op while the startup restore
+/// is still probing: the file on disk is the source of truth until the
+/// restored queue lands in `AppState`.
+pub fn save_queue(s: &AppState) {
+    if s.queue_restoring {
+        return;
+    }
+    offer_queue(collect_queue(s));
+}
+
+/// Restore a snapshot into `PendingSegment`s, keeping only paths that
+/// still probe successfully. Returns the segments and the number of
+/// dropped paths.
+pub fn restored_segments(
+    snapshot: QueueSnapshot,
+    probed: &[(PathBuf, Option<shrinkr_core::media::MediaFile>)],
+) -> (Vec<PendingSegment>, usize) {
+    let by_path: HashMap<PathBuf, shrinkr_core::media::MediaFile> = probed
+        .iter()
+        .filter_map(|(p, m)| m.as_ref().map(|m| (p.clone(), m.clone())))
+        .collect();
+    let mut dropped = 0usize;
+    let mut segments = Vec::new();
+    for batch in snapshot.running.into_iter().chain(snapshot.pending) {
+        let before = batch.files.len();
+        let files: Vec<_> = batch
+            .files
+            .iter()
+            .filter_map(|p| by_path.get(p).cloned())
+            .collect();
+        dropped += before - files.len();
+        if !files.is_empty() {
+            segments.push(PendingSegment {
+                files,
+                cfg: batch.cfg,
+                warn: batch.warn,
+            });
+        }
+    }
+    (segments, dropped)
+}
+
+// ── Processed-file ledger ────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    /// Original spelling of the path, for display.
+    pub path: String,
+    pub size: u64,
+    pub mtime_ms: u64,
+    pub processed_at_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct History {
+    pub schema_version: u32,
+    pub entries: BTreeMap<String, HistoryEntry>,
+}
+
+impl History {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Record one path if its metadata can be read. The ledger key is the
+    /// platform-appropriate spelling: case-insensitive on Windows so a
+    /// path picked with different casing still matches.
+    pub fn record(&mut self, path: &Path, now: u64) -> bool {
+        let Some((size, mtime_ms)) = fingerprint(path) else {
+            return false;
+        };
+        self.schema_version = HISTORY_SCHEMA_VERSION;
+        self.entries.insert(
+            history_key(path),
+            HistoryEntry {
+                path: path.to_string_lossy().into_owned(),
+                size,
+                mtime_ms,
+                processed_at_ms: now,
+            },
+        );
+        while self.entries.len() > MAX_HISTORY_ENTRIES {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.processed_at_ms)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    self.entries.remove(&k);
+                }
+                None => break,
+            }
+        }
+        true
+    }
+
+    /// True when this exact file (same path, size and mtime) is in the
+    /// ledger. A touched or rewritten file is a new input and must run.
+    pub fn matches(&self, path: &Path) -> bool {
+        let Some((size, mtime_ms)) = fingerprint(path) else {
+            return false;
+        };
+        self.entries
+            .get(&history_key(path))
+            .is_some_and(|e| e.size == size && e.mtime_ms == mtime_ms)
+    }
+}
+
+fn history_key(path: &Path) -> String {
+    let s = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        s.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        s
+    }
+}
+
+fn fingerprint(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let ms = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some((meta.len(), ms))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ── Debounced saver ──────────────────────────────────────────────────
+
+static PENDING: Mutex<Option<GuiSettings>> = Mutex::new(None);
 static DIRTY: AtomicBool = AtomicBool::new(false);
+static QUEUE_PENDING: Mutex<Option<QueueSnapshot>> = Mutex::new(None);
+static QUEUE_DIRTY: AtomicBool = AtomicBool::new(false);
+static HISTORY: OnceLock<RwLock<History>> = OnceLock::new();
+static HISTORY_DIRTY: AtomicBool = AtomicBool::new(false);
 
-/// Hand the latest snapshot to the saver thread. Cheap enough to call on
-/// every state change: it just overwrites the pending slot and sets a
-/// flag — the actual disk write happens at most once per saver tick.
+/// Hand the latest settings snapshot to the saver thread. Cheap enough to
+/// call on every state change: it just overwrites the pending slot and
+/// sets a flag - the actual disk write happens at most once per saver
+/// tick.
 pub fn offer(settings: GuiSettings) {
     if let Ok(mut slot) = PENDING.lock() {
         *slot = Some(settings);
         DIRTY.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Hand the latest queue snapshot to the saver. Empty snapshots remove
+/// the file, so a clean finish leaves no stale restore behind.
+pub fn offer_queue(snapshot: QueueSnapshot) {
+    if let Ok(mut slot) = QUEUE_PENDING.lock() {
+        *slot = Some(snapshot);
+        QUEUE_DIRTY.store(true, Ordering::Relaxed);
     }
 }
 
@@ -154,62 +428,146 @@ pub fn is_dirty() -> bool {
     DIRTY.load(Ordering::Relaxed)
 }
 
-/// Saver loop: wake up once per second, write at most one snapshot.
-/// Runs for the process lifetime on a background thread.
+/// Saver loop: wake up once per second, write at most one snapshot per
+/// file. Runs for the process lifetime on a background thread.
 pub fn spawn_saver() {
     std::thread::spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
-        if !DIRTY.swap(false, Ordering::Relaxed) {
-            continue;
+        if DIRTY.swap(false, Ordering::Relaxed) {
+            let snapshot = PENDING.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(settings) = snapshot {
+                if let Some(path) = settings_path() {
+                    if let Ok(json) = serde_json::to_string_pretty(&settings) {
+                        save_atomically(&path, &json);
+                    }
+                }
+            }
         }
-        let snapshot = PENDING.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(settings) = snapshot {
-            let json = match serde_json::to_string_pretty(&settings) {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-            if let Some(path) = settings_path() {
-                save_atomically(&path, &json);
+        if QUEUE_DIRTY.swap(false, Ordering::Relaxed) {
+            let snapshot = QUEUE_PENDING.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(snapshot) = snapshot {
+                save_queue_to_disk(&snapshot);
+            }
+        }
+        if HISTORY_DIRTY.swap(false, Ordering::Relaxed) {
+            let snapshot = history_store().read().ok().map(|h| h.clone());
+            if let Some(history) = snapshot {
+                save_history_to_disk(&history);
             }
         }
     });
 }
 
-/// Same durable location the bench calibration uses (`%LOCALAPPDATA%\shrinkr`
-/// on Windows, `~/.cache/shrinkr` elsewhere) — one app-data folder.
-fn settings_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var_os("LOCALAPPDATA")
-            .map(|l| PathBuf::from(l).join("shrinkr").join("settings.json"))
-    }
-    #[cfg(not(windows))]
-    {
-        let base = if let Some(cache) = std::env::var_os("XDG_CACHE_HOME") {
-            PathBuf::from(cache).join("shrinkr")
-        } else {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("shrinkr"))?
+fn history_store() -> &'static RwLock<History> {
+    HISTORY.get_or_init(|| {
+        // Under test the ledger must not inherit whatever this machine
+        // processed: the pure History tests own their data.
+        #[cfg(not(test))]
+        let loaded = load_history_from_disk();
+        #[cfg(test)]
+        let loaded: Option<History> = None;
+        let history = match loaded {
+            Some(h) => History {
+                schema_version: HISTORY_SCHEMA_VERSION,
+                ..h
+            },
+            None => History {
+                schema_version: HISTORY_SCHEMA_VERSION,
+                ..Default::default()
+            },
         };
-        Some(base.join("settings.json"))
+        RwLock::new(history)
+    })
+}
+
+/// Record one or more successfully placed paths (source and output) in
+/// the ledger. Best-effort: unreadable files are simply not recorded.
+pub fn record_processed(paths: &[&Path]) {
+    let now = now_ms();
+    let mut changed = false;
+    if let Ok(mut h) = history_store().write() {
+        for p in paths {
+            changed |= h.record(p, now);
+        }
+    }
+    if changed {
+        HISTORY_DIRTY.store(true, Ordering::Relaxed);
     }
 }
 
+/// True when the file has not changed since a recorded successful run.
+pub fn was_processed(path: &Path) -> bool {
+    history_store()
+        .read()
+        .map(|h| h.matches(path))
+        .unwrap_or(false)
+}
+
+pub fn history_count() -> usize {
+    history_store().read().map(|h| h.len()).unwrap_or(0)
+}
+
+/// Forget every processed-file mark; the next scan treats all files as
+/// fresh inputs.
+pub fn clear_history() {
+    if let Ok(mut h) = history_store().write() {
+        h.entries.clear();
+        h.schema_version = HISTORY_SCHEMA_VERSION;
+    }
+    HISTORY_DIRTY.store(true, Ordering::Relaxed);
+}
+
+// ── Paths and IO ─────────────────────────────────────────────────────
+
+/// Same durable location the bench calibration uses (`%LOCALAPPDATA%\shrinkr`
+/// on Windows, `~/.cache/shrinkr` elsewhere) - one app-data folder.
+fn app_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA").map(|l| PathBuf::from(l).join("shrinkr"))
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(cache) = std::env::var_os("XDG_CACHE_HOME") {
+            Some(PathBuf::from(cache).join("shrinkr"))
+        } else {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("shrinkr"))
+        }
+    }
+}
+
+fn settings_path() -> Option<PathBuf> {
+    app_data_dir().map(|d| d.join("settings.json"))
+}
+
+fn queue_path() -> Option<PathBuf> {
+    app_data_dir().map(|d| d.join("queue.json"))
+}
+
+fn history_path() -> Option<PathBuf> {
+    app_data_dir().map(|d| d.join("history.json"))
+}
+
 /// Write-through: temp file first, then a rename over the target, so a
-/// crash mid-write can never leave a half-written settings file behind.
+/// crash mid-write can never leave a half-written file behind.
 fn save_atomically(path: &std::path::Path, json: &str) {
     let Some(dir) = path.parent() else { return };
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("state.json");
     // A second concurrently running instance must not clobber this one's
     // temp file mid-rename.
-    let tmp = dir.join(format!("settings.json.tmp.{}", std::process::id()));
+    let tmp = dir.join(format!("{name}.tmp.{}", std::process::id()));
     if std::fs::write(&tmp, json).is_err() {
         return;
     }
     // Windows rename fails onto an existing destination; remove first.
-    // The window where settings.json is absent is one rename wide — and
-    // a missing file just means "defaults" on the next start.
+    // The window where the target is absent is one rename wide - and a
+    // missing file just means "defaults" on the next start.
     let _ = std::fs::remove_file(path);
     let _ = std::fs::rename(&tmp, path);
 }
@@ -226,9 +584,95 @@ pub fn load() -> Option<GuiSettings> {
     Some(s)
 }
 
+/// Load an unfinished queue snapshot. `None` when there is none, it is
+/// empty, or the file is unreadable/corrupt (a lost queue is always
+/// recoverable by re-adding the files).
+pub fn load_queue() -> Option<QueueSnapshot> {
+    load_queue_from_path(&queue_path()?)
+}
+
+fn load_queue_from_path(path: &Path) -> Option<QueueSnapshot> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let snap: QueueSnapshot = serde_json::from_str(&text).ok()?;
+    if snap.schema_version != QUEUE_SCHEMA_VERSION || snap.is_empty() {
+        return None;
+    }
+    Some(snap)
+}
+
+fn save_queue_to_disk(snapshot: &QueueSnapshot) {
+    let Some(path) = queue_path() else { return };
+    if snapshot.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    if let Ok(json) = serde_json::to_string_pretty(snapshot) {
+        save_atomically(&path, &json);
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn load_history_from_disk() -> Option<History> {
+    let text = std::fs::read_to_string(history_path()?).ok()?;
+    let h: History = serde_json::from_str(&text).ok()?;
+    if h.schema_version != HISTORY_SCHEMA_VERSION {
+        return None;
+    }
+    Some(h)
+}
+
+fn save_history_to_disk(history: &History) {
+    let Some(path) = history_path() else { return };
+    if let Ok(json) = serde_json::to_string_pretty(history) {
+        save_atomically(&path, &json);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::ExecItem;
+    use std::sync::Arc;
+
+    fn media(path: &str) -> shrinkr_core::media::MediaFile {
+        shrinkr_core::media::MediaFile {
+            path: PathBuf::from(path),
+            bytes: 1_000_000,
+            vcodec: "h264".into(),
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            pix_fmt: "yuv420p".into(),
+            bit_depth: 8,
+            color_space: "bt709".into(),
+            color_primaries: "bt709".into(),
+            color_transfer: "bt709".into(),
+            color_range: "tv".into(),
+            vbitrate: Some(12_000_000),
+            format_bitrate: None,
+            duration_s: 600.0,
+            audio: vec![],
+            acodec: "aac".into(),
+            rotation_deg: 0,
+            video_stream_count: 1,
+            audio_stream_count: 1,
+            sub_count: 0,
+            attach_count: 0,
+            has_chapters: false,
+        }
+    }
+
+    fn cfg() -> ExecCfg {
+        ExecCfg {
+            params: AppState::default().est_params(),
+            keep_subs: true,
+            parallel: 2,
+            replace: false,
+            threshold: 10.0,
+            threshold_policy: shrinkr_core::pipeline::ThresholdPolicy::Warn,
+            extra_args: vec![],
+        }
+    }
 
     #[test]
     fn collect_apply_round_trips_every_knob() {
@@ -249,6 +693,7 @@ mod tests {
             image_preserve_format: false,
             min_saving_pct: 7.5,
             skip_efficient: false,
+            skip_processed: false,
             parallel: 4,
             replace: true,
             extra_args: "-tune grain".into(),
@@ -278,6 +723,7 @@ mod tests {
         assert_eq!(restored.parallel, 4);
         assert_eq!(restored.extra_args, "-tune grain");
         assert_eq!(restored.target_text, "400MB");
+        assert!(!restored.skip_processed);
         assert!(restored.muted_codecs.contains("mpeg4"));
         assert_eq!(
             restored.optimize_pdf_preset,
@@ -298,7 +744,7 @@ mod tests {
             "{",
             "{\"some_future_field\": 1, \"backend\": \"NotABackend\",",
         );
-        // "NotABackend" is an unknown enum variant — the whole file is
+        // "NotABackend" is an unknown enum variant - the whole file is
         // rejected rather than silently mapping to Auto.
         let parsed: Result<GuiSettings, _> = serde_json::from_str(&with_unknown);
         assert!(
@@ -324,5 +770,138 @@ mod tests {
         offer(collect(&AppState::default()));
         assert!(is_dirty());
         DIRTY.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn queue_snapshot_only_keeps_unfinished_and_unskipped_files() {
+        let mut s = AppState {
+            executing: true,
+            exec_cfg: Some(cfg()),
+            exec_files: vec![media("done.mkv"), media("todo.mkv")],
+            exec_items: vec![
+                ExecItem::new(
+                    "done.mkv".into(),
+                    PathBuf::from("done.mkv"),
+                    "1920x1080".into(),
+                ),
+                ExecItem::new(
+                    "todo.mkv".into(),
+                    PathBuf::from("todo.mkv"),
+                    "1920x1080".into(),
+                ),
+            ],
+            ..Default::default()
+        };
+        s.exec_items[0].done = true;
+        s.pending.push(PendingSegment {
+            files: vec![media("wait.mkv"), media("skip.mkv")],
+            cfg: cfg(),
+            warn: true,
+        });
+        let mut skips = HashSet::new();
+        skips.insert(PathBuf::from("skip.mkv"));
+        s.exec_skips = Some(Arc::new(Mutex::new(skips)));
+
+        let snap = collect_queue(&s);
+        assert_eq!(
+            snap.running.as_ref().unwrap().files,
+            vec![PathBuf::from("todo.mkv")]
+        );
+        assert_eq!(snap.pending.len(), 1);
+        assert_eq!(snap.pending[0].files, vec![PathBuf::from("wait.mkv")]);
+        assert!(snap.pending[0].warn);
+        assert_eq!(snap.file_count(), 2);
+    }
+
+    #[test]
+    fn queue_json_round_trips_and_empty_removes_the_file() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("queue.json");
+        let snap = QueueSnapshot {
+            schema_version: QUEUE_SCHEMA_VERSION,
+            saved_at: 1,
+            running: Some(QueuedBatch {
+                files: vec![PathBuf::from("a.mkv")],
+                cfg: cfg(),
+                warn: false,
+            }),
+            pending: vec![],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        save_atomically(&path, &json);
+        let loaded = load_queue_from_path(&path).unwrap();
+        assert_eq!(loaded.file_count(), 1);
+        assert_eq!(loaded.running.unwrap().files, vec![PathBuf::from("a.mkv")]);
+        std::fs::remove_file(&path).unwrap();
+        assert!(load_queue_from_path(&path).is_none());
+    }
+
+    #[test]
+    fn queue_restore_drops_missing_paths_and_keeps_segment_settings() {
+        let d = tempfile::tempdir().unwrap();
+        let one = d.path().join("one.mkv");
+        std::fs::write(&one, b"x").unwrap();
+        let missing = d.path().join("missing.mkv");
+        let snap = QueueSnapshot {
+            schema_version: QUEUE_SCHEMA_VERSION,
+            saved_at: 0,
+            running: Some(QueuedBatch {
+                files: vec![one.clone(), missing],
+                cfg: cfg(),
+                warn: false,
+            }),
+            pending: vec![],
+        };
+        let probed = vec![(one.clone(), Some(media(&one.to_string_lossy())))];
+        let (segments, dropped) = restored_segments(snap, &probed);
+        assert_eq!(dropped, 1);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].files.len(), 1);
+        assert_eq!(segments[0].files[0].path, one);
+    }
+
+    #[test]
+    fn history_matches_exact_size_and_mtime_then_rejects_changes() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("clip.mkv");
+        std::fs::write(&file, b"hello").unwrap();
+        let mut h = History::default();
+        assert!(h.record(&file, 1));
+        assert!(h.matches(&file));
+        // Different bytes (and therefore size) are a new input.
+        std::fs::write(&file, b"hello world").unwrap();
+        assert!(!h.matches(&file));
+        // Re-record then remove: the ledger must not claim a missing file.
+        assert!(h.record(&file, 2));
+        std::fs::remove_file(&file).unwrap();
+        assert!(!h.matches(&file));
+    }
+
+    #[test]
+    fn history_is_bounded_and_json_round_trips() {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = History {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            entries: BTreeMap::new(),
+        };
+        for i in 0..3 {
+            let p = d.path().join(format!("f{i}.mkv"));
+            std::fs::write(&p, b"x").unwrap();
+            assert!(h.record(&p, i as u64));
+        }
+        let json = serde_json::to_string(&h).unwrap();
+        let loaded: History = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert!(loaded.entries.values().any(|e| e.path.ends_with("f1.mkv")));
+    }
+
+    #[test]
+    fn settings_default_matches_safe_app_defaults() {
+        let s = AppState::default();
+        let snap = collect(&s);
+        assert!(snap.skip_processed);
+        assert!(!snap.replace);
+        assert!(snap.keep_subs);
+        assert!(snap.all_audio);
     }
 }
