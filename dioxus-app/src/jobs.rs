@@ -1500,9 +1500,10 @@ fn run_one_optimize(
     })
 }
 
-/// Run the Optimize queue with two workers (PDF imaging and PNG DEFLATE
-/// searches are CPU-bound; two covers the common case without starving
-/// the UI thread's own work).
+/// Run the Optimize queue. Image work is independent and CPU-bound, so
+/// the queue takes every core this machine offers
+/// ([`shrinkr_core::optimize::worker_count`]); PDF jobs decode whole pages
+/// per worker and stay on the conservative cap.
 pub fn start_optimize_exec(
     tx: UnboundedSender<JobMsg>,
     files: Vec<crate::state::OptimizeItem>,
@@ -1533,7 +1534,12 @@ pub fn start_optimize_exec(
                 return;
             }
         };
-        let parallel = 2usize.min(indices.len().max(1));
+        let parallel = shrinkr_core::optimize::worker_count(
+            indices.len(),
+            indices
+                .iter()
+                .any(|&i| files[i].kind == crate::state::OptimizeKind::Pdf),
+        );
         let files = Arc::new(files);
         let queue = Arc::new(indices);
         let next = Arc::new(AtomicUsize::new(0));
