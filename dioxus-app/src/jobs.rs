@@ -1157,6 +1157,73 @@ pub fn pause_optimize_exec(mut state: Signal<AppState>) {
     w.optimize_paused = paused;
 }
 
+pub fn cancel_optimize(state: Signal<AppState>) {
+    if let Some(c) = state.read().optimize_cancel.clone() {
+        c.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Drop an optimize batch that was waiting behind the shrink run.
+pub fn cancel_queued_optimize(mut state: Signal<AppState>) {
+    let mut w = state.write();
+    if let Some(batch) = w.optimize_queued.take() {
+        w.push_log(format!(
+            "{} queued optimize file(s) cancelled.",
+            batch.indices.len()
+        ));
+    }
+}
+
+/// Hand an optimize batch to the workers. The caller checks that no
+/// shrink run is active; `ExecDone` starts a queued batch once the
+/// shrink queue drains.
+pub fn start_optimize_batch(
+    s: &mut AppState,
+    tx: UnboundedSender<JobMsg>,
+    batch: crate::state::OptimizeBatch,
+) -> bool {
+    if s.executing || s.optimize_executing || batch.indices.is_empty() {
+        return false;
+    }
+    if batch.indices.iter().any(|&i| i >= s.optimize_files.len()) {
+        s.push_log(format!(
+            "warn: {} queued optimize file(s) no longer match the list; not run.",
+            batch.indices.len()
+        ));
+        return false;
+    }
+    let files = s.optimize_files.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+    s.optimize_executing = true;
+    s.optimize_done = 0;
+    s.optimize_paused = false;
+    s.optimize_cancel = Some(cancel.clone());
+    s.optimize_pause = Some(pause.clone());
+    // Snapshot the batch membership now, while the list still matches
+    // what the worker receives.
+    s.optimize_run = batch.indices.clone();
+    s.optimize_summary = None;
+    for &i in &batch.indices {
+        if let Some(f) = s.optimize_files.get_mut(i) {
+            f.frac = 0.0;
+            f.no_gain = false;
+        }
+    }
+    s.push_log(format!("Optimizing {} file(s).", batch.indices.len()));
+    start_optimize_exec(
+        tx,
+        files,
+        batch.indices,
+        batch.replace,
+        batch.pdf_preset,
+        batch.level,
+        cancel,
+        pause,
+    );
+    true
+}
+
 pub fn cancel_exec(state: Signal<AppState>) {
     if let Some(c) = state.read().cancel.clone() {
         c.store(true, Ordering::Relaxed);
@@ -2247,6 +2314,12 @@ fn apply_msg_inner(s: &mut AppState, msg: JobMsg) {
                     elapsed_s,
                     human_bytes(freed.max(0) as u64)
                 ));
+                if let Some(batch) = s.optimize_queued.take() {
+                    s.push_log(format!(
+                        "{} queued optimize file(s) not run.",
+                        batch.indices.len()
+                    ));
+                }
                 return;
             }
             if !s.pending.is_empty() {
@@ -2373,6 +2446,20 @@ fn apply_msg_inner(s: &mut AppState, msg: JobMsg) {
                 elapsed_s,
                 human_bytes(freed.max(0) as u64)
             ));
+            // The shrink queue is empty: hand the batch that waited
+            // behind it to the optimize workers.
+            if let Some(batch) = s.optimize_queued.take() {
+                match s.job_tx.clone() {
+                    Some(tx) => {
+                        if !start_optimize_batch(s, tx, batch) {
+                            s.push_log("warn: queued optimize batch could not start.".into());
+                        }
+                    }
+                    None => {
+                        s.push_log("warn: queued optimize batch lost - no job channel".into());
+                    }
+                }
+            }
         }
         JobMsg::ExecError { job, msg } => {
             if let Some(job) = job {
@@ -2705,6 +2792,30 @@ fn apply_msg_inner(s: &mut AppState, msg: JobMsg) {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn optimize_batch_refuses_to_start_over_a_run_or_with_stale_indices() {
+        let (tx, _rx) = futures_channel::mpsc::unbounded::<JobMsg>();
+        let mut s = AppState::default();
+        let batch = || crate::state::OptimizeBatch {
+            indices: vec![0],
+            replace: false,
+            pdf_preset: shrinkr_core::pdf::PdfPreset::Balanced,
+            level: shrinkr_core::optimize::OptimizeLevel::Balanced,
+        };
+        // A shrink run owns the workers.
+        s.executing = true;
+        assert!(!start_optimize_batch(&mut s, tx.clone(), batch()));
+        assert!(!s.optimize_executing);
+        s.executing = false;
+        // An optimize run is already active.
+        s.optimize_executing = true;
+        assert!(!start_optimize_batch(&mut s, tx.clone(), batch()));
+        s.optimize_executing = false;
+        // The list no longer has the queued index.
+        assert!(!start_optimize_batch(&mut s, tx, batch()));
+        assert!(!s.optimize_executing);
+    }
 
     #[test]
     #[ignore = "requires FFmpeg; encodes a mixed batch"]

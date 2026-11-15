@@ -593,6 +593,11 @@ outcomes, and benchmark results as messages; it never blocks on an encode.
 Pause holds new files and suspends children already in flight. Cancel kills
 the child and reaps it.
 
+Image/PDF imports and the optimize run live in the sidebar. Only one
+pipeline owns the workers at a time: an optimize batch started while the
+shrink queue is running waits behind it with its own settings snapshot and
+starts when the queue drains.
+
 ### CLI reference
 
 `shrinkr-cli` drives the same core headlessly.

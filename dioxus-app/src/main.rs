@@ -413,7 +413,7 @@ fn Header() -> Element {
     let installing = s.update_installing;
     let available = s.update_available.clone();
     let ready = s.update_ready.clone();
-    let busy = s.executing || s.convert_executing;
+    let busy = s.executing || s.convert_executing || s.optimize_executing;
     let fetching = s.ffmpeg_fetching;
     let fetch_pct = s.ffmpeg_fetch_pct;
     let fetch_supported = shrinkr_core::ffmpeg_fetch::supported();
@@ -554,7 +554,7 @@ fn check_clicked(mut state: Signal<AppState>) {
 fn update_clicked(mut state: Signal<AppState>) {
     {
         let s = state.read();
-        if s.executing || s.convert_executing {
+        if s.executing || s.convert_executing || s.optimize_executing {
             drop(s);
             state.write().push_log(
                 "Update deferred — a batch is running. Wait for it to finish, then press Update again.".into(),
@@ -599,6 +599,15 @@ fn Sidebar() -> Element {
     let executing = s.executing;
     let paused = s.paused;
     let queue_restoring = s.queue_restoring;
+    // Optimize shares the run controls: its batch either sits queued
+    // behind the shrink run or owns the workers.
+    let optimize_count = s.optimize_files.len();
+    let optimize_scanning = s.optimize_scanning;
+    let optimize_executing = s.optimize_executing;
+    let optimize_paused = s.optimize_paused;
+    let optimize_done = s.optimize_done;
+    let optimize_total = s.optimize_run.len();
+    let optimize_queued = s.optimize_queued.as_ref().map(|b| b.indices.len());
     let exec_done = s.exec_done();
     let exec_total = s.exec_total;
     let exec_overall = s.exec_overall();
@@ -875,11 +884,112 @@ fn Sidebar() -> Element {
                     }
                 }
             }
-            // Run control, directly under the Library card: the Process
-            // button when idle (plus Retry while the last run left
-            // failures), batch progress + cancel mid-run.
+            Card {
+                CardHeader {
+                    CardTitle { "Optimize" }
+                }
+                CardContent {
+                    div { class: "flex flex-col gap-2",
+                        Button {
+                            variant: ButtonVariant::Outline,
+                            class: "w-full",
+                            disabled: optimize_executing || optimize_queued.is_some(),
+                            onclick: move |_| {
+                                let tx = pump_tx(&state);
+                                std::thread::spawn(move || {
+                                    let mut dlg = rfd::FileDialog::new();
+                                    if let Some(p) = &parent {
+                                        dlg = dlg.set_parent(p);
+                                    }
+                                    if let Some(paths) = dlg
+                                        .add_filter("optimize", &["pdf", "png", "jpg", "jpeg"])
+                                        .pick_files()
+                                    {
+                                        crate::jobs::start_optimize_scan(tx, paths);
+                                    }
+                                });
+                            },
+                            "Add images/PDFs…"
+                        }
+                        Button {
+                            variant: ButtonVariant::Outline,
+                            class: "w-full",
+                            disabled: optimize_executing || optimize_queued.is_some(),
+                            onclick: move |_| {
+                                let tx = pump_tx(&state);
+                                std::thread::spawn(move || {
+                                    let mut dlg = rfd::FileDialog::new();
+                                    if let Some(p) = &parent {
+                                        dlg = dlg.set_parent(p);
+                                    }
+                                    if let Some(paths) = dlg.pick_folders() {
+                                        crate::jobs::start_optimize_scan(tx, paths);
+                                    }
+                                });
+                            },
+                            "Add folders…"
+                        }
+                        Button {
+                            variant: ButtonVariant::Ghost,
+                            class: "w-full",
+                            disabled: optimize_count == 0
+                                || optimize_executing
+                                || optimize_queued.is_some(),
+                            onclick: move |_| {
+                                let mut w = state.write();
+                                if !w.optimize_executing && w.optimize_queued.is_none() {
+                                    w.optimize_files.clear();
+                                    w.optimize_done = 0;
+                                    w.optimize_run.clear();
+                                    w.optimize_summary = None;
+                                }
+                            },
+                            "Clear"
+                        }
+                    }
+                    if optimize_scanning {
+                        div { class: "mt-2 flex items-center gap-2 text-xs text-muted-foreground",
+                            Spinner {}
+                            "Scanning."
+                        }
+                    } else if optimize_count > 0 {
+                        p { class: "mt-2 text-xs text-muted-foreground",
+                            "{optimize_count} file(s)"
+                        }
+                    }
+                }
+            }
+            // Run control: optimize progress when it owns the workers,
+            // otherwise the shrink Process/Retry buttons when idle or the
+            // batch progress + pause/cancel mid-run. One core run at a time.
             div { class: "flex flex-col gap-2",
-                if !executing {
+                if optimize_executing {
+                    {
+                        let pct = optimize_done as f64 / optimize_total.max(1) as f64 * 100.0;
+                        rsx! {
+                            Progress { value: pct }
+                            p { class: "text-xs text-muted-foreground",
+                                if optimize_paused {
+                                    "Optimizing {optimize_done}/{optimize_total} · paused"
+                                } else {
+                                    "Optimizing {optimize_done}/{optimize_total}."
+                                }
+                            }
+                            Button {
+                                variant: ButtonVariant::Secondary,
+                                class: "w-full",
+                                onclick: move |_| crate::jobs::pause_optimize_exec(state),
+                                if optimize_paused { "Resume" } else { "Pause" }
+                            }
+                            Button {
+                                variant: ButtonVariant::Destructive,
+                                class: "w-full",
+                                onclick: move |_| crate::jobs::cancel_optimize(state),
+                                "Cancel"
+                            }
+                        }
+                    }
+                } else if !executing {
                     if queue_restoring {
                         div { class: "flex items-center gap-2 text-xs text-muted-foreground",
                             Spinner {}
@@ -956,6 +1066,16 @@ fn Sidebar() -> Element {
                 } else {
                     Progress { value: exec_overall * 100.0 }
                     p { class: "text-xs text-muted-foreground", "{progress_label}" }
+                    if let Some(n) = optimize_queued {
+                        div { class: "flex items-center justify-between gap-2 rounded-md border border-border px-2 py-1",
+                            span { class: "text-xs text-muted-foreground", "{n} optimize file(s) queued" }
+                            button {
+                                class: "shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                                onclick: move |_| crate::jobs::cancel_queued_optimize(state),
+                                "✕"
+                            }
+                        }
+                    }
                     if let Some(secs) = queue_eta {
                         p { class: "text-xs text-muted-foreground",
                             "About {fmt_secs(secs)} left in the queue"
@@ -2322,6 +2442,15 @@ fn add_staged_clicked(mut state: Signal<AppState>) {
 
 fn process_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     let s = state.read();
+    // One core run at a time: an optimize batch owns the workers until it
+    // finishes (the Process button is hidden then, this is the guard).
+    if s.optimize_executing || s.optimize_queued.is_some() {
+        drop(s);
+        state
+            .write()
+            .push_log("An optimize batch is waiting or running - wait for it to finish.".into());
+        return;
+    }
     // Adding files auto-scans; a batch must not snapshot a half-probed
     // selection (files still arriving would land in staging afterwards).
     if s.scanning || s.probing {
@@ -2618,7 +2747,12 @@ fn run_batch(
 fn resume_queue_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     let seg = {
         let mut w = state.write();
-        if w.executing || w.queue_restoring || w.pending.is_empty() {
+        if w.executing
+            || w.optimize_executing
+            || w.optimize_queued.is_some()
+            || w.queue_restoring
+            || w.pending.is_empty()
+        {
             return;
         }
         w.pending.remove(0)
@@ -3272,9 +3406,7 @@ fn convert_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
 #[component]
 fn OptimizeCard() -> Element {
     let mut state = use_context::<Signal<AppState>>();
-    let parent = crate::dialog::DialogParent::capture(&dioxus::desktop::use_window());
     let s = state.read();
-    let scanning = s.optimize_scanning;
     let executing = s.optimize_executing;
     let paused = s.optimize_paused;
     let replace = s.optimize_replace;
@@ -3283,6 +3415,18 @@ fn OptimizeCard() -> Element {
     let image_level = s.optimize_image_level;
     let total = s.optimize_files.len();
     let ready = s.optimize_files.iter().filter(|f| f.runnable()).count();
+    // Only the settings that apply to the picked files: a PDF-only batch
+    // hides the image effort, an image-only batch hides the PDF preset.
+    let has_pdf = s
+        .optimize_files
+        .iter()
+        .any(|f| f.kind == state::OptimizeKind::Pdf);
+    let has_image = s
+        .optimize_files
+        .iter()
+        .any(|f| f.kind == state::OptimizeKind::Image);
+    let shrink_running = s.executing;
+    let queued = s.optimize_queued.as_ref().map(|b| b.indices.len());
     drop(s);
     let mut drag_over = use_signal(|| false);
     let drag_cls = if drag_over() {
@@ -3290,7 +3434,22 @@ fn OptimizeCard() -> Element {
     } else {
         "border-border"
     };
-    let run_label = format!("Optimize {ready} file(s)");
+    let run_label = if let Some(n) = queued {
+        format!("Optimize {n} file(s) queued")
+    } else if shrink_running {
+        format!("Queue {ready} file(s)")
+    } else {
+        format!("Optimize {ready} file(s)")
+    };
+    let run_disabled = ready == 0 || queued.is_some();
+    // The queued batch carries the settings picked when it was queued, so
+    // the controls lock until it starts.
+    let settings_locked = executing || queued.is_some();
+    let setting_cols = if (has_pdf || !has_image) && (has_image || !has_pdf) {
+        "md:grid-cols-3"
+    } else {
+        "md:grid-cols-2"
+    };
     rsx! {
         Card {
             CardHeader {
@@ -3310,96 +3469,66 @@ fn OptimizeCard() -> Element {
                             evt.prevent_default();
                             drag_over.set(false);
                             let paths = dropped_paths(&evt);
-                            if !paths.is_empty() {
+                            let w = state.read();
+                            let locked = w.optimize_executing || w.optimize_queued.is_some();
+                            drop(w);
+                            if !locked && !paths.is_empty() {
                                 crate::jobs::start_optimize_scan(pump_tx(&state), paths);
                             }
                         },
                         "Drop PDFs, PNGs or JPEGs here."
                     }
-                    div { class: "flex gap-2",
-                        Button {
-                            variant: ButtonVariant::Outline,
-                            class: "flex-1",
-                            disabled: executing,
-                            onclick: move |_| {
-                                let tx = pump_tx(&state);
-                                std::thread::spawn(move || {
-                                    let mut dlg = rfd::FileDialog::new();
-                                    if let Some(p) = &parent {
-                                        dlg = dlg.set_parent(p);
+                    div { class: "grid grid-cols-1 gap-3 {setting_cols}",
+                        if has_pdf || !has_image {
+                            div { class: "flex flex-col gap-1",
+                                Label { "PDF level" }
+                                select {
+                                    class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
+                                    disabled: settings_locked,
+                                    onchange: move |e: FormEvent| {
+                                        if let Some(p) = shrinkr_core::pdf::PdfPreset::parse(&e.value()) {
+                                            state.write().optimize_pdf_preset = p;
+                                        }
+                                    },
+                                    option {
+                                        value: "lossless",
+                                        selected: pdf_preset == shrinkr_core::pdf::PdfPreset::Lossless,
+                                        "Lossless"
                                     }
-                                    if let Some(paths) = dlg
-                                        .add_filter("optimize", &["pdf", "png", "jpg", "jpeg"])
-                                        .pick_files()
-                                    {
-                                        crate::jobs::start_optimize_scan(tx, paths);
+                                    option {
+                                        value: "balanced",
+                                        selected: pdf_preset == shrinkr_core::pdf::PdfPreset::Balanced,
+                                        "Balanced"
                                     }
-                                });
-                            },
-                            "Add files."
-                        }
-                        Button {
-                            variant: ButtonVariant::Ghost,
-                            disabled: total == 0 || executing,
-                            onclick: move |_| {
-                                let mut w = state.write();
-                                if !w.optimize_executing {
-                                    w.optimize_files.clear();
-                                    w.optimize_done = 0;
-                                    w.optimize_run.clear();
-                                    w.optimize_summary = None;
-                                }
-                            },
-                            "Clear"
-                        }
-                    }
-                    div { class: "grid grid-cols-1 gap-3 md:grid-cols-3",
-                        div { class: "flex flex-col gap-1",
-                            Label { "PDF level" }
-                            select {
-                                class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
-                                disabled: executing,
-                                onchange: move |e: FormEvent| {
-                                    if let Some(p) = shrinkr_core::pdf::PdfPreset::parse(&e.value()) {
-                                        state.write().optimize_pdf_preset = p;
+                                    option {
+                                        value: "small",
+                                        selected: pdf_preset == shrinkr_core::pdf::PdfPreset::Small,
+                                        "Small"
                                     }
-                                },
-                                option {
-                                    value: "lossless",
-                                    selected: pdf_preset == shrinkr_core::pdf::PdfPreset::Lossless,
-                                    "Lossless"
-                                }
-                                option {
-                                    value: "balanced",
-                                    selected: pdf_preset == shrinkr_core::pdf::PdfPreset::Balanced,
-                                    "Balanced"
-                                }
-                                option {
-                                    value: "small",
-                                    selected: pdf_preset == shrinkr_core::pdf::PdfPreset::Small,
-                                    "Small"
                                 }
                             }
                         }
-                        div { class: "flex flex-col gap-1",
-                            Label { "Image effort" }
-                            select {
-                                class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
-                                disabled: executing,
-                                onchange: move |e: FormEvent| {
-                                    if let Some(p) = shrinkr_core::optimize::OptimizeLevel::parse(&e.value()) {
-                                        state.write().optimize_image_level = p;
+                        if has_image || !has_pdf {
+                            div { class: "flex flex-col gap-1",
+                                Label { "Image effort" }
+                                select {
+                                    class: "rounded-md border border-input bg-background px-2 py-1.5 text-sm",
+                                    disabled: settings_locked,
+                                    onchange: move |e: FormEvent| {
+                                        if let Some(p) = shrinkr_core::optimize::OptimizeLevel::parse(&e.value()) {
+                                            state.write().optimize_image_level = p;
+                                        }
+                                    },
+                                    option {
+                                        value: "balanced",
+                                        selected: image_level == shrinkr_core::optimize::OptimizeLevel::Balanced,
+                                        "Balanced"
                                     }
-                                },
-                                option {
-                                    value: "balanced",
-                                    selected: image_level == shrinkr_core::optimize::OptimizeLevel::Balanced,
-                                    "Balanced"
-                                }
-                                option {
-                                    value: "max",
-                                    selected: image_level == shrinkr_core::optimize::OptimizeLevel::Max,
-                                    "Maximum"
+                                    option {
+                                        value: "max",
+                                        selected: image_level == shrinkr_core::optimize::OptimizeLevel::Max,
+                                        "Maximum"
+                                    }
                                 }
                             }
                         }
@@ -3407,17 +3536,11 @@ fn OptimizeCard() -> Element {
                             label { class: "flex items-center gap-2 text-sm",
                                 Checkbox {
                                     checked: replace,
-                                    disabled: executing,
+                                    disabled: settings_locked,
                                     on_checked_change: move |v| state.write().optimize_replace = v,
                                 }
                                 "Replace originals"
                             }
-                        }
-                    }
-                    if scanning {
-                        div { class: "flex items-center gap-2 text-xs text-muted-foreground",
-                            Spinner {}
-                            "Scanning."
                         }
                     }
                     if total > 0 {
@@ -3425,7 +3548,7 @@ fn OptimizeCard() -> Element {
                             Button {
                                 variant: ButtonVariant::Default,
                                 class: "w-full",
-                                disabled: ready == 0,
+                                disabled: run_disabled,
                                 onclick: move |_| optimize_clicked(state, pump_tx(&state)),
                                 "{run_label}"
                             }
@@ -3435,24 +3558,6 @@ fn OptimizeCard() -> Element {
                                     "Optimizing {done}/{total} · paused"
                                 } else {
                                     "Optimizing {done}/{total}."
-                                }
-                            }
-                            div { class: "flex gap-2",
-                                Button {
-                                    variant: ButtonVariant::Secondary,
-                                    class: "flex-1",
-                                    onclick: move |_| crate::jobs::pause_optimize_exec(state),
-                                    if paused { "Resume" } else { "Pause" }
-                                }
-                                Button {
-                                    variant: ButtonVariant::Destructive,
-                                    class: "flex-1",
-                                    onclick: move |_| {
-                                        if let Some(c) = state.read().optimize_cancel.clone() {
-                                            c.store(true, std::sync::atomic::Ordering::Relaxed);
-                                        }
-                                    },
-                                    "Cancel"
                                 }
                             }
                         }
@@ -3513,6 +3618,9 @@ fn OptimizeFilesCard() -> Element {
         return rsx! {};
     }
     let executing = s.optimize_executing;
+    // A batch queued behind the shrink run owns the current rows; removing
+    // one would invalidate its indices.
+    let locked = executing || s.optimize_queued.is_some();
     let win = optimize_window(total, top_row());
     // Two 1px borders shrink the content box; add them so ten full rows
     // fit without showing a sliver of the eleventh.
@@ -3572,7 +3680,7 @@ fn OptimizeFilesCard() -> Element {
                             }
                             button {
                                 class: "shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground",
-                                disabled: executing,
+                                disabled: locked,
                                 onclick: move |_| {
                                     let mut w = state.write();
                                     if !w.optimize_executing && i < w.optimize_files.len() {
@@ -3655,50 +3763,46 @@ fn OptimizeSummaryCard() -> Element {
 }
 
 /// UI-thread part of Optimize: collect runnable rows, snapshot the preset
-/// choices, then hand the queue to the worker.
+/// choices, then start the batch or queue it behind a running shrink run.
 fn optimize_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     let s = state.read();
-    let ready: Vec<usize> = s
+    let indices: Vec<usize> = s
         .optimize_files
         .iter()
         .enumerate()
         .filter(|(_, f)| f.runnable())
         .map(|(i, _)| i)
         .collect();
-    if ready.is_empty() {
+    if indices.is_empty() {
         drop(s);
         state
             .write()
             .push_log("Optimize pressed but no files are runnable.".into());
         return;
     }
-    let files = s.optimize_files.clone();
-    let replace = s.optimize_replace;
-    let pdf_preset = s.optimize_pdf_preset;
-    let level = s.optimize_image_level;
+    let batch = state::OptimizeBatch {
+        indices,
+        replace: s.optimize_replace,
+        pdf_preset: s.optimize_pdf_preset,
+        level: s.optimize_image_level,
+    };
     drop(s);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let pause = Arc::new(AtomicBool::new(false));
-    {
-        let mut w = state.write();
-        w.optimize_executing = true;
-        w.optimize_done = 0;
-        w.optimize_paused = false;
-        w.optimize_cancel = Some(cancel.clone());
-        w.optimize_pause = Some(pause.clone());
-        // The summary describes one batch: snapshot its membership now,
-        // while the list still matches what the worker receives.
-        w.optimize_run = ready.clone();
-        w.optimize_summary = None;
-        for &i in &ready {
-            if let Some(f) = w.optimize_files.get_mut(i) {
-                f.frac = 0.0;
-                f.no_gain = false;
-            }
-        }
-        w.push_log(format!("Optimizing {} file(s).", ready.len()));
+    let mut w = state.write();
+    if w.optimize_executing || w.optimize_queued.is_some() {
+        return;
     }
-    crate::jobs::start_optimize_exec(tx, files, ready, replace, pdf_preset, level, cancel, pause);
+    if w.executing {
+        // The shrink run owns the workers; this batch starts when its
+        // queue drains (ExecDone), with the settings picked here.
+        w.optimize_summary = None;
+        w.push_log(format!(
+            "Queued {} optimize file(s) behind the shrink run.",
+            batch.indices.len()
+        ));
+        w.optimize_queued = Some(batch);
+    } else if !crate::jobs::start_optimize_batch(&mut w, tx, batch) {
+        w.push_log("warn: optimize batch could not start.".into());
+    }
 }
 
 #[component]

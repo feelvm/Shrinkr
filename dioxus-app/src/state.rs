@@ -652,6 +652,9 @@ pub struct AppState {
     pub optimize_run: Vec<usize>,
     /// Result of the last completed batch; None while a run is going.
     pub optimize_summary: Option<OptimizeSummary>,
+    /// Batch queued behind the running shrink run; it starts when the
+    /// shrink queue drains.
+    pub optimize_queued: Option<OptimizeBatch>,
     pub optimize_pdf_preset: shrinkr_core::pdf::PdfPreset,
     pub optimize_image_level: shrinkr_core::optimize::OptimizeLevel,
     // ── Self-update (GitHub Releases) ──
@@ -867,6 +870,17 @@ impl OptimizeItem {
     }
 }
 
+/// One optimize batch waiting for the running shrink queue to drain.
+/// Holds the settings picked when the user pressed Optimize, like the
+/// shrink queue's per-segment settings snapshots.
+#[derive(Clone, Debug)]
+pub struct OptimizeBatch {
+    pub indices: Vec<usize>,
+    pub replace: bool,
+    pub pdf_preset: shrinkr_core::pdf::PdfPreset,
+    pub level: shrinkr_core::optimize::OptimizeLevel,
+}
+
 /// Result of one finished Optimize batch, snapshotted when the worker
 /// reports completion so later edits to the file list do not rewrite it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1016,6 +1030,7 @@ impl Default for AppState {
             optimize_paused: false,
             optimize_run: vec![],
             optimize_summary: None,
+            optimize_queued: None,
             optimize_pdf_preset: shrinkr_core::pdf::PdfPreset::Balanced,
             optimize_image_level: shrinkr_core::optimize::OptimizeLevel::Balanced,
             update_checking: false,
