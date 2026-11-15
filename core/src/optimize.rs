@@ -9,6 +9,12 @@
 //!
 //! Every result is compared with its source: a rewrite that doesn't get
 //! smaller is reported as [`OptimizeOutcome::NoGain`] and never placed.
+//!
+//! Effort is bounded on both axes: how much of the filter search runs, and
+//! how long it may run. Both levels stay on libdeflate — zopfli's last 1-2%
+//! cost 20-100x the CPU per image (a 4K screenshot measured 273 s against
+//! 4.2 s, a 31 KB icon 12.3 s against 0.4 s), which at folder scale is the
+//! difference between seconds and an hour.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,13 +28,40 @@ pub const IMAGE_OPTIMIZE_EXTS: &[&str] = &["png", "jpg", "jpeg"];
 /// "smaller" file meaningless.)
 const MIN_GAIN_BYTES: u64 = 64;
 
-/// CPU budget for the PNG search. Zopfli can otherwise run for minutes on
-/// a single large image.
-const PNG_BUDGET_BALANCED: Duration = Duration::from_secs(20);
-const PNG_BUDGET_MAX: Duration = Duration::from_secs(120);
+/// CPU budget for the PNG search. oxipng checks it between filter trials
+/// (a running trial cannot be interrupted), so this bounds the search, not
+/// one pass. Whole-folder runs should not spend more than this on one file.
+const PNG_BUDGET_BALANCED: Duration = Duration::from_secs(10);
+const PNG_BUDGET_MAX: Duration = Duration::from_secs(30);
 
 /// PNG decompression ceiling (a decompression bomb is not an image).
 const MAX_PNG_BYTES: usize = 512 * 1024 * 1024;
+
+/// Worker cap for lossless image work. Each file is independent and the
+/// encoders are CPU-bound, so a queue can use the whole machine; oxipng's
+/// filter trials run on the process-wide rayon pool, so concurrent files
+/// interleave there instead of oversubscribing the cores.
+pub const IMAGE_WORKER_CAP: usize = 8;
+
+/// Worker cap when the queue holds PDFs: a worker decodes whole pages and
+/// their embedded images (hundreds of MB apiece), so the count stays
+/// conservative.
+pub const PDF_WORKER_CAP: usize = 4;
+
+/// Worker count for an optimize run over `files` files, `has_pdf` when any
+/// of them is a PDF (or another page-imaging job). Callers clamp their own
+/// queue length; this only answers "how many cores may this run use".
+pub fn worker_count(files: usize, has_pdf: bool) -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let cap = if has_pdf {
+        PDF_WORKER_CAP
+    } else {
+        IMAGE_WORKER_CAP
+    };
+    cpus.min(cap).min(files.max(1)).max(1)
+}
 
 /// How hard the optimizer works. Both levels are lossless; `Max` spends
 /// more time searching for a smaller DEFLATE stream.
@@ -177,12 +210,10 @@ fn optimize_png(data: &[u8], level: OptimizeLevel) -> Result<Vec<u8>, String> {
         OptimizeLevel::Balanced => PNG_BUDGET_BALANCED,
         OptimizeLevel::Max => PNG_BUDGET_MAX,
     });
-    if level == OptimizeLevel::Max {
-        opts.deflater = oxipng::Deflater::Zopfli(oxipng::ZopfliOptions {
-            iteration_count: std::num::NonZeroU64::new(15).expect("non-zero"),
-            ..Default::default()
-        });
-    }
+    // Max differs from Balanced in the search (every filter strategy,
+    // Brute level 5, no fast evaluation) and libdeflate 12 instead of 11 -
+    // the measured cost/benefit of the two levels. Zopfli was dropped
+    // deliberately: see the module docs for the numbers.
     oxipng::optimize_from_memory(data, &opts).map_err(|e| format!("PNG optimizer: {e}"))
 }
 
@@ -446,5 +477,38 @@ mod tests {
         assert!(matches!(r, OptimizeOutcome::NoGain { .. }), "{r:?}");
         assert!(!out.exists());
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn max_level_is_lossless_too() {
+        // Max runs the full filter search instead of the balanced subset;
+        // the contract is the same: identical pixels, no interlacing or
+        // metadata changes, and a smaller file for a weak source.
+        let d = temp_dir("max");
+        let src = d.join("flat.png");
+        let out = d.join("flat.max.png");
+        let png = make_png(32, 32);
+        std::fs::write(&src, &png).unwrap();
+        let r = optimize_image(&src, &out, OptimizeLevel::Max, &AtomicBool::new(false)).unwrap();
+        let OptimizeOutcome::Done(res) = r else {
+            panic!("expected a gain from a stored-deflate PNG: {r:?}");
+        };
+        assert_eq!(res.method, "oxipng");
+        let data = std::fs::read(&out).unwrap();
+        assert_eq!(png_dims(&data), png_dims(&png));
+        assert!(!is_apng(&data));
+        assert!(data.len() < png.len());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn worker_count_uses_the_queue_and_the_kind() {
+        // Never zero workers, never more than the queue, and PDFs stay on
+        // the conservative cap regardless of core count.
+        assert_eq!(worker_count(0, false), 1);
+        assert_eq!(worker_count(1, false), 1);
+        assert!(worker_count(100, false) <= IMAGE_WORKER_CAP);
+        assert!(worker_count(100, true) <= PDF_WORKER_CAP);
+        assert!(worker_count(3, true) <= 3);
     }
 }

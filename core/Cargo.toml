@@ -19,7 +19,7 @@ self_update = { version = "1", features = [
 ] }
 libjpeg-turbo-rs = "0.9"
 lopdf = { version = "0.47", default-features = false, features = ["rayon"] }
-oxipng = { version = "10.2", default-features = false, features = ["parallel", "zopfli"] }
+oxipng = { version = "10.2", default-features = false, features = ["parallel"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
