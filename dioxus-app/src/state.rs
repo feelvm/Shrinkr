@@ -643,6 +643,10 @@ pub struct AppState {
     pub optimize_replace: bool,
     pub optimize_cancel: Option<Arc<AtomicBool>>,
     pub optimize_done: usize,
+    /// Pause flag shared with the optimize workers: set, they stop
+    /// claiming files until it clears (in-flight library calls finish).
+    pub optimize_pause: Option<Arc<AtomicBool>>,
+    pub optimize_paused: bool,
     /// Indices of the batch currently handed to the worker, kept so the
     /// completion message can snapshot exactly what ran.
     pub optimize_run: Vec<usize>,
@@ -1008,6 +1012,8 @@ impl Default for AppState {
             optimize_replace: false,
             optimize_cancel: None,
             optimize_done: 0,
+            optimize_pause: None,
+            optimize_paused: false,
             optimize_run: vec![],
             optimize_summary: None,
             optimize_pdf_preset: shrinkr_core::pdf::PdfPreset::Balanced,

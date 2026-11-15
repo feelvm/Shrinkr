@@ -3276,6 +3276,7 @@ fn OptimizeCard() -> Element {
     let s = state.read();
     let scanning = s.optimize_scanning;
     let executing = s.optimize_executing;
+    let paused = s.optimize_paused;
     let replace = s.optimize_replace;
     let done = s.optimize_done;
     let pdf_preset = s.optimize_pdf_preset;
@@ -3429,15 +3430,30 @@ fn OptimizeCard() -> Element {
                                 "{run_label}"
                             }
                         } else {
-                            p { class: "text-xs text-muted-foreground", "Optimizing {done}/{total}." }
-                            Button {
-                                variant: ButtonVariant::Destructive,
-                                onclick: move |_| {
-                                    if let Some(c) = state.read().optimize_cancel.clone() {
-                                        c.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                },
-                                "Cancel"
+                            p { class: "text-xs text-muted-foreground",
+                                if paused {
+                                    "Optimizing {done}/{total} · paused"
+                                } else {
+                                    "Optimizing {done}/{total}."
+                                }
+                            }
+                            div { class: "flex gap-2",
+                                Button {
+                                    variant: ButtonVariant::Secondary,
+                                    class: "flex-1",
+                                    onclick: move |_| crate::jobs::pause_optimize_exec(state),
+                                    if paused { "Resume" } else { "Pause" }
+                                }
+                                Button {
+                                    variant: ButtonVariant::Destructive,
+                                    class: "flex-1",
+                                    onclick: move |_| {
+                                        if let Some(c) = state.read().optimize_cancel.clone() {
+                                            c.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    },
+                                    "Cancel"
+                                }
                             }
                         }
                     }
@@ -3662,11 +3678,14 @@ fn optimize_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
     let level = s.optimize_image_level;
     drop(s);
     let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
     {
         let mut w = state.write();
         w.optimize_executing = true;
         w.optimize_done = 0;
+        w.optimize_paused = false;
         w.optimize_cancel = Some(cancel.clone());
+        w.optimize_pause = Some(pause.clone());
         // The summary describes one batch: snapshot its membership now,
         // while the list still matches what the worker receives.
         w.optimize_run = ready.clone();
@@ -3679,7 +3698,7 @@ fn optimize_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         }
         w.push_log(format!("Optimizing {} file(s).", ready.len()));
     }
-    crate::jobs::start_optimize_exec(tx, files, ready, replace, pdf_preset, level, cancel);
+    crate::jobs::start_optimize_exec(tx, files, ready, replace, pdf_preset, level, cancel, pause);
 }
 
 #[component]

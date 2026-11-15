@@ -18,7 +18,7 @@ use std::sync::{
     atomic::AtomicBool, atomic::AtomicU64, atomic::AtomicUsize, atomic::Ordering, Arc, Mutex,
 };
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The CRF the encoder actually receives for a shared slider value. Only
 /// SVT-AV1 maps the shared CQ to a different scale.
@@ -1142,6 +1142,21 @@ pub fn pause_exec(mut state: Signal<AppState>) {
     w.paused = paused;
 }
 
+/// Toggle the optimize pause: workers stop claiming new files while the
+/// flag is set. A file already inside a library call finishes; the next
+/// place in the queue is held.
+pub fn pause_optimize_exec(mut state: Signal<AppState>) {
+    let mut w = state.write();
+    if !w.optimize_executing {
+        return;
+    }
+    let paused = !w.optimize_paused;
+    if let Some(flag) = &w.optimize_pause {
+        flag.store(paused, Ordering::Relaxed);
+    }
+    w.optimize_paused = paused;
+}
+
 pub fn cancel_exec(state: Signal<AppState>) {
     if let Some(c) = state.read().cancel.clone() {
         c.store(true, Ordering::Relaxed);
@@ -1559,6 +1574,7 @@ fn run_one_optimize(
 /// the queue takes every core this machine offers
 /// ([`shrinkr_core::optimize::worker_count`]); PDF jobs decode whole pages
 /// per worker and stay on the conservative cap.
+#[allow(clippy::too_many_arguments)]
 pub fn start_optimize_exec(
     tx: UnboundedSender<JobMsg>,
     files: Vec<crate::state::OptimizeItem>,
@@ -1567,6 +1583,7 @@ pub fn start_optimize_exec(
     pdf_preset: shrinkr_core::pdf::PdfPreset,
     level: shrinkr_core::optimize::OptimizeLevel,
     cancel: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         let t0 = Instant::now();
@@ -1605,8 +1622,20 @@ pub fn start_optimize_exec(
             let queue = queue.clone();
             let next = next.clone();
             let cancel = cancel.clone();
+            let pause = pause.clone();
             let tmp_root = tmp_root.clone();
             handles.push(thread::spawn(move || loop {
+                // Pause holds the queue at the next file; a file already
+                // inside an optimizer call cannot be suspended and runs
+                // to completion. Cancel wins so a paused run can drain,
+                // and an exhausted queue still closes the batch.
+                while pause.load(Ordering::Relaxed) {
+                    if cancel.load(Ordering::Relaxed) || next.load(Ordering::Relaxed) >= queue.len()
+                    {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
                 let k = next.fetch_add(1, Ordering::Relaxed);
                 if k >= queue.len() {
                     break;
@@ -2531,6 +2560,8 @@ fn apply_msg_inner(s: &mut AppState, msg: JobMsg) {
                 .as_ref()
                 .is_some_and(|c| c.load(Ordering::Relaxed));
             s.optimize_executing = false;
+            s.optimize_paused = false;
+            s.optimize_pause = None;
             let run = std::mem::take(&mut s.optimize_run);
             if cancelled {
                 s.optimize_summary = None;
