@@ -536,12 +536,20 @@ This is the opposite contract to Shrink: the output must decode to exactly the
 same pixels.
 
 - **PNG/APNG** goes through `oxipng` with filter search, palette and bit-depth
-  reduction, and deflate. Balanced uses preset 3 with a 20-second budget; Max
-  uses preset 6 with a 120-second budget and zopfli (15 iterations). Metadata,
+  reduction, and deflate. Balanced uses preset 3 with a 10-second budget; Max
+  uses preset 6 (every filter strategy, no fast evaluation, libdeflate 12) with
+  a 30-second budget. Both stay on libdeflate: zopfli's last 1–2% cost 20–100×
+  the CPU per image (a 4K screenshot measured 273 s against 4.2 s), which at
+  folder scale is the difference between seconds and an hour. Metadata,
   interlacing, and transparent-pixel values are preserved.
 - **JPEG** is re-emitted in the coefficient domain with optimized Huffman
   tables and progressive output, equivalent to `jpegtran -optimize`. All
   markers, EXIF orientation, and ICC profiles are copied.
+
+Files are independent, so the Optimize queue runs one job per core (capped at
+8, shareable with oxipng's own filter threads) instead of one at a time; a
+queue that contains PDFs drops to 4 workers because each PDF job decodes whole
+pages and their embedded images.
 
 A structural check confirms valid headers and unchanged dimensions (plus APNG
 animation retention). A rewrite that does not beat the source by at least 64
