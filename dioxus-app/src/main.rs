@@ -1200,7 +1200,10 @@ fn Main() -> Element {
                         ConvertCard {}
                     }
                     TabsContent { value: "optimize",
-                        OptimizeCard {}
+                        div { class: "flex flex-col gap-4",
+                            OptimizeCard {}
+                            OptimizeFilesCard {}
+                        }
                     }
                 }
                 LogCard {}
@@ -3259,15 +3262,14 @@ fn OptimizeCard() -> Element {
     let mut state = use_context::<Signal<AppState>>();
     let parent = crate::dialog::DialogParent::capture(&dioxus::desktop::use_window());
     let s = state.read();
-    let files = s.optimize_files.clone();
     let scanning = s.optimize_scanning;
     let executing = s.optimize_executing;
     let replace = s.optimize_replace;
     let done = s.optimize_done;
     let pdf_preset = s.optimize_pdf_preset;
     let image_level = s.optimize_image_level;
-    let total = files.len();
-    let ready = files.iter().filter(|f| f.runnable()).count();
+    let total = s.optimize_files.len();
+    let ready = s.optimize_files.iter().filter(|f| f.runnable()).count();
     drop(s);
     let mut drag_over = use_signal(|| false);
     let drag_cls = if drag_over() {
@@ -3325,7 +3327,7 @@ fn OptimizeCard() -> Element {
                         }
                         Button {
                             variant: ButtonVariant::Ghost,
-                            disabled: files.is_empty() || executing,
+                            disabled: total == 0 || executing,
                             onclick: move |_| {
                                 let mut w = state.write();
                                 if !w.optimize_executing {
@@ -3403,48 +3405,7 @@ fn OptimizeCard() -> Element {
                             "Scanning."
                         }
                     }
-                    if !files.is_empty() {
-                        div { class: "flex max-h-64 flex-col gap-2 overflow-y-auto",
-                            for (i , f) in files.iter().enumerate() {
-                                {
-                                    let name = f.name();
-                                    let kind = f.kind_label();
-                                    let status = f.status_text();
-                                    let src = human_bytes(f.bytes);
-                                    let change = if f.done && f.output_bytes > 0 {
-                                        fmt_size_change(f.bytes, f.output_bytes)
-                                    } else {
-                                        String::new()
-                                    };
-                                    let failed = f.failed;
-                                    rsx! {
-                                        div { class: "flex items-center gap-2 rounded-md border border-border p-2",
-                                            span { class: "min-w-0 flex-1 truncate font-mono text-xs", "{name}" }
-                                            Badge { variant: BadgeVariant::Secondary, "{kind}" }
-                                            span { class: "shrink-0 text-xs text-muted-foreground", "{src}" }
-                                            if !change.is_empty() {
-                                                Badge { variant: BadgeVariant::Secondary, "{change}" }
-                                            }
-                                            span {
-                                                class: if failed { "shrink-0 text-xs text-red-500" } else { "shrink-0 text-xs text-muted-foreground" },
-                                                "{status}"
-                                            }
-                                            button {
-                                                class: "shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground",
-                                                disabled: executing,
-                                                onclick: move |_| {
-                                                    let mut w = state.write();
-                                                    if !w.optimize_executing && i < w.optimize_files.len() {
-                                                        w.optimize_files.remove(i);
-                                                    }
-                                                },
-                                                "×"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    if total > 0 {
                         if !executing {
                             Button {
                                 variant: ButtonVariant::Default,
@@ -3466,6 +3427,133 @@ fn OptimizeCard() -> Element {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Fixed row height of the optimize queue list, in CSS pixels. The
+/// windowing math below and the rendered row height share it.
+const OPTIMIZE_ROW_H: usize = 36;
+/// Rows visible in the queue panel before it scrolls.
+const OPTIMIZE_ROWS_VISIBLE: usize = 10;
+
+/// Rows rendered for one scroll position in the optimize queue, plus the
+/// spacer heights that keep the scrollbar proportional to the whole list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OptimizeWindow {
+    start: usize,
+    end: usize,
+    pad_top: usize,
+    pad_bottom: usize,
+}
+
+fn optimize_window(total: usize, top_row: usize) -> OptimizeWindow {
+    let first = top_row.min(total.saturating_sub(OPTIMIZE_ROWS_VISIBLE));
+    // Overscan keeps the next rows painted before they scroll in.
+    let start = first.saturating_sub(2);
+    let end = (first + OPTIMIZE_ROWS_VISIBLE + 2).min(total);
+    OptimizeWindow {
+        start,
+        end,
+        pad_top: start * OPTIMIZE_ROW_H,
+        pad_bottom: (total - end) * OPTIMIZE_ROW_H,
+    }
+}
+
+/// Queue of files picked for Optimize, between the settings card and the
+/// log. Only the rows around the scroll position are in the tree, so a
+/// folder scan with tens of thousands of files stays responsive while
+/// ten rows fill the panel.
+#[component]
+fn OptimizeFilesCard() -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let mut top_row = use_signal(|| 0usize);
+    // The list element disappears with an emptied queue; a later refill
+    // starts at scrollTop 0, so the window has to start there too.
+    use_effect(move || {
+        if state.read().optimize_files.is_empty() && *top_row.peek() != 0 {
+            top_row.set(0);
+        }
+    });
+    let s = state.read();
+    let total = s.optimize_files.len();
+    if total == 0 {
+        return rsx! {};
+    }
+    let executing = s.optimize_executing;
+    let win = optimize_window(total, top_row());
+    // Two 1px borders shrink the content box; add them so ten full rows
+    // fit without showing a sliver of the eleventh.
+    let list_height = total.min(OPTIMIZE_ROWS_VISIBLE) * OPTIMIZE_ROW_H + 2;
+    let rows: Vec<(usize, state::OptimizeItem)> = (win.start..win.end)
+        .map(|i| (i, s.optimize_files[i].clone()))
+        .collect();
+    drop(s);
+    rsx! {
+        Card {
+            CardHeader {
+                div { class: "flex w-full items-center justify-between gap-3",
+                    CardTitle { "Selected files" }
+                    span { class: "text-xs text-muted-foreground tabular-nums",
+                        "{total} file(s)"
+                    }
+                }
+            }
+            CardContent {
+                div {
+                    id: "optimize-files",
+                    class: "overflow-y-auto rounded-md border border-border",
+                    style: "height: {list_height}px",
+                    onscroll: move |_| {
+                        spawn(async move {
+                            let script = format!(
+                                "const el = document.getElementById('optimize-files'); \
+                                 if (!el) {{ dioxus.send(0); }} else {{ \
+                                 dioxus.send(Math.floor(el.scrollTop / {OPTIMIZE_ROW_H})); }}"
+                            );
+                            let mut eval = document::eval(&script);
+                            if let Ok(row) = eval.recv::<usize>().await {
+                                if *top_row.peek() != row {
+                                    top_row.set(row);
+                                }
+                            }
+                        });
+                    },
+                    div { style: "height: {win.pad_top}px" }
+                    for (i , f) in rows {
+                        div {
+                            class: "flex items-center gap-2 overflow-hidden border-b border-border px-2 last:border-b-0",
+                            style: "height: {OPTIMIZE_ROW_H}px",
+                            span { class: "min-w-0 flex-1 truncate font-mono text-xs", "{f.name()}" }
+                            Badge { class: "shrink-0", variant: BadgeVariant::Secondary, "{f.kind_label()}" }
+                            span { class: "shrink-0 text-xs text-muted-foreground tabular-nums",
+                                "{human_bytes(f.bytes)}"
+                            }
+                            if f.done && f.output_bytes > 0 {
+                                Badge { class: "shrink-0", variant: BadgeVariant::Secondary,
+                                    "{fmt_size_change(f.bytes, f.output_bytes)}"
+                                }
+                            }
+                            span {
+                                class: if f.failed { "shrink-0 text-xs text-red-500" } else { "shrink-0 text-xs text-muted-foreground" },
+                                "{f.status_text()}"
+                            }
+                            button {
+                                class: "shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                                disabled: executing,
+                                onclick: move |_| {
+                                    let mut w = state.write();
+                                    if !w.optimize_executing && i < w.optimize_files.len() {
+                                        w.optimize_files.remove(i);
+                                    }
+                                },
+                                "×"
+                            }
+                        }
+                    }
+                    div { style: "height: {win.pad_bottom}px" }
                 }
             }
         }
@@ -3642,5 +3730,37 @@ fn LogLine(entry: std::sync::Arc<LogEntry>) -> Element {
             span { class: "shrink-0 text-xs font-semibold {tag}", "{entry.level.badge()}" }
             p { class: "text-xs break-all {text}", "{entry.text}" }
         }
+    }
+}
+
+#[cfg(test)]
+mod optimize_window_tests {
+    use super::*;
+
+    #[test]
+    fn short_queue_renders_every_row_without_spacers() {
+        let win = optimize_window(5, 0);
+        assert_eq!((win.start, win.end), (0, 5));
+        assert_eq!((win.pad_top, win.pad_bottom), (0, 0));
+    }
+
+    #[test]
+    fn middle_window_keeps_the_total_scroll_height() {
+        let total = 1000;
+        let win = optimize_window(total, 500);
+        assert_eq!((win.start, win.end), (498, 512));
+        assert_eq!(
+            win.pad_top + (win.end - win.start) * OPTIMIZE_ROW_H + win.pad_bottom,
+            total * OPTIMIZE_ROW_H
+        );
+    }
+
+    #[test]
+    fn bottom_window_stops_at_the_last_row() {
+        let total = 100;
+        let win = optimize_window(total, usize::MAX);
+        assert_eq!(win.end, total);
+        assert_eq!(win.pad_bottom, 0);
+        assert!(win.start < total);
     }
 }
