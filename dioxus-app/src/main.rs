@@ -1202,6 +1202,7 @@ fn Main() -> Element {
                     TabsContent { value: "optimize",
                         div { class: "flex flex-col gap-4",
                             OptimizeCard {}
+                            OptimizeSummaryCard {}
                             OptimizeFilesCard {}
                         }
                     }
@@ -1776,6 +1777,17 @@ fn fmt_size_change(src: u64, out: u64) -> String {
         "<1%".to_string()
     } else {
         format!("{pct:+.0}%")
+    }
+}
+
+/// Batch totals in MB, or KB while under 1 MB.
+fn fmt_mb_kb(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let f = bytes as f64;
+    if f >= MB {
+        format!("{:.1} MB", f / MB)
+    } else {
+        format!("{:.0} KB", f / 1024.0)
     }
 }
 
@@ -3333,6 +3345,8 @@ fn OptimizeCard() -> Element {
                                 if !w.optimize_executing {
                                     w.optimize_files.clear();
                                     w.optimize_done = 0;
+                                    w.optimize_run.clear();
+                                    w.optimize_summary = None;
                                 }
                             },
                             "Clear"
@@ -3560,6 +3574,70 @@ fn OptimizeFilesCard() -> Element {
     }
 }
 
+/// Totals for the last finished Optimize batch. Hidden until a run
+/// reports per-file outcomes; a new run or Clear removes it.
+#[component]
+fn OptimizeSummaryCard() -> Element {
+    let state = use_context::<Signal<AppState>>();
+    let summary = state.read().optimize_summary.clone();
+    let Some(summary) = summary else {
+        return rsx! {};
+    };
+    let before = fmt_mb_kb(summary.start_bytes);
+    let after = fmt_mb_kb(summary.output_bytes);
+    let saved = summary.saved_bytes();
+    let saved_label = format!("{} ({:.1}%)", fmt_mb_kb(saved), summary.saved_pct());
+    rsx! {
+        Card {
+            CardHeader {
+                CardTitle { "Summary" }
+            }
+            CardContent {
+                div { class: "grid grid-cols-1 gap-3 md:grid-cols-3",
+                    div { class: "flex flex-col gap-0.5",
+                        span { class: "text-xs text-muted-foreground", "Files" }
+                        span { class: "text-sm font-semibold tabular-nums", "{summary.files}" }
+                    }
+                    div { class: "flex flex-col gap-0.5",
+                        span { class: "text-xs text-muted-foreground", "Skipped" }
+                        span { class: "text-sm font-semibold tabular-nums", "{summary.skipped}" }
+                    }
+                    div { class: "flex flex-col gap-0.5",
+                        span { class: "text-xs text-muted-foreground", "Errors" }
+                        span {
+                            class: if summary.errors > 0 {
+                                "text-sm font-semibold tabular-nums text-red-500"
+                            } else {
+                                "text-sm font-semibold tabular-nums"
+                            },
+                            "{summary.errors}"
+                        }
+                    }
+                    div { class: "flex flex-col gap-0.5",
+                        span { class: "text-xs text-muted-foreground", "Before" }
+                        span { class: "text-sm font-semibold tabular-nums", "{before}" }
+                    }
+                    div { class: "flex flex-col gap-0.5",
+                        span { class: "text-xs text-muted-foreground", "After" }
+                        span { class: "text-sm font-semibold tabular-nums", "{after}" }
+                    }
+                    div { class: "flex flex-col gap-0.5",
+                        span { class: "text-xs text-muted-foreground", "Saved" }
+                        span {
+                            class: if saved > 0 {
+                                "text-sm font-semibold tabular-nums text-green-300"
+                            } else {
+                                "text-sm font-semibold tabular-nums"
+                            },
+                            "{saved_label}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// UI-thread part of Optimize: collect runnable rows, snapshot the preset
 /// choices, then hand the queue to the worker.
 fn optimize_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
@@ -3589,6 +3667,10 @@ fn optimize_clicked(mut state: Signal<AppState>, tx: UnboundedSender<JobMsg>) {
         w.optimize_executing = true;
         w.optimize_done = 0;
         w.optimize_cancel = Some(cancel.clone());
+        // The summary describes one batch: snapshot its membership now,
+        // while the list still matches what the worker receives.
+        w.optimize_run = ready.clone();
+        w.optimize_summary = None;
         for &i in &ready {
             if let Some(f) = w.optimize_files.get_mut(i) {
                 f.frac = 0.0;

@@ -643,6 +643,11 @@ pub struct AppState {
     pub optimize_replace: bool,
     pub optimize_cancel: Option<Arc<AtomicBool>>,
     pub optimize_done: usize,
+    /// Indices of the batch currently handed to the worker, kept so the
+    /// completion message can snapshot exactly what ran.
+    pub optimize_run: Vec<usize>,
+    /// Result of the last completed batch; None while a run is going.
+    pub optimize_summary: Option<OptimizeSummary>,
     pub optimize_pdf_preset: shrinkr_core::pdf::PdfPreset,
     pub optimize_image_level: shrinkr_core::optimize::OptimizeLevel,
     // ── Self-update (GitHub Releases) ──
@@ -858,6 +863,71 @@ impl OptimizeItem {
     }
 }
 
+/// Result of one finished Optimize batch, snapshotted when the worker
+/// reports completion so later edits to the file list do not rewrite it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OptimizeSummary {
+    /// Files in the batch.
+    pub files: usize,
+    /// Finished with a size win (output placed).
+    pub optimized: usize,
+    /// Finished with no win; the original stays.
+    pub skipped: usize,
+    /// Could not be optimized; the original stays.
+    pub errors: usize,
+    /// Sum of the inputs.
+    pub start_bytes: u64,
+    /// Sum of what sits on disk afterwards (originals count for skipped
+    /// and failed files).
+    pub output_bytes: u64,
+}
+
+impl OptimizeSummary {
+    /// Aggregate the batch's indices. Files that never reported a result
+    /// (e.g. a cancellation surfacing as Done) keep their original size.
+    pub fn from_run(items: &[OptimizeItem], run: &[usize]) -> Self {
+        let mut summary = Self {
+            files: run.len(),
+            ..Self::default()
+        };
+        for &i in run {
+            let Some(item) = items.get(i) else { continue };
+            summary.start_bytes += item.bytes;
+            if item.failed {
+                summary.errors += 1;
+                summary.output_bytes += item.bytes;
+            } else if item.done && item.no_gain {
+                summary.skipped += 1;
+                summary.output_bytes += item.bytes;
+            } else if item.done {
+                summary.optimized += 1;
+                summary.output_bytes += item.output_bytes;
+            } else {
+                summary.output_bytes += item.bytes;
+            }
+        }
+        summary
+    }
+
+    pub fn saved_bytes(&self) -> u64 {
+        self.start_bytes.saturating_sub(self.output_bytes)
+    }
+
+    /// Share of the starting size removed, in percent.
+    pub fn saved_pct(&self) -> f64 {
+        if self.start_bytes == 0 {
+            0.0
+        } else {
+            self.saved_bytes() as f64 / self.start_bytes as f64 * 100.0
+        }
+    }
+
+    /// Whether the batch reported at least one per-file outcome.
+    pub fn has_outcomes(&self) -> bool {
+        self.optimized + self.skipped + self.errors > 0
+    }
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
@@ -938,6 +1008,8 @@ impl Default for AppState {
             optimize_replace: false,
             optimize_cancel: None,
             optimize_done: 0,
+            optimize_run: vec![],
+            optimize_summary: None,
             optimize_pdf_preset: shrinkr_core::pdf::PdfPreset::Balanced,
             optimize_image_level: shrinkr_core::optimize::OptimizeLevel::Balanced,
             update_checking: false,
@@ -2437,5 +2509,71 @@ mod tests {
         item.no_gain = true;
         assert_eq!(item.status_text(), "no gain");
         assert!(!item.runnable());
+    }
+
+    #[test]
+    fn optimize_summary_counts_outcomes_and_savings() {
+        let mut placed = OptimizeItem::new(
+            std::path::PathBuf::from("a.png"),
+            1_000,
+            OptimizeKind::Image,
+        );
+        placed.done = true;
+        placed.output_bytes = 600;
+        let mut skipped = OptimizeItem::new(
+            std::path::PathBuf::from("b.png"),
+            2_000,
+            OptimizeKind::Image,
+        );
+        skipped.done = true;
+        skipped.no_gain = true;
+        let mut failed =
+            OptimizeItem::new(std::path::PathBuf::from("c.pdf"), 3_000, OptimizeKind::Pdf);
+        failed.failed = true;
+        let untouched = OptimizeItem::new(
+            std::path::PathBuf::from("d.png"),
+            4_000,
+            OptimizeKind::Image,
+        );
+        let items = vec![placed, skipped, failed, untouched];
+        let summary = OptimizeSummary::from_run(&items, &[0, 1, 2, 3]);
+        assert_eq!(summary.files, 4);
+        assert_eq!(summary.optimized, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.start_bytes, 10_000);
+        // 600 placed + 2_000 + 3_000 + 4_000 kept originals.
+        assert_eq!(summary.output_bytes, 9_600);
+        assert_eq!(summary.saved_bytes(), 400);
+        assert_eq!(summary.saved_pct(), 4.0);
+        assert!(summary.has_outcomes());
+    }
+
+    #[test]
+    fn optimize_summary_only_covers_the_batch_indices() {
+        let mut placed = OptimizeItem::new(
+            std::path::PathBuf::from("a.png"),
+            1_000,
+            OptimizeKind::Image,
+        );
+        placed.done = true;
+        placed.output_bytes = 500;
+        let untouched = OptimizeItem::new(
+            std::path::PathBuf::from("b.png"),
+            2_000,
+            OptimizeKind::Image,
+        );
+        let summary = OptimizeSummary::from_run(&[placed, untouched], &[1]);
+        assert_eq!(summary.files, 1);
+        assert_eq!(summary.start_bytes, 2_000);
+        assert_eq!(summary.output_bytes, 2_000);
+        assert_eq!(summary.saved_bytes(), 0);
+        assert_eq!(summary.saved_pct(), 0.0);
+        // No per-file outcome: the card stays hidden for a failed hand-off.
+        assert!(!summary.has_outcomes());
+
+        let empty = OptimizeSummary::from_run(&[], &[]);
+        assert_eq!(empty.files, 0);
+        assert_eq!(empty.saved_pct(), 0.0);
     }
 }

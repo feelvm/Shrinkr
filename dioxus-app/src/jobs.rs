@@ -2531,9 +2531,13 @@ fn apply_msg_inner(s: &mut AppState, msg: JobMsg) {
                 .as_ref()
                 .is_some_and(|c| c.load(Ordering::Relaxed));
             s.optimize_executing = false;
+            let run = std::mem::take(&mut s.optimize_run);
             if cancelled {
+                s.optimize_summary = None;
                 s.push_log(format!("Optimize cancelled after {:.0}s.", elapsed_s));
             } else {
+                let batch = crate::state::OptimizeSummary::from_run(&s.optimize_files, &run);
+                s.optimize_summary = batch.has_outcomes().then_some(batch);
                 let done = s.optimize_files.iter().filter(|f| f.done).count();
                 let failed = s.optimize_files.iter().filter(|f| f.failed).count();
                 let summary = if failed == 0 {
