@@ -10,8 +10,8 @@ use shrinkr_core::media::{human_bytes, probe_file};
 use shrinkr_core::pipeline::{NvencPreset, ScalePolicy, VideoBackend};
 use shrinkr_core::{bench, ffmpeg, hw, pipeline};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 fn tool_ok(prog: &str) -> bool {
     std::process::Command::new(prog)
@@ -762,8 +762,10 @@ fn cli_shrink(
 }
 
 /// Headless PDF shrink + lossless image optimization. Mirrors the GUI
-/// Optimize tab: same core calls, same placement policy, one file at a
-/// time with loud per-file output.
+/// Optimize tab: same core calls and placement policy as the GUI, with
+/// loud per-file output. Files are independent, so the queue runs one per
+/// core; each file's lines are printed together so parallel output stays
+/// readable.
 fn cli_optimize(
     input: &Path,
     replace: bool,
@@ -813,87 +815,150 @@ fn cli_optimize(
     let mut failed = 0;
     let mut no_gain = 0;
     let mut saved = 0i64;
-    for (i, p) in inputs.iter().enumerate() {
-        let ext = pdf::ext_of(p);
-        let tmp = tmp_root.join(format!("opt-{i}.{ext}"));
-        if let Err(e) = ffmpeg::ensure_output_dir(&tmp) {
-            eprintln!("{}: {e}", p.display());
-            failed += 1;
-            continue;
-        }
-        let _ = std::fs::remove_file(&tmp);
-        println!("{}", p.display());
-        let result: Result<(u64, String), String> = if ext == "pdf" {
-            match pdf::compress_pdf(p, pdf_preset, &tmp, &cancel) {
-                Ok(pdf::PdfOutcome::Done(r)) => Ok((
-                    r.output_bytes,
-                    format!(
-                        "{} page(s), {}/{} image(s) re-encoded ({} downscaled), {} stream(s), {:.0}% smaller, {:.1}s",
-                        r.pages,
-                        r.images_recompressed,
-                        r.images,
-                        r.images_downscaled,
-                        r.streams_recompressed,
-                        (1.0 - r.ratio) * 100.0,
-                        r.elapsed_s
-                    ),
-                )),
-                Ok(pdf::PdfOutcome::NoGain { output_bytes }) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    Err(format!(
-                        "no gain (rewritten {output_bytes} B, source {} B) - original kept",
-                        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-                    ))
+    // Files are independent, so the queue runs one job per core instead of
+    // one at a time. Output stays readable because each file's lines are
+    // printed as one block under the same lock; the summary counters are
+    // shared atomics. PDFs pull the worker count down to the page-imaging
+    // cap (see `optimize::worker_count`).
+    let has_pdf = inputs.iter().any(|p| pdf::is_pdf(p));
+    let parallel = optimize::worker_count(inputs.len(), has_pdf);
+    let next = AtomicUsize::new(0);
+    let failed_n = AtomicUsize::new(0);
+    let no_gain_n = AtomicUsize::new(0);
+    let saved_n = AtomicI64::new(0);
+    let aborted = AtomicBool::new(false);
+    let out = Mutex::new(());
+    std::thread::scope(|scope| {
+        for _ in 0..parallel {
+            let (inputs, out) = (&inputs, &out);
+            let (next, failed_n, no_gain_n, saved_n, aborted) =
+                (&next, &failed_n, &no_gain_n, &saved_n, &aborted);
+            let (tmp_root, cancel) = (&tmp_root, &cancel);
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= inputs.len() || aborted.load(Ordering::Relaxed) {
+                    break;
                 }
-                Err(e) => Err(e),
-            }
-        } else {
-            match optimize::optimize_image(p, &tmp, level, &cancel) {
-                Ok(optimize::OptimizeOutcome::Done(r)) => Ok((
-                    r.output_bytes,
-                    format!(
-                        "{} ({}) {:.0}% smaller, {:.1}s",
-                        r.method,
-                        r.note,
-                        (1.0 - r.ratio) * 100.0,
-                        r.elapsed_s
-                    ),
-                )),
-                Ok(optimize::OptimizeOutcome::NoGain { output_bytes }) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    Err(format!(
-                        "no gain (rewritten {output_bytes} B) - original kept"
-                    ))
+                let p = &inputs[i];
+                let ext = pdf::ext_of(p);
+                let tmp = tmp_root.join(format!("opt-{i}.{ext}"));
+                if let Err(e) = ffmpeg::ensure_output_dir(&tmp) {
+                    if let Ok(_g) = out.lock() {
+                        eprintln!("{}: {e}", p.display());
+                    }
+                    failed_n.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-                Err(e) => Err(e),
-            }
-        };
-        match result {
-            Ok((bytes, note)) => match ffmpeg::place_output(p, &tmp, replace, &ext) {
-                Ok((delta, dest)) => {
-                    saved += delta;
-                    println!("  -> {} ({bytes} B): {note}", dest.display());
-                }
-                Err(e) => {
-                    eprintln!("  place failed: {e}");
-                    let _ = std::fs::remove_file(&tmp);
-                    failed += 1;
-                }
-            },
-            Err(e) if e.starts_with("no gain") => {
-                no_gain += 1;
-                println!("  skip: {e}");
-            }
-            Err(e) if e == "cancelled" => {
-                eprintln!("cancelled");
-                return 1;
-            }
-            Err(e) => {
-                eprintln!("  failed: {e}");
                 let _ = std::fs::remove_file(&tmp);
-                failed += 1;
-            }
+                // A one-worker run has nothing to interleave with, so it
+                // keeps the old "path first, result under it" output and
+                // shows the file being worked on. Parallel runs print the
+                // block once the file finishes, when nothing can interleave.
+                if parallel == 1 {
+                    if let Ok(_g) = out.lock() {
+                        println!("{}", p.display());
+                    }
+                }
+                let result: Result<(u64, String), String> = if ext == "pdf" {
+                    match pdf::compress_pdf(p, pdf_preset, &tmp, cancel) {
+                        Ok(pdf::PdfOutcome::Done(r)) => Ok((
+                            r.output_bytes,
+                            format!(
+                                "{} page(s), {}/{} image(s) re-encoded ({} downscaled), {} stream(s), {:.0}% smaller, {:.1}s",
+                                r.pages,
+                                r.images_recompressed,
+                                r.images,
+                                r.images_downscaled,
+                                r.streams_recompressed,
+                                (1.0 - r.ratio) * 100.0,
+                                r.elapsed_s
+                            ),
+                        )),
+                        Ok(pdf::PdfOutcome::NoGain { output_bytes }) => {
+                            let _ = std::fs::remove_file(&tmp);
+                            Err(format!(
+                                "no gain (rewritten {output_bytes} B, source {} B) - original kept",
+                                std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+                            ))
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    match optimize::optimize_image(p, &tmp, level, cancel) {
+                        Ok(optimize::OptimizeOutcome::Done(r)) => Ok((
+                            r.output_bytes,
+                            format!(
+                                "{} ({}) {:.0}% smaller, {:.1}s",
+                                r.method,
+                                r.note,
+                                (1.0 - r.ratio) * 100.0,
+                                r.elapsed_s
+                            ),
+                        )),
+                        Ok(optimize::OptimizeOutcome::NoGain { output_bytes }) => {
+                            let _ = std::fs::remove_file(&tmp);
+                            Err(format!(
+                                "no gain (rewritten {output_bytes} B) - original kept"
+                            ))
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+                // Place the output first: the move is real I/O (possibly a
+                // cross-volume copy) and must not serialize the batch.
+                let mut lines: Vec<String> = vec![];
+                let mut errs: Vec<String> = vec![];
+                let mut failed_this = false;
+                match result {
+                    Ok((bytes, note)) => match ffmpeg::place_output(p, &tmp, replace, &ext) {
+                        Ok((delta, dest)) => {
+                            saved_n.fetch_add(delta, Ordering::Relaxed);
+                            lines.push(format!("  -> {} ({bytes} B): {note}", dest.display()));
+                        }
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&tmp);
+                            failed_this = true;
+                            errs.push(format!("  place failed: {e}"));
+                        }
+                    },
+                    Err(e) if e.starts_with("no gain") => {
+                        no_gain_n.fetch_add(1, Ordering::Relaxed);
+                        lines.push(format!("  skip: {e}"));
+                    }
+                    Err(e) if e == "cancelled" => {
+                        errs.push("cancelled".into());
+                        aborted.store(true, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        failed_this = true;
+                        errs.push(format!("  failed: {e}"));
+                    }
+                }
+                if failed_this {
+                    failed_n.fetch_add(1, Ordering::Relaxed);
+                }
+                // Print the file's lines as one block so parallel output
+                // stays readable.
+                if let Ok(_g) = out.lock() {
+                    if parallel > 1 {
+                        println!("{}", p.display());
+                    }
+                    for line in &lines {
+                        println!("{line}");
+                    }
+                    for line in &errs {
+                        eprintln!("{line}");
+                    }
+                }
+            });
         }
+    });
+    failed += failed_n.into_inner();
+    no_gain += no_gain_n.into_inner();
+    saved += saved_n.into_inner();
+    if aborted.into_inner() {
+        return 1;
     }
     if saved > 0 {
         println!("reclaimed {}", human_bytes(saved as u64));
