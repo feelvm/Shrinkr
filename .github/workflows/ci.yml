@@ -60,3 +60,61 @@ jobs:
       - name: Test
         if: matrix.check_only != true
         run: cargo test --workspace --target ${{ matrix.target }}
+
+  # The Windows installer is a first-class download: it sits next to the
+  # portable zip in every release. Release tags are cut from master, so
+  # building it on every master push means a broken installer (.iss,
+  # staging, bundled license) fails CI before it can reach a release,
+  # and the run's artifact is a testable preview of the same setup
+  # users download. Not built for pull_request: that would double every
+  # PR's CI cost for an artifact only master pushes publish.
+  installer:
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build GUI and CLI (release)
+        run: cargo build --release -p shrinkr -p shrinkr-cli
+
+      # Same pinned, checksum-verified FFmpeg build the release workflow
+      # bundles (keep the tag/asset pair in sync with FFMPEG-PINS.sha256
+      # and release.yml).
+      - name: Download FFmpeg sidecars
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $tag = "autobuild-2026-11-13-12-43"
+          $asset = "ffmpeg-N-128889-g88c46fce27-win64-gpl.zip"
+          $pin = Select-String -Path FFMPEG-PINS.sha256 -Pattern ("^[0-9a-f]{64}[ 	]+" + [regex]::Escape($asset)) |
+            Select-Object -First 1
+          if (-not $pin) { throw "no SHA-256 pin for $asset in FFMPEG-PINS.sha256" }
+          $expected = ($pin.Line.Trim() -split '\s+')[0].ToLower()
+          Invoke-WebRequest -Uri "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/$tag/$asset" -OutFile ffmpeg.zip
+          $actual = (Get-FileHash -Algorithm SHA256 ffmpeg.zip).Hash.ToLower()
+          if ($actual -ne $expected) {
+            throw "ffmpeg.zip checksum mismatch: got $actual, expected $expected (see FFMPEG-PINS.sha256)"
+          }
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-build
+          New-Item -ItemType Directory -Force sidecars | Out-Null
+          Copy-Item (Get-ChildItem -Recurse ffmpeg-build -Filter ffmpeg.exe | Select-Object -First 1).FullName sidecars/ffmpeg.exe
+          Copy-Item (Get-ChildItem -Recurse ffmpeg-build -Filter ffprobe.exe | Select-Object -First 1).FullName sidecars/ffprobe.exe
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          ./installer/windows/build-installer.ps1 `
+            -SkipBuild `
+            -FfmpegDir sidecars `
+            -OutputDir .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shrinkr-windows-installer
+          path: Shrinkr-Setup-*-x64.exe
+          if-no-files-found: error

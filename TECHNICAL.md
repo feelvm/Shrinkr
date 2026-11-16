@@ -643,9 +643,11 @@ The release workflow builds:
 
 - Windows x64, macOS Apple Silicon, and Linux x64 release binaries (GUI + CLI);
 - `shrinkr-<target-triple>.zip` archives containing both binaries, `ffmpeg`,
-  `ffprobe`, and `FFMPEG-NOTES.txt`;
-- `Shrinkr-Setup-<version>-x64.exe` (Inno Setup) for Windows;
-- `shrinkr-<target-triple>.dmg` for macOS.
+  `ffprobe`, `FFMPEG-NOTES.txt`, and `LICENSE`;
+- `Shrinkr-Setup-<version>-x64.exe` (Inno Setup) for Windows, which shows the
+  GPL-3.0 license page and installs `LICENSE` next to the binaries;
+- `shrinkr-<target-triple>.dmg` for macOS, with `LICENSE` in
+  `Contents/Resources`.
 
 The Windows installer is per-user (`%LOCALAPPDATA%\Programs\Shrinkr`), needs no
 admin prompt, and optionally adds the install directory to `PATH` for
@@ -672,7 +674,13 @@ ffmpeg/ffprobe sidecars are pinned per build and checksum-verified against
 bumping a pin is documented in that file's header and `FFMPEG-NOTES.txt`.
 
 The Windows installer exists as a separate asset whose name omits the target
-triple, so the updater can never select it by mistake.
+triple, so the updater can never select it by mistake. It is built from the
+same release binaries and pinned sidecars before the release is published, so
+a broken installer fails the tag build instead of shipping a release without
+one. CI also builds it on every master push (Inno Setup via Chocolatey) and
+uploads `shrinkr-windows-installer` as a workflow artifact, which catches
+installer breakage before a tag. The checksum job refuses to publish sums for a
+release that lacks either Windows download: the installer or the portable zip.
 
 ## GUI shell
 

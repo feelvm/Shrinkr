@@ -289,9 +289,19 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ github.ref_name }}"
+          version="${tag#v}"
           rm -rf sums-tmp && mkdir sums-tmp
           gh release download "$tag" -R "$GITHUB_REPOSITORY" -D sums-tmp
           cd sums-tmp
+          # Windows users get both downloads: the per-user installer and
+          # the portable archive. A release missing either one is not
+          # complete, so fail instead of publishing checksums for it.
+          for asset in "Shrinkr-Setup-${version}-x64.exe" "shrinkr-x86_64-pc-windows-msvc.zip"; do
+            if [ ! -f "$asset" ]; then
+              echo "::error::$asset is missing from release $tag"
+              exit 1
+            fi
+          done
           ls | grep -v '^SHA256SUMS' | xargs sha256sum > ../SHA256SUMS.txt
           cd ..
           cat SHA256SUMS.txt
