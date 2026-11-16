@@ -125,3 +125,17 @@ Binaries land in `target/release/`. For the Windows installer, install
 
 Releases are cut by tagging `v0.x.y`; GitHub Actions builds and publishes the
 platform archives, the Windows installer and the macOS DMG.
+
+## License
+
+Copyright (C) 2026 feelvm
+
+Shrinkr is free software: you can redistribute it and/or modify it under the
+terms of the **GNU General Public License, version 3** as published by the Free
+Software Foundation. It is distributed in the hope that it will be useful, but
+**without any warranty**; without even the implied warranty of
+merchantability or fitness for a particular purpose. See the
+[GNU General Public License](LICENSE) for the full terms.
+
+Shrinkr is built on FFmpeg; the bundled `ffmpeg`/`ffprobe` builds and their
+licensing are described in [FFMPEG-NOTES.txt](FFMPEG-NOTES.txt).

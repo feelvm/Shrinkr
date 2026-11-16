@@ -1,8 +1,9 @@
 ; Shrinkr Windows installer (Inno Setup 6+).
 ;
 ; Built by build-installer.ps1, which stages the two Shrinkr binaries,
-; the bundled ffmpeg/ffprobe sidecars and FFMPEG-NOTES.txt, then passes
-; AppVersion / NumericVersion / StagingDir / OutputDir as /D defines.
+; the bundled ffmpeg/ffprobe sidecars, FFMPEG-NOTES.txt and LICENSE,
+; then passes AppVersion / NumericVersion / StagingDir / OutputDir as
+; /D defines.
 ;
 ; Inno Setup 6 is free for non-commercial use; commercial distribution
 ; requires a license from https://jrsoftware.org (see its LICENSE.TXT).
@@ -46,6 +47,7 @@ PrivilegesRequired=lowest
 OutputDir={#OutputDir}
 OutputBaseFilename=Shrinkr-Setup-{#FileVersion}-x64
 SetupIconFile=..\..\dioxus-app\assets\icons\icon.ico
+LicenseFile={#StagingDir}\LICENSE
 UninstallDisplayIcon={app}\shrinkr.exe
 Compression=lzma2/max
 SolidCompression=yes
@@ -73,6 +75,7 @@ Source: "{#StagingDir}\shrinkr-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\ffmpeg.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\ffprobe.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\FFMPEG-NOTES.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StagingDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Shrinkr"; Filename: "{app}\shrinkr.exe"

@@ -5,8 +5,8 @@
 
 .DESCRIPTION
     Compiles the GUI and CLI in release mode, stages them next to the
-    bundled FFmpeg sidecars and FFMPEG-NOTES.txt, and runs the Inno Setup
-    compiler on installer/windows/shrinkr.iss.
+    bundled FFmpeg sidecars, FFMPEG-NOTES.txt and LICENSE, and runs the
+    Inno Setup compiler on installer/windows/shrinkr.iss.
 
     FFmpeg is downloaded from the same BtbN build the release workflow
     uses and cached under target/installer/ffmpeg, so repeated runs are
@@ -208,6 +208,11 @@ if (-not (Test-Path -LiteralPath $notes)) {
     throw "missing $notes"
 }
 
+$license = Join-Path $RepoRoot 'LICENSE'
+if (-not (Test-Path -LiteralPath $license)) {
+    throw "missing $license"
+}
+
 $staging = Join-Path $RepoRoot 'target\installer\staging'
 if (Test-Path -LiteralPath $staging) {
     Remove-Item -LiteralPath $staging -Recurse -Force
@@ -220,6 +225,7 @@ Copy-Item -LiteralPath (Join-Path $binDir 'shrinkr-cli.exe') -Destination $stagi
 Copy-Item -LiteralPath $ffmpeg.Ffmpeg -Destination (Join-Path $staging 'ffmpeg.exe')
 Copy-Item -LiteralPath $ffmpeg.Ffprobe -Destination (Join-Path $staging 'ffprobe.exe')
 Copy-Item -LiteralPath $notes -Destination $staging
+Copy-Item -LiteralPath $license -Destination $staging
 Get-ChildItem -LiteralPath $staging | ForEach-Object {
     Write-Host ('    {0,-18} {1,8:N1} MB' -f $_.Name, ($_.Length / 1MB))
 }

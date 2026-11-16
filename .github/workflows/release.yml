@@ -128,7 +128,7 @@ jobs:
             "target/${{ matrix.target }}/release/shrinkr" \
             "target/${{ matrix.target }}/release/shrinkr-cli" \
             sidecars/ffmpeg sidecars/ffprobe \
-            FFMPEG-NOTES.txt
+            FFMPEG-NOTES.txt LICENSE
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -139,7 +139,8 @@ jobs:
             "target/${{ matrix.target }}/release/shrinkr-cli.exe",
             "sidecars/ffmpeg.exe",
             "sidecars/ffprobe.exe",
-            "FFMPEG-NOTES.txt"
+            "FFMPEG-NOTES.txt",
+            "LICENSE"
           ) -DestinationPath "${{ env.ARCHIVE }}" -Force
           Get-ChildItem ${{ env.ARCHIVE }}
 
@@ -218,6 +219,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/shrinkr" "$APP/Contents/MacOS/Shrinkr"
           cp "target/${{ matrix.target }}/release/shrinkr-cli" "$APP/Contents/MacOS/"
           cp sidecars/ffmpeg sidecars/ffprobe "$APP/Contents/MacOS/"
+          cp LICENSE "$APP/Contents/Resources/LICENSE"
           chmod +x "$APP"/Contents/MacOS/*
           cat > "$APP/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
