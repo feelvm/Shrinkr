@@ -421,6 +421,8 @@ fn Header() -> Element {
     // detection); reading hw::caps() directly here would block the first
     // paint on the trial-encode detection.
     let caps = s.caps;
+    // Compile-time version: the header always names the running build.
+    let version = env!("CARGO_PKG_VERSION");
     drop(s);
     // Say only what this machine can't do, and only for features the UI
     // exposes — everything supported is selectable (and greyed out when
@@ -451,7 +453,10 @@ fn Header() -> Element {
     rsx! {
         header { class: "relative flex shrink-0 items-center justify-between border-b border-border bg-card px-5 py-3",
             div {
-                h1 { class: "text-lg font-bold tracking-tight", "Shrinkr" }
+                h1 { class: "text-lg font-bold tracking-tight",
+                    "Shrinkr "
+                    span { class: "text-[10px] font-medium text-muted-foreground tabular-nums", "v{version}" }
+                }
             }
             div { class: "pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2",
                 if !tools_ok {
