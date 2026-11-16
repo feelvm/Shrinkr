@@ -573,19 +573,7 @@ fn update_clicked(mut state: Signal<AppState>) {
 #[component]
 fn Sidebar() -> Element {
     let mut state = use_context::<Signal<AppState>>();
-    let parent = crate::dialog::DialogParent::capture(&dioxus::desktop::use_window());
     let s = state.read();
-    let has_targets = !s.targets.is_empty();
-    let targets: Vec<std::path::PathBuf> = s.targets.clone();
-    let scanning = s.scanning;
-    let probing = s.probing;
-    let scan_busy = scanning || probing;
-    // Clear works on everything the selection owns: probed files, paths
-    // still waiting behind a running scan, mid-run staging, and a scan
-    // that has not produced its first result yet.
-    let has_selection = !s.files.is_empty() || has_targets || !s.staged.is_empty() || scan_busy;
-    let probe_done = s.probe_done;
-    let probe_total = s.probe_total;
     let files_summary = crate::sidebar_summary(&s);
     // Codec circles' checked state (unchecked = muted): the rows read it
     // directly, so a click greys the type out on the next frame.
@@ -594,15 +582,13 @@ fn Sidebar() -> Element {
     // skips every file must not hide the toggle that caused it.
     let skip_processed = s.skip_processed;
     let history_count = s.history_count;
-    // Run state — the Process button and its batch progress live at the
-    // bottom of this sidebar, next to the import controls.
+    // Run state — progress, pause/cancel and the waiting queue live at the
+    // bottom of this sidebar; start buttons sit in their workbench tabs.
     let executing = s.executing;
     let paused = s.paused;
     let queue_restoring = s.queue_restoring;
     // Optimize shares the run controls: its batch either sits queued
     // behind the shrink run or owns the workers.
-    let optimize_count = s.optimize_files.len();
-    let optimize_scanning = s.optimize_scanning;
     let optimize_executing = s.optimize_executing;
     let optimize_paused = s.optimize_paused;
     let optimize_done = s.optimize_done;
@@ -677,20 +663,10 @@ fn Sidebar() -> Element {
         })
         .collect();
     let n_staged = staged_files.len();
-    let n_eligible = s.eligible().len();
     // Files addable to the running batch queue (the mid-run Queue
     // button): below-threshold files count too — the click is explicit.
     let n_queueable = s.queueable().len();
-    // Failed files from the last finished run — feeds the Retry button.
-    let n_retry = s.retry_files().len();
-    let retry_file_word = if n_retry == 1 { "file" } else { "files" };
     drop(s);
-    let probe_pct = if probe_total > 0 {
-        probe_done as f64 / probe_total as f64 * 100.0
-    } else {
-        0.0
-    };
-    let probe_label = format!("Probing {probe_done}/{probe_total} …");
     let waiting = pending_files.iter().filter(|(.., sk)| !*sk).count();
     let mut progress_label = format!(
         "Working {exec_done}/{exec_total} — {:.0}%",
@@ -702,122 +678,9 @@ fn Sidebar() -> Element {
     if paused {
         progress_label.push_str(" · paused");
     }
-    let process_label = format!("Process {n_eligible} file(s)");
-    // OS drag & drop onto the sidebar queues shrink sources.
-    let drop_tx = pump_tx(&state);
-    let mut drag_over = use_signal(|| false);
-    let drag_cls = if drag_over() {
-        "ring-2 ring-inset ring-primary"
-    } else {
-        ""
-    };
     rsx! {
         aside {
-            class: "flex w-80 shrink-0 flex-col gap-4 overflow-y-auto border-r border-border bg-card p-4 {drag_cls}",
-            ondragenter: move |_| drag_over.set(true),
-            ondragleave: move |_| drag_over.set(false),
-            ondragover: move |evt| {
-                evt.prevent_default();
-                drag_over.set(true);
-            },
-            ondrop: move |evt| {
-                evt.prevent_default();
-                drag_over.set(false);
-                let paths = dropped_paths(&evt);
-                if !paths.is_empty() {
-                    let _ = drop_tx.unbounded_send(JobMsg::TargetsAdded(paths));
-                }
-            },
-            Card {
-                CardHeader {
-                    CardTitle { "Sources" }
-                }
-                CardContent {
-                    div { class: "flex flex-col gap-2",
-                        Button {
-                            variant: ButtonVariant::Outline,
-                            class: "w-full",
-                            onclick: move |_| {
-                                let tx = pump_tx(&state);
-                                std::thread::spawn(move || {
-                                    let mut dlg = rfd::FileDialog::new();
-                                    if let Some(p) = &parent {
-                                        dlg = dlg.set_parent(p);
-                                    }
-                                    if let Some(paths) = dlg.pick_folders() {
-                                        let _ = tx.unbounded_send(JobMsg::TargetsAdded(paths));
-                                    }
-                                });
-                            },
-                            "Add folders…"
-                        }
-                        Button {
-                            variant: ButtonVariant::Outline,
-                            class: "w-full",
-                            onclick: move |_| {
-                                let tx = pump_tx(&state);
-                                std::thread::spawn(move || {
-                                    let mut dlg = rfd::FileDialog::new();
-                                    if let Some(p) = &parent {
-                                        dlg = dlg.set_parent(p);
-                                    }
-                                    if let Some(paths) = dlg
-                                        .add_filter("media", shrinkr_core::media::MEDIA_EXTS)
-                                        .add_filter("images", shrinkr_core::images::IMAGE_SHRINK_EXTS)
-                                        .pick_files()
-                                    {
-                                        let _ = tx.unbounded_send(JobMsg::TargetsAdded(paths));
-                                    }
-                                });
-                            },
-                            "Add files…"
-                        }
-                        Button {
-                            variant: ButtonVariant::Ghost,
-                            class: "w-full",
-                            disabled: !has_selection,
-                            title: "Remove every added file from the selection",
-                            onclick: move |_| crate::clear_clicked(state),
-                            "Clear"
-                        }
-                    }
-                    if has_targets {
-                        p { class: "mt-3 text-xs text-muted-foreground", "Waiting to scan:" }
-                        div { class: "mt-1 max-h-32 overflow-y-auto rounded-md border border-border p-2",
-                            for (i , t) in targets.iter().enumerate() {
-                                div { class: "flex items-center justify-between gap-2 py-0.5",
-                                    span { class: "truncate text-xs text-muted-foreground",
-                                        "{t.display()}"
-                                    }
-                                    button {
-                                        class: "shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground",
-                                        title: "Remove from the waiting list",
-                                        onclick: move |_| {
-                                            let mut w = state.write();
-                                            if i < w.targets.len() {
-                                                w.targets.remove(i);
-                                            }
-                                        },
-                                        "✕"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if scanning {
-                        div { class: "mt-2 flex items-center gap-2 text-xs text-muted-foreground",
-                            Spinner {}
-                            "Walking subdirectories…"
-                        }
-                    }
-                    if probing {
-                        div { class: "mt-2",
-                            Progress { value: probe_pct }
-                            p { class: "mt-1 text-xs text-muted-foreground", "{probe_label}" }
-                        }
-                    }
-                }
-            }
+            class: "flex w-80 shrink-0 flex-col gap-4 overflow-y-auto border-r border-border bg-card p-4",
             Card {
                 CardHeader {
                     CardTitle { "Library" }
@@ -884,84 +747,10 @@ fn Sidebar() -> Element {
                     }
                 }
             }
-            Card {
-                CardHeader {
-                    CardTitle { "Optimize" }
-                }
-                CardContent {
-                    div { class: "flex flex-col gap-2",
-                        Button {
-                            variant: ButtonVariant::Outline,
-                            class: "w-full",
-                            disabled: optimize_executing || optimize_queued.is_some(),
-                            onclick: move |_| {
-                                let tx = pump_tx(&state);
-                                std::thread::spawn(move || {
-                                    let mut dlg = rfd::FileDialog::new();
-                                    if let Some(p) = &parent {
-                                        dlg = dlg.set_parent(p);
-                                    }
-                                    if let Some(paths) = dlg
-                                        .add_filter("optimize", &["pdf", "png", "jpg", "jpeg"])
-                                        .pick_files()
-                                    {
-                                        crate::jobs::start_optimize_scan(tx, paths);
-                                    }
-                                });
-                            },
-                            "Add images/PDFs…"
-                        }
-                        Button {
-                            variant: ButtonVariant::Outline,
-                            class: "w-full",
-                            disabled: optimize_executing || optimize_queued.is_some(),
-                            onclick: move |_| {
-                                let tx = pump_tx(&state);
-                                std::thread::spawn(move || {
-                                    let mut dlg = rfd::FileDialog::new();
-                                    if let Some(p) = &parent {
-                                        dlg = dlg.set_parent(p);
-                                    }
-                                    if let Some(paths) = dlg.pick_folders() {
-                                        crate::jobs::start_optimize_scan(tx, paths);
-                                    }
-                                });
-                            },
-                            "Add folders…"
-                        }
-                        Button {
-                            variant: ButtonVariant::Ghost,
-                            class: "w-full",
-                            disabled: optimize_count == 0
-                                || optimize_executing
-                                || optimize_queued.is_some(),
-                            onclick: move |_| {
-                                let mut w = state.write();
-                                if !w.optimize_executing && w.optimize_queued.is_none() {
-                                    w.optimize_files.clear();
-                                    w.optimize_done = 0;
-                                    w.optimize_run.clear();
-                                    w.optimize_summary = None;
-                                }
-                            },
-                            "Clear"
-                        }
-                    }
-                    if optimize_scanning {
-                        div { class: "mt-2 flex items-center gap-2 text-xs text-muted-foreground",
-                            Spinner {}
-                            "Scanning."
-                        }
-                    } else if optimize_count > 0 {
-                        p { class: "mt-2 text-xs text-muted-foreground",
-                            "{optimize_count} file(s)"
-                        }
-                    }
-                }
-            }
             // Run control: optimize progress when it owns the workers,
-            // otherwise the shrink Process/Retry buttons when idle or the
-            // batch progress + pause/cancel mid-run. One core run at a time.
+            // otherwise the shrink batch progress + pause/cancel. Start
+            // buttons sit in their workbench tabs; this panel only
+            // monitors and stops whatever is running.
             div { class: "flex flex-col gap-2",
                 if optimize_executing {
                     {
@@ -1042,25 +831,6 @@ fn Sidebar() -> Element {
                                 onclick: move |_| discard_restored(state),
                                 "Discard"
                             }
-                        }
-                    }
-                    Button {
-                        variant: ButtonVariant::Default,
-                        class: "w-full",
-                        // Auto-scan is part of adding now: let the selection
-                        // finish probing before a batch snapshots it.
-                        disabled: scan_busy || queue_restoring || waiting > 0,
-                        title: if scan_busy { Some("Waiting for the scan to finish".to_string()) } else { None },
-                        onclick: move |_| crate::process_clicked(state, pump_tx(&state)),
-                        "{process_label}"
-                    }
-                    if n_retry > 0 {
-                        Button {
-                            variant: ButtonVariant::Warning,
-                            class: "w-full",
-                            disabled: waiting > 0,
-                            onclick: move |_| crate::retry_clicked(state, pump_tx(&state)),
-                            "Retry {n_retry} failed {retry_file_word}"
                         }
                     }
                 } else {
@@ -1305,6 +1075,7 @@ fn Main() -> Element {
                     }
                     TabsContent { value: "shrink",
                         div { class: "flex flex-col gap-4",
+                            ImportBar { mode: ImportMode::Shrink }
                             if empty {
                                 ShrinkEmpty {}
                             } else {
@@ -1321,6 +1092,7 @@ fn Main() -> Element {
                     }
                     TabsContent { value: "optimize",
                         div { class: "flex flex-col gap-4",
+                            ImportBar { mode: ImportMode::Optimize }
                             OptimizeCard {}
                             OptimizeSummaryCard {}
                             OptimizeFilesCard {}
@@ -1333,40 +1105,221 @@ fn Main() -> Element {
     }
 }
 
-/// Shrink-tab empty state, doubling as a drop zone for files/folders.
+/// Which pipeline a workspace import strip feeds.
+#[derive(Clone, Copy, PartialEq)]
+enum ImportMode {
+    Shrink,
+    Optimize,
+}
+
+/// Shared import strip at the top of a workbench tab: the same buttons and
+/// native dialogs everywhere, with the tab deciding the filter and where
+/// the files land. Also the tab's drop target.
 #[component]
-fn ShrinkEmpty() -> Element {
-    let state = use_context::<Signal<AppState>>();
-    let drop_tx = pump_tx(&state);
+fn ImportBar(mode: ImportMode) -> Element {
+    let mut state = use_context::<Signal<AppState>>();
+    let parent = crate::dialog::DialogParent::capture(&dioxus::desktop::use_window());
+    let s = state.read();
+    let optimize = mode == ImportMode::Optimize;
+    let targets: Vec<std::path::PathBuf> = s.targets.clone();
+    let scanning = s.scanning;
+    let probing = s.probing;
+    let probe_done = s.probe_done;
+    let probe_total = s.probe_total;
+    // Clear exists on both sides: shrink owns the library + pending scan
+    // list; optimize owns its picked files.
+    let has_selection =
+        !s.files.is_empty() || !targets.is_empty() || !s.staged.is_empty() || scanning || probing;
+    let opt_count = s.optimize_files.len();
+    let opt_scanning = s.optimize_scanning;
+    let opt_locked = s.optimize_executing || s.optimize_queued.is_some();
+    drop(s);
     let mut drag_over = use_signal(|| false);
     let drag_cls = if drag_over() {
         "ring-2 ring-inset ring-primary"
     } else {
         ""
     };
+    let probe_pct = if probe_total > 0 {
+        probe_done as f64 / probe_total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let probe_label = format!("Probing {probe_done}/{probe_total} …");
+    let status = if optimize {
+        if opt_scanning {
+            "Scanning.".to_string()
+        } else if opt_count > 0 {
+            format!("{opt_count} file(s)")
+        } else {
+            String::new()
+        }
+    } else if scanning {
+        "Walking subdirectories…".to_string()
+    } else if !targets.is_empty() {
+        format!("{} waiting to scan", targets.len())
+    } else {
+        String::new()
+    };
+    let clear_disabled = if optimize {
+        opt_count == 0 || opt_locked
+    } else {
+        !has_selection
+    };
+    let import_disabled = optimize && opt_locked;
+    let add_label = if optimize {
+        "Add images/PDFs…"
+    } else {
+        "Add files…"
+    };
+    rsx! {
+        div {
+            class: "rounded-xl border border-border bg-card p-3 shadow-sm {drag_cls}",
+            ondragenter: move |_| drag_over.set(true),
+            ondragleave: move |_| drag_over.set(false),
+            ondragover: move |evt| {
+                evt.prevent_default();
+                drag_over.set(true);
+            },
+            ondrop: move |evt| {
+                evt.prevent_default();
+                drag_over.set(false);
+                let paths = dropped_paths(&evt);
+                if paths.is_empty() {
+                    return;
+                }
+                if optimize {
+                    let w = state.read();
+                    let locked = w.optimize_executing || w.optimize_queued.is_some();
+                    drop(w);
+                    if !locked {
+                        crate::jobs::start_optimize_scan(pump_tx(&state), paths);
+                    }
+                } else {
+                    let _ = pump_tx(&state).unbounded_send(JobMsg::TargetsAdded(paths));
+                }
+            },
+            div { class: "flex flex-wrap items-center gap-2",
+                Button {
+                    variant: ButtonVariant::Outline,
+                    disabled: import_disabled,
+                    onclick: move |_| {
+                        let tx = pump_tx(&state);
+                        std::thread::spawn(move || {
+                            let mut dlg = rfd::FileDialog::new();
+                            if let Some(p) = &parent {
+                                dlg = dlg.set_parent(p);
+                            }
+                            if optimize {
+                                if let Some(paths) = dlg
+                                    .add_filter("optimize", &["pdf", "png", "jpg", "jpeg"])
+                                    .pick_files()
+                                {
+                                    crate::jobs::start_optimize_scan(tx, paths);
+                                }
+                            } else if let Some(paths) = dlg
+                                .add_filter("media", shrinkr_core::media::MEDIA_EXTS)
+                                .add_filter("images", shrinkr_core::images::IMAGE_SHRINK_EXTS)
+                                .pick_files()
+                            {
+                                let _ = tx.unbounded_send(JobMsg::TargetsAdded(paths));
+                            }
+                        });
+                    },
+                    "{add_label}"
+                }
+                Button {
+                    variant: ButtonVariant::Outline,
+                    disabled: import_disabled,
+                    onclick: move |_| {
+                        let tx = pump_tx(&state);
+                        std::thread::spawn(move || {
+                            let mut dlg = rfd::FileDialog::new();
+                            if let Some(p) = &parent {
+                                dlg = dlg.set_parent(p);
+                            }
+                            if let Some(paths) = dlg.pick_folders() {
+                                if optimize {
+                                    crate::jobs::start_optimize_scan(tx, paths);
+                                } else {
+                                    let _ = tx.unbounded_send(JobMsg::TargetsAdded(paths));
+                                }
+                            }
+                        });
+                    },
+                    "Add folders…"
+                }
+                Button {
+                    variant: ButtonVariant::Ghost,
+                    disabled: clear_disabled,
+                    onclick: move |_| {
+                        if optimize {
+                            let mut w = state.write();
+                            if !w.optimize_executing && w.optimize_queued.is_none() {
+                                w.optimize_files.clear();
+                                w.optimize_done = 0;
+                                w.optimize_run.clear();
+                                w.optimize_summary = None;
+                            }
+                        } else {
+                            crate::clear_clicked(state);
+                        }
+                    },
+                    "Clear"
+                }
+                if !status.is_empty() {
+                    span { class: "ml-auto flex items-center gap-2 text-xs text-muted-foreground",
+                        if scanning || opt_scanning {
+                            Spinner {}
+                        }
+                        "{status}"
+                    }
+                }
+            }
+            if !optimize {
+                if !targets.is_empty() {
+                    div { class: "mt-2 max-h-24 overflow-y-auto rounded-md border border-border p-2",
+                        for (i , t) in targets.iter().enumerate() {
+                            div { class: "flex items-center justify-between gap-2 py-0.5",
+                                span { class: "truncate text-xs text-muted-foreground",
+                                    "{t.display()}"
+                                }
+                                button {
+                                    class: "shrink-0 rounded px-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                                    onclick: move |_| {
+                                        let mut w = state.write();
+                                        if i < w.targets.len() {
+                                            w.targets.remove(i);
+                                        }
+                                    },
+                                    "✕"
+                                }
+                            }
+                        }
+                    }
+                }
+                if probing {
+                    div { class: "mt-2",
+                        Progress { value: probe_pct }
+                        p { class: "mt-1 text-xs text-muted-foreground", "{probe_label}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Shrink-tab empty state; the import strip above does the adding.
+#[component]
+fn ShrinkEmpty() -> Element {
     rsx! {
         Card {
             CardContent {
-                div {
-                    class: "rounded-md border border-dashed border-border p-6 text-center {drag_cls}",
-                    ondragenter: move |_| drag_over.set(true),
-                    ondragleave: move |_| drag_over.set(false),
-                    ondragover: move |evt| {
-                        evt.prevent_default();
-                        drag_over.set(true);
-                    },
-                    ondrop: move |evt| {
-                        evt.prevent_default();
-                        drag_over.set(false);
-                        let paths = dropped_paths(&evt);
-                        if !paths.is_empty() {
-                            let _ = drop_tx.unbounded_send(JobMsg::TargetsAdded(paths));
-                        }
-                    },
+                div { class: "rounded-md border border-dashed border-border p-6 text-center",
                     Empty {
                         EmptyTitle { "No files yet" }
                         EmptyDescription {
-                            "Add folders or files (videos and images) on the left, or drag & drop them here — scanning starts automatically."
+                            "Add folders or files above — scanning starts automatically."
                         }
                     }
                 }
@@ -1411,6 +1364,15 @@ fn PipelineCard() -> Element {
     let (est_in, est_out, _, _) = s.estimate();
     // Capabilities come from the state copy, not a blocking hw::caps().
     let caps = s.caps;
+    // Run controls: the Process/Retry buttons live here with the settings
+    // they apply; progress and Pause/Cancel stay in the sidebar.
+    let executing = s.executing;
+    let scan_busy = s.scanning || s.probing;
+    let queue_restoring = s.queue_restoring;
+    let pending_waiting = !s.pending.is_empty();
+    let optimize_busy = s.optimize_executing || s.optimize_queued.is_some();
+    let n_eligible = s.eligible().len();
+    let n_retry = s.retry_files().len();
     drop(s);
     let cq_label = if preserve_quality {
         "Auto".to_string()
@@ -1425,6 +1387,8 @@ fn PipelineCard() -> Element {
     );
     let saving_label = format!("{min_saving:.0}");
     let parallel_label = format!("{parallel}");
+    let process_label = format!("Process {n_eligible} file(s)");
+    let retry_file_word = if n_retry == 1 { "file" } else { "files" };
     let estimate_label = (est_in > 0).then(|| {
         format!(
             "{} → {} • {}",
@@ -1864,6 +1828,30 @@ fn PipelineCard() -> Element {
                             }
                             div { class: "flex w-12 shrink-0 justify-end",
                                 Badge { "{parallel_label}" }
+                            }
+                        }
+                    }
+                    if !executing {
+                        div { class: "flex flex-col gap-2",
+                            Button {
+                                variant: ButtonVariant::Default,
+                                class: "w-full",
+                                disabled: scan_busy
+                                    || queue_restoring
+                                    || pending_waiting
+                                    || optimize_busy,
+                                title: if scan_busy { Some("Waiting for the scan to finish".to_string()) } else { None },
+                                onclick: move |_| crate::process_clicked(state, pump_tx(&state)),
+                                "{process_label}"
+                            }
+                            if n_retry > 0 {
+                                Button {
+                                    variant: ButtonVariant::Warning,
+                                    class: "w-full",
+                                    disabled: pending_waiting || optimize_busy,
+                                    onclick: move |_| crate::retry_clicked(state, pump_tx(&state)),
+                                    "Retry {n_retry} failed {retry_file_word}"
+                                }
                             }
                         }
                     }
@@ -3428,12 +3416,6 @@ fn OptimizeCard() -> Element {
     let shrink_running = s.executing;
     let queued = s.optimize_queued.as_ref().map(|b| b.indices.len());
     drop(s);
-    let mut drag_over = use_signal(|| false);
-    let drag_cls = if drag_over() {
-        "border-primary"
-    } else {
-        "border-border"
-    };
     let run_label = if let Some(n) = queued {
         format!("Optimize {n} file(s) queued")
     } else if shrink_running {
@@ -3457,27 +3439,6 @@ fn OptimizeCard() -> Element {
             }
             CardContent {
                 div { class: "flex flex-col gap-3",
-                    div {
-                        class: "rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground {drag_cls}",
-                        ondragenter: move |_| drag_over.set(true),
-                        ondragleave: move |_| drag_over.set(false),
-                        ondragover: move |evt| {
-                            evt.prevent_default();
-                            drag_over.set(true);
-                        },
-                        ondrop: move |evt| {
-                            evt.prevent_default();
-                            drag_over.set(false);
-                            let paths = dropped_paths(&evt);
-                            let w = state.read();
-                            let locked = w.optimize_executing || w.optimize_queued.is_some();
-                            drop(w);
-                            if !locked && !paths.is_empty() {
-                                crate::jobs::start_optimize_scan(pump_tx(&state), paths);
-                            }
-                        },
-                        "Drop PDFs, PNGs or JPEGs here."
-                    }
                     div { class: "grid grid-cols-1 gap-3 {setting_cols}",
                         if has_pdf || !has_image {
                             div { class: "flex flex-col gap-1",

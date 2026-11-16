@@ -593,10 +593,12 @@ outcomes, and benchmark results as messages; it never blocks on an encode.
 Pause holds new files and suspends children already in flight. Cancel kills
 the child and reaps it.
 
-Image/PDF imports and the optimize run live in the sidebar. Only one
-pipeline owns the workers at a time: an optimize batch started while the
-shrink queue is running waits behind it with its own settings snapshot and
-starts when the queue drains.
+Each pipeline tab owns its import strip, settings, and start button; the
+sidebar holds the shared library and history plus the active run's
+progress, pause/cancel, and queued work. Only one pipeline owns the
+workers at a time: an optimize batch started while the shrink queue is
+running waits behind it with its own settings snapshot and starts when
+the queue drains.
 
 ### CLI reference
 
