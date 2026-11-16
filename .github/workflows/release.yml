@@ -9,7 +9,37 @@ permissions:
   contents: write
 
 jobs:
+  # Every asset job needs the release to exist, so create it exactly once
+  # and as a draft: a release only becomes public after the publish job
+  # has verified every download — including the Windows installer — is
+  # attached. Users never land on the Latest release mid-upload, and a
+  # failed matrix job leaves a hidden draft instead of a public release
+  # missing its installer.
+  prepare:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Create draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          # Reuse any existing release for the tag (rerun, or a manually
+          # created release) instead of creating a second one. The list
+          # endpoint includes drafts for tokens with write access, unlike
+          # a tag lookup that can be ambiguous when duplicates exist.
+          ids="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+            --jq ".[] | select(.tag_name == \"$tag\") | .id")"
+          if [ -n "$ids" ]; then
+            echo "release $tag already exists (id ${ids%%$'\n'*}); reusing it"
+          else
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+              --title "$tag" --generate-notes --draft
+          fi
+
   build:
+    needs: prepare
     strategy:
       # One platform failing must not cancel the others' uploads.
       fail-fast: false
@@ -242,22 +272,18 @@ jobs:
           codesign --force --deep --sign - "$APP"
           hdiutil create -volname "Shrinkr" -srcfolder "$APP" -ov -format UDZO "$GITHUB_WORKSPACE/$DMG"
 
-      - name: Publish GitHub Release
+      - name: Upload archive (draft)
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # First matrix job to arrive creates the release; the rest skip
-          # straight to uploading their own archive (--clobber re-uploads
-          # safely on retry).
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --generate-notes 2>/dev/null || true
+          # The prepare job created the draft; uploads stay hidden until
+          # the publish job flips it public. --clobber makes re-runs safe.
           gh release upload "${{ github.ref_name }}" "${{ env.ARCHIVE }}" --clobber
 
-      # Runs after Publish in the same job, so the release is guaranteed
-      # to exist by now (created by this job or an earlier matrix job).
-      - name: Publish DMG (macOS)
+      # Uploads to the same draft, so the DMG and the archive appear
+      # together when the release is published.
+      - name: Upload DMG (macOS)
         if: runner.os == 'macOS'
         shell: bash
         env:
@@ -265,7 +291,7 @@ jobs:
         run: |
           gh release upload "${{ github.ref_name }}" "shrinkr-${{ matrix.target }}.dmg" --clobber
 
-      - name: Publish installer (Windows)
+      - name: Upload installer (Windows)
         if: runner.os == 'Windows'
         shell: bash
         env:
@@ -274,10 +300,12 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           gh release upload "${{ github.ref_name }}" "Shrinkr-Setup-${VERSION}-x64.exe" --clobber
 
-  # Runs once, after every matrix job has uploaded its artifacts: publish
-  # SHA256SUMS.txt so users (and mirroring scripts) can verify every
-  # download — including the DMG and the installer, which carry no
-  # embedded signature. Re-uploads are safe: the sums exclude themselves.
+  # Runs once, after every matrix job has uploaded its artifacts, and
+  # before anything is published: verify the whole user-facing download
+  # set exists, then attach SHA256SUMS.txt so users (and mirroring
+  # scripts) can verify every download — including the DMG and the
+  # installer, which carry no embedded signature. Re-uploads are safe:
+  # the sums exclude themselves.
   checksums:
     needs: build
     runs-on: ubuntu-22.04
@@ -294,9 +322,14 @@ jobs:
           gh release download "$tag" -R "$GITHUB_REPOSITORY" -D sums-tmp
           cd sums-tmp
           # Windows users get both downloads: the per-user installer and
-          # the portable archive. A release missing either one is not
+          # the portable archive. A release missing any of these is not
           # complete, so fail instead of publishing checksums for it.
-          for asset in "Shrinkr-Setup-${version}-x64.exe" "shrinkr-x86_64-pc-windows-msvc.zip"; do
+          for asset in \
+            "Shrinkr-Setup-${version}-x64.exe" \
+            "shrinkr-x86_64-pc-windows-msvc.zip" \
+            "shrinkr-aarch64-apple-darwin.zip" \
+            "shrinkr-aarch64-apple-darwin.dmg" \
+            "shrinkr-x86_64-unknown-linux-gnu.zip"; do
             if [ ! -f "$asset" ]; then
               echo "::error::$asset is missing from release $tag"
               exit 1
@@ -306,3 +339,43 @@ jobs:
           cd ..
           cat SHA256SUMS.txt
           gh release upload "$tag" -R "$GITHUB_REPOSITORY" SHA256SUMS.txt --clobber
+
+  # Last gate: the draft created by prepare only becomes public now, with
+  # every asset (installer included) and SHA256SUMS.txt already attached.
+  # A failure anywhere earlier leaves it a draft, so the repository's
+  # Latest release is always a complete one.
+  publish:
+    needs: [build, checksums]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Publish draft as latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          version="${tag#v}"
+          assets="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+            --jq ".[] | select(.tag_name == \"$tag\") | .assets[].name")"
+          for asset in \
+            "Shrinkr-Setup-${version}-x64.exe" \
+            "shrinkr-x86_64-pc-windows-msvc.zip" \
+            "shrinkr-aarch64-apple-darwin.zip" \
+            "shrinkr-aarch64-apple-darwin.dmg" \
+            "shrinkr-x86_64-unknown-linux-gnu.zip" \
+            "SHA256SUMS.txt"; do
+            if ! grep -Fxq "$asset" <<< "$assets"; then
+              echo "::error::$asset is missing; release $tag stays a draft"
+              exit 1
+            fi
+          done
+          tmp="$(mktemp -d)"
+          gh release download "$tag" -R "$GITHUB_REPOSITORY" -p SHA256SUMS.txt -D "$tmp"
+          if ! grep -q "Shrinkr-Setup-${version}-x64.exe" "$tmp/SHA256SUMS.txt"; then
+            echo "::error::SHA256SUMS.txt does not cover the Windows installer; release $tag stays a draft"
+            exit 1
+          fi
+          # --latest so the newest tag is also the download the repository
+          # advertises, not just the most recently created release.
+          gh release edit "$tag" -R "$GITHUB_REPOSITORY" --draft=false --latest

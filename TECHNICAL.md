@@ -679,8 +679,15 @@ same release binaries and pinned sidecars before the release is published, so
 a broken installer fails the tag build instead of shipping a release without
 one. CI also builds it on every master push (Inno Setup via Chocolatey) and
 uploads `shrinkr-windows-installer` as a workflow artifact, which catches
-installer breakage before a tag. The checksum job refuses to publish sums for a
-release that lacks either Windows download: the installer or the portable zip.
+installer breakage before a tag.
+
+A tag push does not publish a release directly. A `prepare` job creates it as
+a draft once, the matrix jobs upload their archives and the installer to that
+draft, the checksum job verifies the complete download set and attaches
+`SHA256SUMS.txt`, and only then does a final `publish` job flip the draft
+public and mark it **Latest**. If any platform or the installer fails, the
+draft stays hidden, so users never land on a half-uploaded Latest release and
+the newest installer is always attached by the time a release is visible.
 
 ## GUI shell
 

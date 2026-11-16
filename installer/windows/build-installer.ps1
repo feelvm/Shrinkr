@@ -250,6 +250,13 @@ $setup = Join-Path $OutputDir "Shrinkr-Setup-$fileVersion-x64.exe"
 if (-not (Test-Path -LiteralPath $setup)) {
     throw "expected installer was not produced: $setup"
 }
+# The setup carries the requested version in its version resource. Guard
+# against attaching an installer built for a different release. The
+# resource string is space-padded to a fixed width, hence Trim().
+$productVersion = ([string](Get-Item -LiteralPath $setup).VersionInfo.ProductVersion).Trim()
+if ($productVersion -ne $numericVersion) {
+    throw "installer reports version '$productVersion', expected '$numericVersion'"
+}
 $sizeMb = [math]::Round((Get-Item -LiteralPath $setup).Length / 1MB, 1)
 Write-Host ''
 Write-Host "Installer ready: $setup ($sizeMb MB)"
