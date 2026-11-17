@@ -148,9 +148,14 @@ pub fn install_update(current_version: &str) -> Result<String> {
     }
     let asset = release
         .asset_for(self_update::get_target(), None)
-        .context("release has no archive for this platform")?
-        .download_url()
-        .to_string();
+        .context("release has no archive for this platform")?;
+    // The asset's *name* must come from the release metadata: since
+    // self_update 1.x the GitHub backend's `download_url` is the API URL
+    // (`.../releases/assets/<id>`), whose last path segment is the numeric
+    // asset id. Deriving the file name from it stored the archive without
+    // its `.zip` extension, and zipsign then treated it as a plain file.
+    let asset_name = asset.name().to_string();
+    let asset_url = asset.download_url().to_string();
 
     let exe = std::env::current_exe().context("locate running executable")?;
     let install_dir = exe
@@ -178,7 +183,7 @@ pub fn install_update(current_version: &str) -> Result<String> {
     let scratch = install_dir.join(format!(".shrinkr-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).with_context(|| format!("create {}", scratch.display()))?;
-    let result = install_from_asset(&asset, &scratch, &install_dir);
+    let result = install_from_asset(&asset_url, &asset_name, &scratch, &install_dir);
     // Best-effort: on Windows the stashed copy of the *running* binary
     // cannot be deleted until this process exits, so the dir can linger
     // until the next update sweeps it.
@@ -186,18 +191,21 @@ pub fn install_update(current_version: &str) -> Result<String> {
     result.map(|_| new_version)
 }
 
-fn install_from_asset(url: &str, scratch: &Path, install_dir: &Path) -> Result<()> {
-    // Keep the release asset's file name: the embedded zipsign signature
-    // is salted with the archive name, so verification must see the same
-    // name the signing step saw in CI.
-    let asset_name = url
-        .split(['?', '#'])
-        .next()
-        .and_then(|p| p.rsplit('/').next())
-        .filter(|s| !s.is_empty())
-        .context("release asset URL has no file name")?
-        .to_string();
-    let zip_path = scratch.join(&asset_name);
+fn install_from_asset(
+    url: &str,
+    asset_name: &str,
+    scratch: &Path,
+    install_dir: &Path,
+) -> Result<()> {
+    // Keep the release asset's published file name: the embedded zipsign
+    // signature is salted with the archive name, and verification only
+    // recognizes `.zip` / `.tar.gz` names. `asset_name` is the release
+    // metadata's name, never the download URL's last segment (the GitHub
+    // API URL ends in the numeric asset id).
+    if !(asset_name.ends_with(".zip") || asset_name.ends_with(".tar.gz")) {
+        bail!("release asset {asset_name} is not a .zip/.tar.gz archive");
+    }
+    let zip_path = scratch.join(asset_name);
     let file = std::fs::File::create(&zip_path).context("create download file")?;
     self_update::Download::from_url(url)
         .request_header("ACCEPT", "application/octet-stream")
@@ -373,6 +381,33 @@ mod tests {
         assert!(
             self_update::verify_signature(&unsigned, &[UPDATER_KEY]).is_err(),
             "an archive without an embedded signature must be rejected"
+        );
+    }
+
+    /// Regression: self_update 1.x's GitHub `download_url` is the API URL
+    /// (`.../releases/assets/<id>`), not the published file name. Feeding
+    /// that id to the downloader stored an extension-less file and zipsign
+    /// refused it as a plain file. The asset's metadata name must win, and
+    /// a non-archive name must fail before any download.
+    #[test]
+    fn api_asset_id_is_never_used_as_the_archive_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let err = install_from_asset(
+            "https://api.github.com/repos/feelvm/Shrinkr/releases/assets/760618947",
+            "760618947",
+            &scratch,
+            tmp.path(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not a .zip/.tar.gz archive"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !scratch.join("760618947").exists(),
+            "nothing may be written for a non-archive asset"
         );
     }
 
