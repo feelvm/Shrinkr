@@ -1114,6 +1114,7 @@ fn Main() -> Element {
                         TabsTrigger { value: "shrink", "Shrink" }
                         TabsTrigger { value: "convert", "Convert" }
                         TabsTrigger { value: "optimize", "Optimize" }
+                        TabsTrigger { value: "history", "History" }
                     }
                     TabsContent { value: "shrink",
                         div { class: "flex flex-col gap-4",
@@ -1139,6 +1140,9 @@ fn Main() -> Element {
                             OptimizeSummaryCard {}
                             OptimizeFilesCard {}
                         }
+                    }
+                    TabsContent { value: "history",
+                        HistoryCard {}
                     }
                 }
                 LogCard {}
@@ -2591,6 +2595,7 @@ fn clear_history_clicked(mut state: Signal<AppState>) {
     crate::persist::clear_history();
     let mut w = state.write();
     w.history_count = 0;
+    w.history_revision = w.history_revision.wrapping_add(1);
     w.push_log(
         "Cleared processed-file history - the next scan treats every file as a fresh input.".into(),
     );
@@ -3577,27 +3582,37 @@ const OPTIMIZE_ROW_H: usize = 36;
 /// Rows visible in the queue panel before it scrolls.
 const OPTIMIZE_ROWS_VISIBLE: usize = 10;
 
-/// Rows rendered for one scroll position in the optimize queue, plus the
-/// spacer heights that keep the scrollbar proportional to the whole list.
+/// Fixed row height of the History list, in CSS pixels.
+const HISTORY_ROW_H: usize = 36;
+/// Rows visible in the History panel before it scrolls.
+const HISTORY_ROWS_VISIBLE: usize = 12;
+
+/// Rows rendered for one scroll position in a fixed-height list, plus
+/// the spacer heights that keep the scrollbar proportional to the whole
+/// list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OptimizeWindow {
+struct ListWindow {
     start: usize,
     end: usize,
     pad_top: usize,
     pad_bottom: usize,
 }
 
-fn optimize_window(total: usize, top_row: usize) -> OptimizeWindow {
-    let first = top_row.min(total.saturating_sub(OPTIMIZE_ROWS_VISIBLE));
+fn list_window(total: usize, top_row: usize, rows_visible: usize, row_h: usize) -> ListWindow {
+    let first = top_row.min(total.saturating_sub(rows_visible));
     // Overscan keeps the next rows painted before they scroll in.
     let start = first.saturating_sub(2);
-    let end = (first + OPTIMIZE_ROWS_VISIBLE + 2).min(total);
-    OptimizeWindow {
+    let end = (first + rows_visible + 2).min(total);
+    ListWindow {
         start,
         end,
-        pad_top: start * OPTIMIZE_ROW_H,
-        pad_bottom: (total - end) * OPTIMIZE_ROW_H,
+        pad_top: start * row_h,
+        pad_bottom: (total - end) * row_h,
     }
+}
+
+fn optimize_window(total: usize, top_row: usize) -> ListWindow {
+    list_window(total, top_row, OPTIMIZE_ROWS_VISIBLE, OPTIMIZE_ROW_H)
 }
 
 /// Queue of files picked for Optimize, between the settings card and the
@@ -3763,6 +3778,216 @@ fn OptimizeSummaryCard() -> Element {
             }
         }
     }
+}
+
+/// Processed-file ledger view: every path the Shrink pipeline has placed,
+/// newest first. The ledger is persisted in `history.json` (capped, one
+/// row per path), so this is the app's memory across restarts — "all
+/// processed files since installation".
+///
+/// Rows are windowed like the Optimize queue: a long-lived installation
+/// can hold thousands of entries, and only the visible slice belongs in
+/// the tree.
+#[component]
+fn HistoryCard() -> Element {
+    let state = use_context::<Signal<AppState>>();
+    // The ledger lives outside the state signal (it is a file); the
+    // revision counter is the cheap "it changed" trigger. The count alone
+    // would miss a re-processed path, which updates the stamp in place.
+    let revision = state.read().history_revision;
+    let mut entries = use_signal(persist::history_entries);
+    let mut seen_revision = use_signal(|| revision);
+    let mut top_row = use_signal(|| 0usize);
+    use_effect(move || {
+        let revision = state.read().history_revision;
+        if revision != *seen_revision.peek() {
+            seen_revision.set(revision);
+            entries.set(persist::history_entries());
+        }
+    });
+    // The list element disappears with an emptied ledger; a later refill
+    // starts at scrollTop 0, so the window has to start there too.
+    use_effect(move || {
+        if entries.read().is_empty() && *top_row.peek() != 0 {
+            top_row.set(0);
+        }
+    });
+    let all = entries.read();
+    let total = all.len();
+    if total == 0 {
+        return rsx! {
+            Card {
+                CardHeader { CardTitle { "Processed files" } }
+                CardContent {
+                    Empty {
+                        EmptyTitle { "Nothing processed yet" }
+                    }
+                }
+            }
+        };
+    }
+    let total_bytes: u64 = all.iter().map(|e| e.size).sum();
+    let win = list_window(total, top_row(), HISTORY_ROWS_VISIBLE, HISTORY_ROW_H);
+    // Two 1px borders shrink the content box; add them so a full row set
+    // fits without showing a sliver of the next one.
+    let list_height = total.min(HISTORY_ROWS_VISIBLE) * HISTORY_ROW_H + 2;
+    let now = now_ms();
+    // Only the rendered slice is formatted: a 5,000-entry ledger must not
+    // turn a progress-tick render into thousands of path parses.
+    let rows: Vec<(String, String, String, u64, String)> = (win.start..win.end)
+        .map(|i| {
+            let e = &all[i];
+            let path = std::path::Path::new(&e.path);
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(e.path.as_str())
+                .to_string();
+            let folder = path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            let tooltip = format!("{}\n{}", e.path, utc_stamp(e.processed_at_ms));
+            (
+                name,
+                folder,
+                tooltip,
+                e.size,
+                age_label(e.processed_at_ms, now),
+            )
+        })
+        .collect();
+    drop(all);
+    let header_count = format!("{total} file(s)");
+    let header_bytes = human_bytes(total_bytes);
+    rsx! {
+        Card {
+            CardHeader {
+                div { class: "flex w-full items-center justify-between gap-3",
+                    CardTitle { "Processed files" }
+                    div { class: "flex items-center gap-2",
+                        span { class: "text-xs text-muted-foreground tabular-nums",
+                            "{header_count} · {header_bytes}"
+                        }
+                        Button {
+                            variant: ButtonVariant::Ghost,
+                            class: "h-7 px-2 text-xs",
+                            onclick: move |_| clear_history_clicked(state),
+                            "Clear"
+                        }
+                    }
+                }
+            }
+            CardContent {
+                div { class: "flex items-center gap-3 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground",
+                    span { class: "min-w-0 flex-1", "File" }
+                    span { class: "hidden w-56 shrink-0 lg:block", "Folder" }
+                    span { class: "w-20 shrink-0 text-right", "Size" }
+                    span { class: "w-24 shrink-0 text-right", "Processed" }
+                }
+                div {
+                    id: "history-list",
+                    class: "overflow-y-auto rounded-md border border-border",
+                    style: "height: {list_height}px",
+                    onscroll: move |_| {
+                        spawn(async move {
+                            let script = format!(
+                                "const el = document.getElementById('history-list'); \
+                                 if (!el) {{ dioxus.send(0); }} else {{ \
+                                 dioxus.send(Math.floor(el.scrollTop / {HISTORY_ROW_H})); }}"
+                            );
+                            let mut eval = document::eval(&script);
+                            if let Ok(row) = eval.recv::<usize>().await {
+                                if *top_row.peek() != row {
+                                    top_row.set(row);
+                                }
+                            }
+                        });
+                    },
+                    div { style: "height: {win.pad_top}px" }
+                    for (name , folder , tooltip , size , age) in rows {
+                        div {
+                            class: "flex items-center gap-3 overflow-hidden border-b border-border px-3 last:border-b-0",
+                            style: "height: {HISTORY_ROW_H}px",
+                            span {
+                                class: "min-w-0 flex-1 truncate font-mono text-xs",
+                                title: "{tooltip}",
+                                "{name}"
+                            }
+                            span { class: "hidden w-56 shrink-0 truncate text-xs text-muted-foreground lg:block",
+                                "{folder}"
+                            }
+                            span { class: "w-20 shrink-0 text-right text-xs tabular-nums",
+                                "{human_bytes(size)}"
+                            }
+                            span { class: "w-24 shrink-0 text-right text-xs text-muted-foreground tabular-nums",
+                                "{age}"
+                            }
+                        }
+                    }
+                    div { style: "height: {win.pad_bottom}px" }
+                }
+            }
+        }
+    }
+}
+
+/// Wall time since `processed_at_ms`, in the largest readable unit.
+/// Relative ages need no time-zone math; the exact UTC stamp is the row
+/// tooltip.
+fn age_label(processed_at_ms: u64, now_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(processed_at_ms) / 1000;
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    if secs < 3_600 {
+        return format!("{} min ago", secs / 60);
+    }
+    if secs < 86_400 {
+        return format!("{} h ago", secs / 3_600);
+    }
+    let days = secs / 86_400;
+    if days < 30 {
+        format!("{days} d ago")
+    } else if days < 365 {
+        format!("{} mo ago", days / 30)
+    } else {
+        format!("{} y ago", days / 365)
+    }
+}
+
+/// `YYYY-MM-DD HH:MM UTC` — the same clock the log panel stamps with.
+fn utc_stamp(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    let rem = secs % 86_400;
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        rem / 3_600,
+        (rem % 3_600) / 60
+    )
+}
+
+/// Days since the Unix epoch to a civil date (Howard Hinnant's
+/// `civil_from_days`).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (year + i64::from(month <= 2), month, day)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// UI-thread part of Optimize: collect runnable rows, snapshot the preset
@@ -3970,5 +4195,51 @@ mod optimize_window_tests {
         assert_eq!(win.end, total);
         assert_eq!(win.pad_bottom, 0);
         assert!(win.start < total);
+    }
+
+    #[test]
+    fn history_window_uses_its_own_row_count_and_height() {
+        let total = 500;
+        let win = list_window(total, 40, HISTORY_ROWS_VISIBLE, HISTORY_ROW_H);
+        assert_eq!(
+            win.end - win.start,
+            HISTORY_ROWS_VISIBLE + 4,
+            "two overscan rows above and below the visible slice"
+        );
+        assert_eq!(
+            win.pad_top + (win.end - win.start) * HISTORY_ROW_H + win.pad_bottom,
+            total * HISTORY_ROW_H
+        );
+        // An empty list has no rows and no spacers.
+        let empty = list_window(0, 0, HISTORY_ROWS_VISIBLE, HISTORY_ROW_H);
+        assert_eq!((empty.start, empty.end), (0, 0));
+        assert_eq!((empty.pad_top, empty.pad_bottom), (0, 0));
+    }
+
+    #[test]
+    fn age_labels_cover_every_unit() {
+        let now = 1_000_000_000_000u64;
+        assert_eq!(age_label(now, now), "just now");
+        assert_eq!(age_label(now - 59_000, now), "just now");
+        assert_eq!(age_label(now - 60_000, now), "1 min ago");
+        assert_eq!(age_label(now - 59 * 60_000, now), "59 min ago");
+        assert_eq!(age_label(now - 3_600_000, now), "1 h ago");
+        assert_eq!(age_label(now - 23 * 3_600_000, now), "23 h ago");
+        assert_eq!(age_label(now - 86_400_000, now), "1 d ago");
+        assert_eq!(age_label(now - 29 * 86_400_000, now), "29 d ago");
+        assert_eq!(age_label(now - 30 * 86_400_000, now), "1 mo ago");
+        assert_eq!(age_label(now - 400 * 86_400_000, now), "1 y ago");
+        // Clock skew (a future stamp) reads as fresh, never negative.
+        assert_eq!(age_label(now + 5_000, now), "just now");
+    }
+
+    #[test]
+    fn utc_stamps_are_civil_dates() {
+        // 1970-01-01 00:00:00 UTC.
+        assert_eq!(utc_stamp(0), "1970-01-01 00:00 UTC");
+        // 2000-03-01 12:34:00 UTC (a leap-year day boundary).
+        assert_eq!(utc_stamp(951_914_040_000), "2000-03-01 12:34 UTC");
+        // 2026-11-17 14:30:00 UTC.
+        assert_eq!(utc_stamp(1_794_925_800_000), "2026-11-17 14:30 UTC");
     }
 }

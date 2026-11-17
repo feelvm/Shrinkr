@@ -546,6 +546,10 @@ pub struct AppState {
     /// Processed-file ledger entries (display only; the ledger lives in
     /// the app-data folder).
     pub history_count: usize,
+    /// Bumped whenever the ledger changes (a file finished, or history
+    /// was cleared). Transient: `history.json` holds the data; this only
+    /// tells the History tab to re-read it.
+    pub history_revision: u64,
     /// Files omitted by the history check during the current scan.
     pub history_skipped: usize,
     /// True while the startup worker is probing paths from a saved queue.
@@ -974,6 +978,7 @@ impl Default for AppState {
             skip_efficient: true,
             skip_processed: true,
             history_count: 0,
+            history_revision: 0,
             history_skipped: 0,
             queue_restoring: false,
             parallel: 2,

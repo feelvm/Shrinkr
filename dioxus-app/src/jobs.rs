@@ -2223,7 +2223,9 @@ fn apply_msg_inner(s: &mut AppState, msg: JobMsg) {
             // Remember the source and the written output by fingerprint:
             // a rescan of either should not re-apply a lossy encode.
             if let Some(src) = s.exec_items.get(job).map(|i| i.path.clone()) {
-                crate::persist::record_processed(&[src.as_path(), dest.as_path()]);
+                if crate::persist::record_processed(&[src.as_path(), dest.as_path()]) {
+                    s.history_revision = s.history_revision.wrapping_add(1);
+                }
                 s.history_count = crate::persist::history_count();
             }
             s.push_log(detail);

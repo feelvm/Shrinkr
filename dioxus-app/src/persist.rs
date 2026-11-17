@@ -556,7 +556,8 @@ fn history_store() -> &'static RwLock<History> {
 
 /// Record one or more successfully placed paths (source and output) in
 /// the ledger. Best-effort: unreadable files are simply not recorded.
-pub fn record_processed(paths: &[&Path]) {
+/// Returns whether the ledger changed (drives the History tab refresh).
+pub fn record_processed(paths: &[&Path]) -> bool {
     let now = now_ms();
     let mut changed = false;
     if let Ok(mut h) = history_store().write() {
@@ -567,6 +568,7 @@ pub fn record_processed(paths: &[&Path]) {
     if changed {
         HISTORY_DIRTY.store(true, Ordering::Relaxed);
     }
+    changed
 }
 
 /// True when the file has not changed since a recorded successful run.
@@ -579,6 +581,28 @@ pub fn was_processed(path: &Path) -> bool {
 
 pub fn history_count() -> usize {
     history_store().read().map(|h| h.len()).unwrap_or(0)
+}
+
+/// Every processed-file ledger entry, newest first. A snapshot for the
+/// History tab: the ledger itself stays keyed by path (that is what the
+/// skip gate looks up), while the view wants chronology.
+pub fn history_entries() -> Vec<HistoryEntry> {
+    history_store()
+        .read()
+        .map(|h| sorted_entries(&h))
+        .unwrap_or_default()
+}
+
+fn sorted_entries(history: &History) -> Vec<HistoryEntry> {
+    let mut entries: Vec<HistoryEntry> = history.entries.values().cloned().collect();
+    // Newest first; a path tie (source and output recorded in the same
+    // call) keeps a stable, readable order by path.
+    entries.sort_by(|a, b| {
+        b.processed_at_ms
+            .cmp(&a.processed_at_ms)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    entries
 }
 
 /// Forget every processed-file mark; the next scan treats all files as
@@ -1039,6 +1063,33 @@ mod tests {
         let loaded: History = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.len(), 3);
         assert!(loaded.entries.values().any(|e| e.path.ends_with("f1.mkv")));
+    }
+
+    #[test]
+    fn history_entries_are_newest_first() {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = History {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            entries: BTreeMap::new(),
+        };
+        // Recorded out of order so sorting, not insertion, decides.
+        for (name, at) in [("old.mkv", 100), ("newest.mkv", 300), ("middle.mkv", 200)] {
+            let p = d.path().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            assert!(h.record(&p, at));
+        }
+        let entries = sorted_entries(&h);
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| {
+                Path::new(&e.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(names, vec!["newest.mkv", "middle.mkv", "old.mkv"]);
+        assert_eq!(entries[0].processed_at_ms, 300);
     }
 
     #[test]

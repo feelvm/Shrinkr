@@ -29,7 +29,9 @@ automatically. Built in Rust on FFmpeg.
   offered on the next launch as a restored queue with Resume and Discard.
   Successfully shrunk files are fingerprinted by path, size and modified time
   so folder scans skip unchanged inputs instead of re-applying a lossy encode.
-  The sidebar's History card has the *Skip already-processed* toggle and Clear.
+  The **History** tab lists every processed file since installation with its
+  folder, size and age; the sidebar's History card keeps the *Skip
+  already-processed* toggle and Clear.
 
 ## Install
 
