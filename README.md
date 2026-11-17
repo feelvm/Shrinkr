@@ -58,6 +58,12 @@ needed for document conversion.
   installing. The bundled `ffmpeg`/`ffprobe` are pinned and checksum-verified
   builds (`FFMPEG-PINS.sha256`).
 
+> **Updating from v1.6.0 or earlier:** those builds shipped a broken in-app
+> updater — it saved the release archive under the GitHub asset id, so the
+> signature check rejected it as a plain file. Install **v1.6.1** once by
+> hand (installer or portable archive); in-app updates work from v1.6.1
+> onward.
+
 ## Quick start
 
 Launch Shrinkr, drop files or folders onto the window, and pick a tab:
