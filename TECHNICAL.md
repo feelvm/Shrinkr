@@ -695,8 +695,11 @@ The window refuses to close silently while anything runs (shrink, convert,
 optimize, update install): Windows asks in a native box before forwarding the
 close; macOS/Linux hide on the close attempt and resolve a native dialog
 through the pump. User settings (pipeline knobs, codec mutes, convert/optimize
-prefs, log filter) persist to `settings.json` in the app-data folder,
-debounced in the background and applied before the first render. GPU and
+prefs, log filter) persist to `settings.json` in the app-data folder: a
+background saver writes a debounced snapshot at most once per second, the
+close request and the final `LoopDestroyed` event flush it synchronously (so
+a setting picked right before quitting is still there on the next launch),
+and the file is applied before the first render. GPU and
 converter capability detection (ffmpeg trial encodes, `soffice --version`)
 runs on a warmup thread so the first paint never blocks on subprocesses, and
 plan computations (eligible files, goal segments, estimates) are cached behind

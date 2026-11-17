@@ -401,25 +401,29 @@ static QUEUE_PENDING: Mutex<Option<QueueSnapshot>> = Mutex::new(None);
 static QUEUE_DIRTY: AtomicBool = AtomicBool::new(false);
 static HISTORY: OnceLock<RwLock<History>> = OnceLock::new();
 static HISTORY_DIRTY: AtomicBool = AtomicBool::new(false);
+/// Serializes disk writes: the saver tick and an exit `flush` can run on
+/// different threads, and two writers racing over the same temp file
+/// could interleave into a torn snapshot.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Hand the latest settings snapshot to the saver thread. Cheap enough to
 /// call on every state change: it just overwrites the pending slot and
 /// sets a flag - the actual disk write happens at most once per saver
 /// tick.
 pub fn offer(settings: GuiSettings) {
-    if let Ok(mut slot) = PENDING.lock() {
-        *slot = Some(settings);
-        DIRTY.store(true, Ordering::Relaxed);
-    }
+    // Recover from a poisoned slot: the saver must keep working after a
+    // panic elsewhere, and the slot only holds one built value.
+    let mut slot = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    *slot = Some(settings);
+    DIRTY.store(true, Ordering::Relaxed);
 }
 
 /// Hand the latest queue snapshot to the saver. Empty snapshots remove
 /// the file, so a clean finish leaves no stale restore behind.
 pub fn offer_queue(snapshot: QueueSnapshot) {
-    if let Ok(mut slot) = QUEUE_PENDING.lock() {
-        *slot = Some(snapshot);
-        QUEUE_DIRTY.store(true, Ordering::Relaxed);
-    }
+    let mut slot = QUEUE_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    *slot = Some(snapshot);
+    QUEUE_DIRTY.store(true, Ordering::Relaxed);
 }
 
 /// Whether the next saver tick has something to write.
@@ -428,34 +432,104 @@ pub fn is_dirty() -> bool {
     DIRTY.load(Ordering::Relaxed)
 }
 
+/// Snapshots taken out of the pending slots, ready to be written. Taking
+/// clears the dirty flags, so a change offered while the write runs is
+/// re-flagged for the next tick instead of being dropped.
+struct PendingWrites {
+    settings: Option<GuiSettings>,
+    queue: Option<QueueSnapshot>,
+    history: Option<History>,
+}
+
+impl PendingWrites {
+    fn is_empty(&self) -> bool {
+        self.settings.is_none() && self.queue.is_none() && self.history.is_none()
+    }
+}
+
+fn take_pending() -> PendingWrites {
+    // A panic while a slot was held must not lose the last snapshot: the
+    // slot only ever holds one fully-built value, so a poisoned guard is
+    // still safe to read.
+    let settings = if DIRTY.swap(false, Ordering::Relaxed) {
+        PENDING.lock().unwrap_or_else(|e| e.into_inner()).take()
+    } else {
+        None
+    };
+    let queue = if QUEUE_DIRTY.swap(false, Ordering::Relaxed) {
+        QUEUE_PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    } else {
+        None
+    };
+    let history = if HISTORY_DIRTY.swap(false, Ordering::Relaxed) {
+        HISTORY
+            .get()
+            .map(|h| h.read().unwrap_or_else(|e| e.into_inner()).clone())
+    } else {
+        None
+    };
+    PendingWrites {
+        settings,
+        queue,
+        history,
+    }
+}
+
+/// Write one taken set of snapshots into `dir`. Every file keeps the
+/// temp-then-rename discipline, so a crash mid-write can only leave the
+/// previous snapshot behind.
+fn write_pending_in(dir: &Path, writes: PendingWrites) {
+    if let Some(settings) = writes.settings {
+        if let Ok(json) = serde_json::to_string_pretty(&settings) {
+            save_atomically(&dir.join("settings.json"), &json);
+        }
+    }
+    if let Some(queue) = writes.queue {
+        save_queue_to_path(&dir.join("queue.json"), &queue);
+    }
+    if let Some(history) = writes.history {
+        if let Ok(json) = serde_json::to_string_pretty(&history) {
+            save_atomically(&dir.join("history.json"), &json);
+        }
+    }
+}
+
+/// Write whatever is pending now, under the writer lock.
+fn write_pending_now() {
+    let Some(dir) = app_data_dir() else { return };
+    // A panic while a writer held the lock must not cost the user the
+    // final save; the write itself is atomic, so recovering is safe.
+    // Taking the lock before the take keeps "read the slots, write the
+    // files" atomic against another writer.
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let writes = take_pending();
+    if writes.is_empty() {
+        return;
+    }
+    write_pending_in(&dir, writes);
+}
+
 /// Saver loop: wake up once per second, write at most one snapshot per
 /// file. Runs for the process lifetime on a background thread.
 pub fn spawn_saver() {
     std::thread::spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
-        if DIRTY.swap(false, Ordering::Relaxed) {
-            let snapshot = PENDING.lock().ok().and_then(|mut slot| slot.take());
-            if let Some(settings) = snapshot {
-                if let Some(path) = settings_path() {
-                    if let Ok(json) = serde_json::to_string_pretty(&settings) {
-                        save_atomically(&path, &json);
-                    }
-                }
-            }
-        }
-        if QUEUE_DIRTY.swap(false, Ordering::Relaxed) {
-            let snapshot = QUEUE_PENDING.lock().ok().and_then(|mut slot| slot.take());
-            if let Some(snapshot) = snapshot {
-                save_queue_to_disk(&snapshot);
-            }
-        }
-        if HISTORY_DIRTY.swap(false, Ordering::Relaxed) {
-            let snapshot = history_store().read().ok().map(|h| h.clone());
-            if let Some(history) = snapshot {
-                save_history_to_disk(&history);
-            }
-        }
+        write_pending_now();
     });
+}
+
+/// Write every pending snapshot to disk right now. Called on the exit
+/// paths (window close, restart, panic): the background saver writes at
+/// most once per second, so without this the last changes a user made
+/// before closing the app died with the process — "I picked these
+/// settings, closed it, and they were back to defaults on the next
+/// launch". Best-effort: an unwritable folder just leaves the file as it
+/// was.
+pub fn flush() {
+    write_pending_now();
 }
 
 fn history_store() -> &'static RwLock<History> {
@@ -574,7 +648,11 @@ fn save_atomically(path: &std::path::Path, json: &str) {
 
 /// Load the saved settings (None on first run / unreadable file).
 pub fn load() -> Option<GuiSettings> {
-    let text = std::fs::read_to_string(settings_path()?).ok()?;
+    load_settings_from_path(&settings_path()?)
+}
+
+fn load_settings_from_path(path: &Path) -> Option<GuiSettings> {
+    let text = std::fs::read_to_string(path).ok()?;
     let s: GuiSettings = serde_json::from_str(&text).ok()?;
     // A future schema version may change a field's meaning; refuse the
     // whole file rather than misread it.
@@ -600,14 +678,13 @@ fn load_queue_from_path(path: &Path) -> Option<QueueSnapshot> {
     Some(snap)
 }
 
-fn save_queue_to_disk(snapshot: &QueueSnapshot) {
-    let Some(path) = queue_path() else { return };
+fn save_queue_to_path(path: &Path, snapshot: &QueueSnapshot) {
     if snapshot.is_empty() {
         let _ = std::fs::remove_file(path);
         return;
     }
     if let Ok(json) = serde_json::to_string_pretty(snapshot) {
-        save_atomically(&path, &json);
+        save_atomically(path, &json);
     }
 }
 
@@ -619,13 +696,6 @@ fn load_history_from_disk() -> Option<History> {
         return None;
     }
     Some(h)
-}
-
-fn save_history_to_disk(history: &History) {
-    let Some(path) = history_path() else { return };
-    if let Ok(json) = serde_json::to_string_pretty(history) {
-        save_atomically(&path, &json);
-    }
 }
 
 #[cfg(test)]
@@ -672,6 +742,15 @@ mod tests {
             threshold_policy: shrinkr_core::pipeline::ThresholdPolicy::Warn,
             extra_args: vec![],
         }
+    }
+
+    /// The pending slots are process-global; these tests mutate them and
+    /// must not interleave (a parallel `offer` would land between an
+    /// assert and its take).
+    static PENDING_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn pending_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        PENDING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -767,9 +846,76 @@ mod tests {
 
     #[test]
     fn offer_flags_dirty_until_taken() {
+        let _guard = pending_test_guard();
         offer(collect(&AppState::default()));
         assert!(is_dirty());
         DIRTY.store(false, Ordering::Relaxed);
+    }
+
+    /// The exit path: whatever the user picked last must already be in
+    /// the pending slot, and `flush` must write it without waiting for
+    /// the saver tick. This is the "close the app, settings intact"
+    /// guarantee.
+    #[test]
+    fn flush_writes_the_latest_snapshot_before_exit() {
+        let _guard = pending_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let s = AppState {
+            cq: 34,
+            backend: shrinkr_core::pipeline::VideoBackend::CpuX265,
+            preserve_quality: false,
+            replace: true,
+            parallel: 3,
+            ..Default::default()
+        };
+        offer(collect(&s));
+
+        let writes = take_pending();
+        assert!(
+            !writes.is_empty(),
+            "an offered snapshot must survive into the flush"
+        );
+        write_pending_in(dir.path(), writes);
+
+        let loaded = load_settings_from_path(&dir.path().join("settings.json"))
+            .expect("flush wrote a loadable settings.json");
+        assert_eq!(loaded.cq, 34);
+        assert_eq!(
+            loaded.backend,
+            shrinkr_core::pipeline::VideoBackend::CpuX265
+        );
+        assert!(!loaded.preserve_quality);
+        assert!(loaded.replace, "the last picked toggle is restored");
+        assert_eq!(loaded.parallel, 3);
+
+        // Taking twice writes nothing: the flush does not rewrite a file
+        // the saver already handled.
+        assert!(take_pending().is_empty());
+    }
+
+    /// A change offered while a write is running must be re-flagged, not
+    /// lost with the snapshots the write already took.
+    #[test]
+    fn changes_offered_after_a_take_are_written_next_time() {
+        let _guard = pending_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        offer(collect(&AppState::default()));
+        let first = take_pending();
+        assert!(first.settings.is_some());
+        // The user moves another knob while the write runs.
+        let s = AppState {
+            image_cq: 36,
+            ..Default::default()
+        };
+        offer(collect(&s));
+
+        write_pending_in(dir.path(), first);
+        let second = take_pending();
+        assert!(second.settings.is_some());
+        write_pending_in(dir.path(), second);
+
+        let loaded = load_settings_from_path(&dir.path().join("settings.json")).unwrap();
+        assert_eq!(loaded.image_cq, 36);
     }
 
     #[test]

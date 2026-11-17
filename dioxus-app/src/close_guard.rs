@@ -79,6 +79,12 @@ mod win {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> isize {
+        if msg == WM_CLOSE {
+            // The window is going away: write the last-used settings now
+            // rather than trusting the debounced saver to fire before the
+            // process exits. Harmless if the close is later cancelled.
+            crate::persist::flush();
+        }
         if msg == WM_CLOSE && is_busy() {
             // One dialog at a time; further close clicks while it is open
             // are swallowed instead of stacking.

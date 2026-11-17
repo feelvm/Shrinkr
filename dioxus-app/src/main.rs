@@ -55,6 +55,9 @@ fn main() {
     // process dies. This is what makes "it just closes, no logs" diagnosable.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // The debounced saver may still be sleeping on the user's last
+        // change; keep it before the process goes down.
+        crate::persist::flush();
         let bt = std::backtrace::Backtrace::force_capture();
         shrinkr_core::log::to_file(&format!("PANIC: {info}\n{bt}"));
         default_hook(info);
@@ -88,6 +91,9 @@ fn main() {
         Some(dir) => config.with_data_directory(dir),
         None => config,
     };
+    // The desktop event loop calls `process::exit` when it ends, so this
+    // call never returns; the last-used settings are written by the
+    // close/`LoopDestroyed` event handler in `App`.
     dioxus::LaunchBuilder::desktop()
         .with_cfg(config)
         .launch(App);
@@ -229,22 +235,27 @@ const SLIDER_CSS: &str = include_str!("../assets/slider.css");
 
 #[component]
 fn App() -> Element {
-    // Load persisted settings before the first render (file read, not a
-    // subprocess — cheap enough for the first paint to stay fast).
-    let restored_queue = persist::load_queue();
-    let mut initial = AppState::default();
-    if let Some(saved) = persist::load() {
-        saved.apply(&mut initial);
-    }
-    initial.history_count = persist::history_count();
-    if let Some(snapshot) = &restored_queue {
-        initial.queue_restoring = true;
-        initial.push_log(format!(
-            "Restoring {} unfinished file(s) from the previous session.",
-            snapshot.file_count()
-        ));
-    }
-    let mut state = use_signal(move || initial);
+    // Load the persisted state once, before the first render (file reads,
+    // not subprocesses — cheap enough for the first paint to stay fast).
+    // Both loads happen in hooks: the disk is touched on the first render
+    // only, not on every re-render this component goes through.
+    let restored_queue = use_hook(persist::load_queue);
+    let queue_for_initial = restored_queue.clone();
+    let mut state = use_signal(move || {
+        let mut initial = AppState::default();
+        if let Some(saved) = persist::load() {
+            saved.apply(&mut initial);
+        }
+        initial.history_count = persist::history_count();
+        if let Some(snapshot) = &queue_for_initial {
+            initial.queue_restoring = true;
+            initial.push_log(format!(
+                "Restoring {} unfinished file(s) from the previous session.",
+                snapshot.file_count()
+            ));
+        }
+        initial
+    });
     use_context_provider(|| state);
     let pump = use_coroutine(move |mut rx: UnboundedReceiver<JobMsg>| async move {
         while let Some(m) = rx.next().await {
@@ -254,6 +265,9 @@ fn App() -> Element {
                 let ctx = dioxus::desktop::window();
                 use dioxus::desktop::WindowCloseBehaviour;
                 if quit {
+                    // The settings saver is debounced; closing right
+                    // after a change must still keep that change.
+                    persist::flush();
                     ctx.set_close_behavior(WindowCloseBehaviour::WindowCloses);
                     ctx.close();
                 } else {
@@ -329,23 +343,43 @@ fn App() -> Element {
             });
         }
     });
-    // macOS/Linux: tao's close request can't be prevented synchronously,
-    // so observe it and ask on a worker thread — the "hide while busy"
+    // Every platform: a close request is the last moment the live state
+    // is readable, so snapshot the settings and write them before the
+    // window can go away. `LoopDestroyed` is the final event before tao
+    // calls `process::exit` (desktop `launch` never returns), which is
+    // the last chance to persist. This is what guarantees "I picked it,
+    // closed it, and it is still there on the next launch": the
+    // background saver is debounced and the settings effect can still be
+    // a frame behind.
+    //
+    // macOS/Linux also ask here before closing a busy app: tao's close
+    // request can't be prevented synchronously, so the "hide while busy"
     // behaviour set above keeps the window alive until the pump receives
     // the answer.
-    #[cfg(not(target_os = "windows"))]
     {
+        use dioxus::desktop::tao::event::{Event, WindowEvent};
+        let s = state;
+        #[cfg(not(target_os = "windows"))]
         let tx = pump.tx();
-        dioxus::desktop::use_wry_event_handler(move |event, _target| {
-            if let dioxus::desktop::tao::event::Event::WindowEvent {
-                event: dioxus::desktop::tao::event::WindowEvent::CloseRequested { .. },
+        dioxus::desktop::use_wry_event_handler(move |event, _target| match event {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested { .. },
                 ..
-            } = event
-            {
+            } => {
+                // peek: the event handler is not a reactive context, and a
+                // close must not register the whole state as a dependency.
+                persist::offer(persist::collect(&s.peek()));
+                persist::flush();
+                #[cfg(not(target_os = "windows"))]
                 if close_guard::should_intercept() {
                     close_guard::spawn_confirm_dialog(tx.clone());
                 }
             }
+            // The close request already snapshotted the live state; this
+            // only makes sure the (debounced) write has happened before
+            // tao replaces the process.
+            Event::LoopDestroyed => persist::flush(),
+            _ => {}
         });
     }
     // Windows-only: intercept the main window's WM_CLOSE while busy.
@@ -494,6 +528,9 @@ fn Header() -> Element {
                     Button {
                         variant: ButtonVariant::Default,
                         onclick: move |_| {
+                            // restart_now exits this process; don't lose
+                            // the knobs changed since the last saver tick.
+                            crate::persist::flush();
                             if let Err(e) = shrinkr_core::update::restart_now() {
                                 state.write().push_log(format!("ERROR: restart failed: {e:#}"));
                             }
