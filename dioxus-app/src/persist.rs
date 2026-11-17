@@ -15,9 +15,11 @@
 //!   waiting segment. Written while work is in flight; on the next launch
 //!   it is re-probed and restored as a paused queue (`Resume queue`).
 //! * `history.json` - a bounded ledger of processed inputs keyed by path,
-//!   size and modified time. Scans can skip files that have not changed
-//!   since a run instead of re-applying a lossy encode. The GUI exposes a
-//!   toggle and a clear button; the ledger is advisory, never destructive.
+//!   size and modified time, plus the lifetime bytes those placements
+//!   removed (`source - output`, summed per run). Scans can skip files
+//!   that have not changed since a run instead of re-applying a lossy
+//!   encode; the History tab reads both the ledger and the total. The
+//!   ledger is advisory, never destructive.
 
 use crate::state::{AppState, ExecCfg, PendingSegment};
 use serde::{Deserialize, Serialize};
@@ -312,11 +314,30 @@ pub struct HistoryEntry {
 pub struct History {
     pub schema_version: u32,
     pub entries: BTreeMap<String, HistoryEntry>,
+    /// Lifetime bytes removed by verified placements (`source - output`),
+    /// summed across every successful run since installation. Kept apart
+    /// from `entries` so clearing the skip ledger never rewinds the
+    /// History tab's counter.
+    pub saved_bytes: u64,
 }
 
 impl History {
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Add one run's compression gain. Saturating: a corrupted file must
+    /// not wrap the lifetime counter.
+    pub fn add_saved(&mut self, bytes: u64) {
+        self.schema_version = HISTORY_SCHEMA_VERSION;
+        self.saved_bytes = self.saved_bytes.saturating_add(bytes);
+    }
+
+    /// Forget the skip ledger's marks but keep the lifetime counter (the
+    /// History tab reports "since installation", not "since last clear").
+    pub fn clear_entries(&mut self) {
+        self.entries.clear();
+        self.schema_version = HISTORY_SCHEMA_VERSION;
     }
 
     /// Record one path if its metadata can be read. The ledger key is the
@@ -555,14 +576,20 @@ fn history_store() -> &'static RwLock<History> {
 }
 
 /// Record one or more successfully placed paths (source and output) in
-/// the ledger. Best-effort: unreadable files are simply not recorded.
-/// Returns whether the ledger changed (drives the History tab refresh).
-pub fn record_processed(paths: &[&Path]) -> bool {
+/// the ledger and add this run's compression gain to the lifetime
+/// counter. Best-effort: unreadable files are simply not recorded (the
+/// gain still counts — the output was placed). Returns whether the
+/// ledger changed (drives the History tab refresh).
+pub fn record_processed(paths: &[&Path], saved_bytes: u64) -> bool {
     let now = now_ms();
     let mut changed = false;
     if let Ok(mut h) = history_store().write() {
         for p in paths {
             changed |= h.record(p, now);
+        }
+        if saved_bytes > 0 {
+            h.add_saved(saved_bytes);
+            changed = true;
         }
     }
     if changed {
@@ -581,6 +608,12 @@ pub fn was_processed(path: &Path) -> bool {
 
 pub fn history_count() -> usize {
     history_store().read().map(|h| h.len()).unwrap_or(0)
+}
+
+/// Lifetime bytes removed by every successful placement since
+/// installation. Only grows; clearing the ledger leaves it alone.
+pub fn history_saved_bytes() -> u64 {
+    history_store().read().map(|h| h.saved_bytes).unwrap_or(0)
 }
 
 /// Every processed-file ledger entry, newest first. A snapshot for the
@@ -606,11 +639,10 @@ fn sorted_entries(history: &History) -> Vec<HistoryEntry> {
 }
 
 /// Forget every processed-file mark; the next scan treats all files as
-/// fresh inputs.
+/// fresh inputs. The lifetime saved-bytes counter is untouched.
 pub fn clear_history() {
     if let Ok(mut h) = history_store().write() {
-        h.entries.clear();
-        h.schema_version = HISTORY_SCHEMA_VERSION;
+        h.clear_entries();
     }
     HISTORY_DIRTY.store(true, Ordering::Relaxed);
 }
@@ -1052,7 +1084,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut h = History {
             schema_version: HISTORY_SCHEMA_VERSION,
-            entries: BTreeMap::new(),
+            ..Default::default()
         };
         for i in 0..3 {
             let p = d.path().join(format!("f{i}.mkv"));
@@ -1070,7 +1102,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut h = History {
             schema_version: HISTORY_SCHEMA_VERSION,
-            entries: BTreeMap::new(),
+            ..Default::default()
         };
         // Recorded out of order so sorting, not insertion, decides.
         for (name, at) in [("old.mkv", 100), ("newest.mkv", 300), ("middle.mkv", 200)] {
@@ -1090,6 +1122,31 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["newest.mkv", "middle.mkv", "old.mkv"]);
         assert_eq!(entries[0].processed_at_ms, 300);
+    }
+
+    #[test]
+    fn saved_bytes_accumulate_survive_clearing_and_old_files_load_zero() {
+        let mut h = History {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            ..Default::default()
+        };
+        h.add_saved(1_500);
+        h.add_saved(2_000);
+        assert_eq!(h.saved_bytes, 3_500);
+
+        // Clearing the skip ledger must not rewind the lifetime counter.
+        h.clear_entries();
+        assert!(h.entries.is_empty());
+        assert_eq!(h.saved_bytes, 3_500);
+
+        // Files written before the counter existed still load (as zero).
+        let legacy: History = serde_json::from_str(r#"{"schema_version":1,"entries":{}}"#).unwrap();
+        assert_eq!(legacy.saved_bytes, 0);
+
+        // The counter round-trips with the rest of the ledger.
+        let json = serde_json::to_string(&h).unwrap();
+        let loaded: History = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.saved_bytes, 3_500);
     }
 
     #[test]

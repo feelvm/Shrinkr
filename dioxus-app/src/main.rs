@@ -3814,19 +3814,7 @@ fn HistoryCard() -> Element {
     });
     let all = entries.read();
     let total = all.len();
-    if total == 0 {
-        return rsx! {
-            Card {
-                CardHeader { CardTitle { "Processed files" } }
-                CardContent {
-                    Empty {
-                        EmptyTitle { "Nothing processed yet" }
-                    }
-                }
-            }
-        };
-    }
-    let total_bytes: u64 = all.iter().map(|e| e.size).sum();
+    let saved = persist::history_saved_bytes();
     let win = list_window(total, top_row(), HISTORY_ROWS_VISIBLE, HISTORY_ROW_H);
     // Two 1px borders shrink the content box; add them so a full row set
     // fits without showing a sliver of the next one.
@@ -3858,74 +3846,89 @@ fn HistoryCard() -> Element {
         })
         .collect();
     drop(all);
+    let saved_label = human_bytes(saved);
     let header_count = format!("{total} file(s)");
-    let header_bytes = human_bytes(total_bytes);
     rsx! {
         Card {
             CardHeader {
-                div { class: "flex w-full items-center justify-between gap-3",
-                    CardTitle { "Processed files" }
-                    div { class: "flex items-center gap-2",
-                        span { class: "text-xs text-muted-foreground tabular-nums",
-                            "{header_count} · {header_bytes}"
+                div { class: "flex w-full items-end justify-between gap-4",
+                    div { class: "flex flex-col gap-1",
+                        span { class: "text-sm text-muted-foreground",
+                            "Space saved since installation"
                         }
-                        Button {
-                            variant: ButtonVariant::Ghost,
-                            class: "h-7 px-2 text-xs",
-                            onclick: move |_| clear_history_clicked(state),
-                            "Clear"
+                        span { class: "text-3xl font-bold leading-none tabular-nums text-green-300",
+                            "{saved_label}"
+                        }
+                    }
+                    if total > 0 {
+                        div { class: "flex items-center gap-2",
+                            span { class: "text-xs text-muted-foreground tabular-nums",
+                                "{header_count}"
+                            }
+                            Button {
+                                variant: ButtonVariant::Ghost,
+                                class: "h-7 px-2 text-xs",
+                                onclick: move |_| clear_history_clicked(state),
+                                "Clear"
+                            }
                         }
                     }
                 }
             }
             CardContent {
-                div { class: "flex items-center gap-3 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground",
-                    span { class: "min-w-0 flex-1", "File" }
-                    span { class: "hidden w-56 shrink-0 lg:block", "Folder" }
-                    span { class: "w-20 shrink-0 text-right", "Size" }
-                    span { class: "w-24 shrink-0 text-right", "Processed" }
-                }
-                div {
-                    id: "history-list",
-                    class: "overflow-y-auto rounded-md border border-border",
-                    style: "height: {list_height}px",
-                    onscroll: move |_| {
-                        spawn(async move {
-                            let script = format!(
-                                "const el = document.getElementById('history-list'); \
-                                 if (!el) {{ dioxus.send(0); }} else {{ \
-                                 dioxus.send(Math.floor(el.scrollTop / {HISTORY_ROW_H})); }}"
-                            );
-                            let mut eval = document::eval(&script);
-                            if let Ok(row) = eval.recv::<usize>().await {
-                                if *top_row.peek() != row {
-                                    top_row.set(row);
+                if total == 0 {
+                    Empty {
+                        EmptyTitle { "Nothing processed yet" }
+                    }
+                } else {
+                    div { class: "flex items-center gap-3 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground",
+                        span { class: "min-w-0 flex-1", "File" }
+                        span { class: "hidden w-56 shrink-0 lg:block", "Folder" }
+                        span { class: "w-20 shrink-0 text-right", "Size" }
+                        span { class: "w-24 shrink-0 text-right", "Processed" }
+                    }
+                    div {
+                        id: "history-list",
+                        class: "overflow-y-auto rounded-md border border-border",
+                        style: "height: {list_height}px",
+                        onscroll: move |_| {
+                            spawn(async move {
+                                let script = format!(
+                                    "const el = document.getElementById('history-list'); \
+                                     if (!el) {{ dioxus.send(0); }} else {{ \
+                                     dioxus.send(Math.floor(el.scrollTop / {HISTORY_ROW_H})); }}"
+                                );
+                                let mut eval = document::eval(&script);
+                                if let Ok(row) = eval.recv::<usize>().await {
+                                    if *top_row.peek() != row {
+                                        top_row.set(row);
+                                    }
+                                }
+                            });
+                        },
+                        div { style: "height: {win.pad_top}px" }
+                        for (name , folder , tooltip , size , age) in rows {
+                            div {
+                                class: "flex items-center gap-3 overflow-hidden border-b border-border px-3 last:border-b-0",
+                                style: "height: {HISTORY_ROW_H}px",
+                                span {
+                                    class: "min-w-0 flex-1 truncate font-mono text-xs",
+                                    title: "{tooltip}",
+                                    "{name}"
+                                }
+                                span { class: "hidden w-56 shrink-0 truncate text-xs text-muted-foreground lg:block",
+                                    "{folder}"
+                                }
+                                span { class: "w-20 shrink-0 text-right text-xs tabular-nums",
+                                    "{human_bytes(size)}"
+                                }
+                                span { class: "w-24 shrink-0 text-right text-xs text-muted-foreground tabular-nums",
+                                    "{age}"
                                 }
                             }
-                        });
-                    },
-                    div { style: "height: {win.pad_top}px" }
-                    for (name , folder , tooltip , size , age) in rows {
-                        div {
-                            class: "flex items-center gap-3 overflow-hidden border-b border-border px-3 last:border-b-0",
-                            style: "height: {HISTORY_ROW_H}px",
-                            span {
-                                class: "min-w-0 flex-1 truncate font-mono text-xs",
-                                title: "{tooltip}",
-                                "{name}"
-                            }
-                            span { class: "hidden w-56 shrink-0 truncate text-xs text-muted-foreground lg:block",
-                                "{folder}"
-                            }
-                            span { class: "w-20 shrink-0 text-right text-xs tabular-nums",
-                                "{human_bytes(size)}"
-                            }
-                            span { class: "w-24 shrink-0 text-right text-xs text-muted-foreground tabular-nums",
-                                "{age}"
-                            }
                         }
+                        div { style: "height: {win.pad_bottom}px" }
                     }
-                    div { style: "height: {win.pad_bottom}px" }
                 }
             }
         }

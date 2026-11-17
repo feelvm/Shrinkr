@@ -86,6 +86,10 @@ pub enum JobMsg {
     ExecFileDone {
         job: usize,
         detail: String,
+        /// Bytes this run removed from the source file: `source - output`
+        /// when the result was smaller, 0 otherwise. Independent of
+        /// `replace` (keeping the original still shrank the working copy).
+        saved_bytes: u64,
         /// Final path written (== source when replacement was requested).
         dest: PathBuf,
     },
@@ -395,6 +399,12 @@ pub fn start_queue_restore(tx: UnboundedSender<JobMsg>, snapshot: crate::persist
 /// outcomes - only `Err` is a failure.
 enum JobOutcome {
     Placed {
+        /// Byte difference of the source and the written output, clamped
+        /// at 0. Every placed result is smaller (the no-gain guard keeps
+        /// larger encodes out), except deliberate audio-only passes.
+        gain: u64,
+        /// Space actually freed on disk: 0 unless the original was
+        /// replaced. Runs the batch summary.
         saved: i64,
         detail: String,
         /// Final path written (== source when replace was requested).
@@ -712,6 +722,7 @@ fn run_one_job(
         }
     }
     Ok(JobOutcome::Placed {
+        gain: f.bytes.saturating_sub(er.output_bytes),
         saved,
         detail,
         dest,
@@ -793,6 +804,7 @@ fn run_one_image_job(
         }
     );
     Ok(JobOutcome::Placed {
+        gain: f.bytes.saturating_sub(res.output_bytes),
         saved,
         detail,
         dest,
@@ -910,6 +922,7 @@ pub fn start_exec(
                     &cancel,
                 ) {
                     Ok(JobOutcome::Placed {
+                        gain,
                         saved,
                         detail,
                         dest,
@@ -920,6 +933,7 @@ pub fn start_exec(
                             JobMsg::ExecFileDone {
                                 job: i,
                                 detail,
+                                saved_bytes: gain,
                                 dest,
                             },
                         );
@@ -2215,15 +2229,22 @@ fn apply_msg_inner(s: &mut AppState, msg: JobMsg) {
             }
             s.push_log(format!("Checking picture and audio quality for {name}…"));
         }
-        JobMsg::ExecFileDone { job, detail, dest } => {
+        JobMsg::ExecFileDone {
+            job,
+            detail,
+            saved_bytes,
+            dest,
+        } => {
             if let Some(item) = s.exec_items.get_mut(job) {
                 item.done = true;
                 item.frac = 1.0;
             }
             // Remember the source and the written output by fingerprint:
-            // a rescan of either should not re-apply a lossy encode.
+            // a rescan of either should not re-apply a lossy encode. The
+            // run's compression gain joins the lifetime counter while the
+            // same lock is held.
             if let Some(src) = s.exec_items.get(job).map(|i| i.path.clone()) {
-                if crate::persist::record_processed(&[src.as_path(), dest.as_path()]) {
+                if crate::persist::record_processed(&[src.as_path(), dest.as_path()], saved_bytes) {
                     s.history_revision = s.history_revision.wrapping_add(1);
                 }
                 s.history_count = crate::persist::history_count();

@@ -597,7 +597,9 @@ Each pipeline tab owns its import strip, settings, and start button; the
 sidebar holds the shared library and history plus the active run's
 progress, pause/cancel, and queued work. The **History** tab renders the
 processed-file ledger newest-first — name, folder, size and age, with the
-exact UTC stamp in the row tooltip; rows are windowed because a long-lived
+exact UTC stamp in the row tooltip — over a lifetime "space saved" total
+(`source - output` summed for every successful placement, persisted with
+the ledger and kept across Clear); rows are windowed because a long-lived
 installation can hold thousands of entries. Only one pipeline owns the
 workers at a time: an optimize batch started while the shrink queue is
 running waits behind it with its own settings snapshot and starts when

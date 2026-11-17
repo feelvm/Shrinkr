@@ -30,8 +30,8 @@ automatically. Built in Rust on FFmpeg.
   Successfully shrunk files are fingerprinted by path, size and modified time
   so folder scans skip unchanged inputs instead of re-applying a lossy encode.
   The **History** tab lists every processed file since installation with its
-  folder, size and age; the sidebar's History card keeps the *Skip
-  already-processed* toggle and Clear.
+  folder, size and age, plus the total space those runs saved; the sidebar's
+  History card keeps the *Skip already-processed* toggle and Clear.
 
 ## Install
 
