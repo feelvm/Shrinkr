@@ -5,16 +5,15 @@
 
 .DESCRIPTION
     Compiles the GUI and CLI in release mode, stages them next to the
-    bundled FFmpeg sidecars, FFMPEG-NOTES.txt and LICENSE, and runs the
-    Inno Setup compiler on installer/windows/shrinkr.iss.
+    bundled FFmpeg sidecars, FFMPEG-NOTES.txt and LICENSE, and builds the
+    native Rust setup from installer/windows (setup + uninstaller). No
+    external installer toolchain is required.
 
     FFmpeg is downloaded from the same BtbN build the release workflow
     uses and cached under target/installer/ffmpeg, so repeated runs are
     offline. Pass -FfmpegDir to reuse a directory that already contains
     ffmpeg.exe and ffprobe.exe (the release workflow passes its sidecars
     folder).
-
-    Requires Inno Setup 6+:  winget install JRSoftware.InnoSetup
 
 .PARAMETER Version
     Installer version. Defaults to the `shrinkr` package version in
@@ -110,26 +109,6 @@ function Find-FfmpegExes([string]$Dir) {
         Ffmpeg  = $ffmpeg.FullName
         Ffprobe = $ffprobe.FullName
     }
-}
-
-function Find-Iscc {
-    $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
-    $candidates = @(
-        $env:ISCC,
-        (Get-Command iscc.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
-        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
-        (Join-Path $env:ProgramFiles 'Inno Setup 7\ISCC.exe'),
-        $(if ($programFilesX86) { Join-Path $programFilesX86 'Inno Setup 6\ISCC.exe' }),
-        $(if ($programFilesX86) { Join-Path $programFilesX86 'Inno Setup 7\ISCC.exe' }),
-        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe')
-    )
-    foreach ($candidate in $candidates) {
-        if ($candidate -and (Test-Path -LiteralPath $candidate)) {
-            return $candidate
-        }
-    }
-    throw 'Inno Setup compiler (ISCC.exe) not found. Install it with: winget install JRSoftware.InnoSetup'
 }
 
 if (-not $Version) {
@@ -230,23 +209,32 @@ Get-ChildItem -LiteralPath $staging | ForEach-Object {
     Write-Host ('    {0,-18} {1,8:N1} MB' -f $_.Name, ($_.Length / 1MB))
 }
 
-$iscc = Find-Iscc
-$script = Join-Path $PSScriptRoot 'shrinkr.iss'
-Write-Host "==> Compiling installer with Inno Setup"
-$isccArgs = @(
-    "/DAppVersion=$Version",
-    "/DNumericVersion=$numericVersion",
-    "/DFileVersion=$fileVersion",
-    "/DStagingDir=$staging",
-    "/DOutputDir=$OutputDir",
-    $script
-)
-& $iscc @isccArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "Inno Setup failed with exit code $LASTEXITCODE"
+$installerRoot = Join-Path $RepoRoot 'installer\windows'
+$installerManifest = Join-Path $installerRoot 'Cargo.toml'
+$installerTarget = Join-Path $installerRoot 'target\release'
+$uninstaller = Join-Path $installerTarget 'shrinkr-uninstaller.exe'
+$setupBinary = Join-Path $installerTarget 'shrinkr-setup.exe'
+
+$env:SHRINKR_VERSION = $Version
+$env:SHRINKR_STAGING_DIR = $staging
+$env:SHRINKR_UNINSTALLER = $uninstaller
+Write-Host '==> Building native setup'
+Push-Location $RepoRoot
+try {
+    & cargo build --release --locked --manifest-path $installerManifest -p shrinkr-uninstaller
+    if ($LASTEXITCODE -ne 0) {
+        throw "building the uninstaller failed with exit code $LASTEXITCODE"
+    }
+    & cargo build --release --locked --manifest-path $installerManifest -p shrinkr-setup
+    if ($LASTEXITCODE -ne 0) {
+        throw "building the setup failed with exit code $LASTEXITCODE"
+    }
+} finally {
+    Pop-Location
 }
 
 $setup = Join-Path $OutputDir "Shrinkr-Setup-$fileVersion-x64.exe"
+Copy-Item -LiteralPath $setupBinary -Destination $setup -Force
 if (-not (Test-Path -LiteralPath $setup)) {
     throw "expected installer was not produced: $setup"
 }

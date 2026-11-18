@@ -203,11 +203,9 @@ jobs:
       # asset (matched by target triple), while the setup exe is the
       # user-facing Windows install. Its name deliberately omits the
       # triple so the updater can never select it by mistake.
-      - name: Install Inno Setup (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: choco install innosetup -y --no-progress
-
+      # The setup exe is a native Rust binary built by the same PowerShell
+      # script from the release binaries and pinned sidecars; no external
+      # installer toolchain is installed on the runner.
       - name: Build Windows installer
         if: runner.os == 'Windows'
         shell: pwsh

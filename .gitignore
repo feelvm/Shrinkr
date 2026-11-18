@@ -3,3 +3,5 @@
 /dist
 /.pins-tmp
 /signing
+
+/installer/windows/target

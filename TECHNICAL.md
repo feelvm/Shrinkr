@@ -649,8 +649,8 @@ The release workflow builds:
 - Windows x64, macOS Apple Silicon, and Linux x64 release binaries (GUI + CLI);
 - `shrinkr-<target-triple>.zip` archives containing both binaries, `ffmpeg`,
   `ffprobe`, `FFMPEG-NOTES.txt`, and `LICENSE`;
-- `Shrinkr-Setup-<version>-x64.exe` (Inno Setup) for Windows, which shows the
-  GPL-3.0 license page and installs `LICENSE` next to the binaries;
+- `Shrinkr-Setup-<version>-x64.exe`, a native Rust setup for Windows, which
+  installs `LICENSE` next to the binaries;
 - `shrinkr-<target-triple>.dmg` for macOS, with `LICENSE` in
   `Contents/Resources`.
 
@@ -682,7 +682,7 @@ The Windows installer exists as a separate asset whose name omits the target
 triple, so the updater can never select it by mistake. It is built from the
 same release binaries and pinned sidecars before the release is published, so
 a broken installer fails the tag build instead of shipping a release without
-one. CI also builds it on every master push (Inno Setup via Chocolatey) and
+one. CI also builds it on every master push (the native Rust setup) and
 uploads `shrinkr-windows-installer` as a workflow artifact, which catches
 installer breakage before a tag.
 

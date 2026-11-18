@@ -119,9 +119,9 @@ cargo build --release -p shrinkr
 cargo build --release -p shrinkr-cli
 ```
 
-Binaries land in `target/release/`. For the Windows installer, install
-[Inno Setup 6](https://jrsoftware.org/isinfo.php) and run
-`./installer/windows/build-installer.ps1`.
+Binaries land in `target/release/`. For the Windows installer, run
+`./installer/windows/build-installer.ps1`; it builds the native setup exe and
+its uninstaller from `installer/windows` (no Inno Setup required).
 
 ## Project layout
 

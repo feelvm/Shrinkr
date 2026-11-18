@@ -63,7 +63,7 @@ jobs:
 
   # The Windows installer is a first-class download: it sits next to the
   # portable zip in every release. Release tags are cut from master, so
-  # building it on every master push means a broken installer (.iss,
+  # building it on every master push means a broken installer (setup source,
   # staging, bundled license) fails CI before it can reach a release,
   # and the run's artifact is a testable preview of the same setup
   # users download. Not built for pull_request: that would double every
@@ -75,6 +75,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - name: Build GUI and CLI (release)
         run: cargo build --release -p shrinkr -p shrinkr-cli
@@ -102,8 +104,8 @@ jobs:
           Copy-Item (Get-ChildItem -Recurse ffmpeg-build -Filter ffmpeg.exe | Select-Object -First 1).FullName sidecars/ffmpeg.exe
           Copy-Item (Get-ChildItem -Recurse ffmpeg-build -Filter ffprobe.exe | Select-Object -First 1).FullName sidecars/ffprobe.exe
 
-      - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
+      - name: Check installer formatting
+        run: cargo fmt --manifest-path installer/windows/Cargo.toml --all --check
 
       - name: Build installer
         shell: pwsh
@@ -112,6 +114,52 @@ jobs:
             -SkipBuild `
             -FfmpegDir sidecars `
             -OutputDir .
+
+      - name: Exercise install and uninstall
+        shell: pwsh
+        run: |
+          function Start-And-Wait($file, $argLine) {
+            $info = New-Object System.Diagnostics.ProcessStartInfo
+            $info.FileName = $file
+            $info.Arguments = $argLine
+            $info.UseShellExecute = $false
+            $process = [System.Diagnostics.Process]::Start($info)
+            if (-not $process.WaitForExit(180000)) {
+              $process.Kill()
+              throw "timed out: $file $argLine"
+            }
+            return $process.ExitCode
+          }
+
+          $setup = (Resolve-Path "installer/windows/target/release/shrinkr-setup.exe").Path
+          $dir = Join-Path $env:RUNNER_TEMP "shrinkr install test"
+          $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{4D8134AB-7963-468F-82AC-FCB570190ED3}"
+          $lnk = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Shrinkr.lnk"
+          $desktop = Join-Path $env:USERPROFILE "Desktop\Shrinkr.lnk"
+
+          $code = Start-And-Wait $setup "/S `"/D=$dir`""
+          if ($code -ne 0) { throw "setup exited with $code" }
+          foreach ($name in @("shrinkr.exe", "shrinkr-cli.exe", "ffmpeg.exe", "ffprobe.exe", "FFMPEG-NOTES.txt", "LICENSE", "uninstall.exe")) {
+            if (-not (Test-Path (Join-Path $dir $name))) { throw "$name was not installed" }
+          }
+          if (-not (Test-Path $lnk)) { throw "the Start Menu shortcut was not created" }
+          if (Test-Path $desktop) { throw "a desktop shortcut was created in silent mode" }
+          if (-not (Test-Path $key)) { throw "the uninstall registry entry was not written" }
+          $path = (Get-ItemProperty "HKCU:\Environment").Path
+          if (-not (($path -split ';') -contains $dir)) { throw "the install directory was not added to PATH" }
+
+          $code = Start-And-Wait (Join-Path $dir "uninstall.exe") "/S"
+          if ($code -ne 0) { throw "uninstaller exited with $code" }
+          for ($i = 0; $i -lt 80; $i++) {
+            $path = (Get-ItemProperty "HKCU:\Environment").Path
+            if (-not (Test-Path $dir) -and -not (Test-Path $key) -and -not (Test-Path $lnk) -and -not (($path -split ';') -contains $dir)) { break }
+            Start-Sleep -Milliseconds 250
+          }
+          if (Test-Path $dir) { throw "the install directory survived the uninstall" }
+          if (Test-Path $key) { throw "the uninstall registry entry survived the uninstall" }
+          if (Test-Path $lnk) { throw "the Start Menu shortcut survived the uninstall" }
+          $path = (Get-ItemProperty "HKCU:\Environment").Path
+          if (($path -split ';') -contains $dir) { throw "the PATH entry survived the uninstall" }
 
       - uses: actions/upload-artifact@v4
         with:
